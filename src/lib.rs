@@ -3,4 +3,5 @@
 
 pub mod actions;
 pub mod log;
+pub mod map;
 pub mod text;

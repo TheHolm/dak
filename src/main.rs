@@ -28,6 +28,12 @@ struct Cli {
     /// Debug subsystems to enable: device, scene, action.
     #[arg(short = 'd', long, value_delimiter = ',', num_args = 1..)]
     debug: Vec<String>,
+
+    /// Run the interactive device-mapping wizard instead of normal operation:
+    /// no config is read and no actions run; the wizard prints the collected
+    /// device mapping as JSON and exits.
+    #[arg(long)]
+    map: bool,
 }
 
 const QUERY: DeviceQuery = DeviceQuery::new(65440, 1, 0x0300, 0x3002);
@@ -51,6 +57,12 @@ async fn main() -> Result<(), MirajazzError> {
         "DAK (Dynamic Ajazz Keyboard) v{}",
         env!("CARGO_PKG_VERSION")
     ));
+
+    // The mapping wizard runs standalone: it must not read the config nor
+    // execute any actions, and it exits on its own when done.
+    if cli.map {
+        return dak::map::run_map_wizard(log).await;
+    }
 
     let config_path = actions::resolve_config_path(cli.config.as_deref());
     log.info(format!("Using config: {}", config_path.display()));
@@ -444,6 +456,14 @@ mod tests {
     fn cli_rejects_missing_flag_values() {
         assert!(Cli::try_parse_from(["dak", "-c"]).is_err());
         assert!(Cli::try_parse_from(["dak", "-d"]).is_err());
+    }
+
+    /// `--map` selects the mapping wizard; it can be combined with nothing
+    /// else because the wizard ignores config and debug flags.
+    #[test]
+    fn cli_map_flag_selects_wizard() {
+        let cli = Cli::try_parse_from(["dak", "--map"]).unwrap();
+        assert!(cli.map);
     }
 
     /// Debug-prints like the real Linux `DeviceId::DevPath`, so the device-line

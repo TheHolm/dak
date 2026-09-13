@@ -6,9 +6,11 @@ edition = "2021"
 [dependencies]
 chrono = { version = "0.4" }
 mirajazz = { version = "0.16" }
+async-hid = { version = "0.5.3", default-features = false, features = ["tokio"] }
 image = { version = "0.25" }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
 
 serde_json = { version = "1.0.150"}
+serde = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 clap = { version = "4", features = ["derive"] }
