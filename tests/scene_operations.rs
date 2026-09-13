@@ -3,6 +3,7 @@
 mod common;
 
 use dak::actions::{scene_operations, CommandSpec, SceneOp};
+use dak::baseplane::Reference;
 use serde_json::json;
 
 use crate::common::write_temp_config;
@@ -14,8 +15,8 @@ fn scene_operations_extract_static_images() {
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "image", "params": "/path/one.ico" },
-                    "2": { "type": "image", "params": "/path/two.png" }
+                    "1b01": { "type": "image", "params": "/path/one.ico" },
+                    "1b02": { "type": "image", "params": "/path/two.png" }
                 }
             }
         }"#,
@@ -28,11 +29,11 @@ fn scene_operations_extract_static_images() {
         operations,
         vec![
             SceneOp::SetImage {
-                key: 1,
+                reference: Reference::button(1, 1),
                 path: "/path/one.ico".to_string()
             },
             SceneOp::SetImage {
-                key: 2,
+                reference: Reference::button(1, 2),
                 path: "/path/two.png".to_string()
             },
         ]
@@ -47,7 +48,7 @@ fn scene_operations_mark_unsupported_commands() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "2": { "type": "frobnicate", "params": "/usr/bin/text2gif -t Test" }
+                "1b02": { "type": "frobnicate", "params": "/usr/bin/text2gif -t Test" }
             }
         }
     });
@@ -69,7 +70,7 @@ fn scene_operations_extract_image_exec() {
         r#"{
             "on_start": {
                 "setup": {
-                    "2": { "type": "image_exec", "params": "/usr/bin/convert input.png png:-" }
+                    "1b02": { "type": "image_exec", "params": "/usr/bin/convert input.png png:-" }
                 }
             }
         }"#,
@@ -81,7 +82,7 @@ fn scene_operations_extract_image_exec() {
     assert_eq!(
         operations,
         vec![SceneOp::ImageExec {
-            key: 2,
+            reference: Reference::button(1, 2),
             command: CommandSpec {
                 program: "/usr/bin/convert".to_string(),
                 args: vec!["input.png".to_string(), "png:-".to_string()]
@@ -97,7 +98,7 @@ fn scene_operations_extract_text() {
         r#"{
             "on_start": {
                 "setup": {
-                    "3": { "type": "text", "params": "/tmp/notes.txt" }
+                    "1b03": { "type": "text", "params": "/tmp/notes.txt" }
                 }
             }
         }"#,
@@ -109,7 +110,7 @@ fn scene_operations_extract_text() {
     assert_eq!(
         operations,
         vec![SceneOp::Text {
-            key: 3,
+            reference: Reference::button(1, 3),
             path: "/tmp/notes.txt".to_string()
         }]
     );
@@ -123,7 +124,7 @@ fn scene_operations_extract_text_exec() {
         r#"{
             "on_start": {
                 "setup": {
-                    "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
+                    "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
                 }
             }
         }"#,
@@ -135,7 +136,7 @@ fn scene_operations_extract_text_exec() {
     assert_eq!(
         operations,
         vec![SceneOp::TextExec {
-            key: 3,
+            reference: Reference::button(1, 3),
             command: CommandSpec {
                 program: "/usr/bin/date".to_string(),
                 args: vec!["+%H:%M".to_string()]
@@ -150,7 +151,7 @@ fn scene_operations_extract_text_exec_quoted_args() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "3": { "type": "text_exec", "params": "/usr/bin/find . -name '*.rs'" }
+                "1b03": { "type": "text_exec", "params": "/usr/bin/find . -name '*.rs'" }
             }
         }
     });
@@ -158,7 +159,7 @@ fn scene_operations_extract_text_exec_quoted_args() {
     assert_eq!(
         operations,
         vec![SceneOp::TextExec {
-            key: 3,
+            reference: Reference::button(1, 3),
             command: CommandSpec {
                 program: "/usr/bin/find".to_string(),
                 args: vec![".".to_string(), "-name".to_string(), "*.rs".to_string(),]
@@ -173,7 +174,7 @@ fn scene_operations_reject_text_exec_empty_params() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "1": { "type": "text_exec", "params": "" }
+                "1b01": { "type": "text_exec", "params": "" }
             }
         }
     });
@@ -190,7 +191,7 @@ fn scene_operations_reject_text_exec_unbalanced_quotes() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "1": { "type": "text_exec", "params": "/bin/sh -c 'oops" }
+                "1b01": { "type": "text_exec", "params": "/bin/sh -c 'oops" }
             }
         }
     });
@@ -204,12 +205,15 @@ fn scene_operations_reject_missing_type() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "1": { "params": "/tmp/notes.txt" }
+                "1b01": { "params": "/tmp/notes.txt" }
             }
         }
     });
     let error = scene_operations("on_start", &scenes).unwrap_err();
-    assert!(error.contains("key \"1\" type must be a string"), "{error}");
+    assert!(
+        error.contains("key \"1b01\" type must be a string"),
+        "{error}"
+    );
 }
 
 /// A button entry with a non-string params value is rejected.
@@ -218,13 +222,13 @@ fn scene_operations_reject_params_not_a_string() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "1": { "type": "image", "params": 42 }
+                "1b01": { "type": "image", "params": 42 }
             }
         }
     });
     let error = scene_operations("on_start", &scenes).unwrap_err();
     assert!(
-        error.contains("key \"1\" params must be a string"),
+        error.contains("key \"1b01\" params must be a string"),
         "{error}"
     );
 }
@@ -235,22 +239,22 @@ fn scene_operations_reject_button_entry_not_an_object() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "1": "image"
+                "1b01": "image"
             }
         }
     });
     let error = scene_operations("on_start", &scenes).unwrap_err();
-    assert!(error.contains("key \"1\" must be an object"), "{error}");
+    assert!(error.contains("key \"1b01\" must be an object"), "{error}");
 }
 
 /// launch buttons are parsed into Launch operations with the program split from
-/// the collapsed params command line; the button is only a config slot.
+/// the collapsed params command line; the reference is only a config slot.
 #[test]
 fn scene_operations_extract_launch() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "4": { "type": "launch", "params": "/usr/bin/systemctl suspend" }
+                "1b04": { "type": "launch", "params": "/usr/bin/systemctl suspend" }
             }
         }
     });
@@ -258,7 +262,7 @@ fn scene_operations_extract_launch() {
     assert_eq!(
         operations,
         vec![SceneOp::Launch {
-            key: 4,
+            reference: Reference::button(1, 4),
             command: CommandSpec {
                 program: "/usr/bin/systemctl".to_string(),
                 args: vec!["suspend".to_string()]
@@ -273,7 +277,7 @@ fn scene_operations_extract_launch_quoted_args() {
     let scenes = json!({
         "on_start": {
             "setup": {
-                "2": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
+                "1b02": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
             }
         }
     });
@@ -281,7 +285,7 @@ fn scene_operations_extract_launch_quoted_args() {
     assert_eq!(
         operations,
         vec![SceneOp::Launch {
-            key: 2,
+            reference: Reference::button(1, 2),
             command: CommandSpec {
                 program: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), "echo detached".to_string()]
@@ -305,14 +309,14 @@ fn scene_operations_reject_setup_not_an_object() {
     );
 }
 
-/// Clear buttons become Clear operations with the given key, params optional.
+/// Clear buttons become Clear operations with the given reference, params optional.
 #[test]
 fn scene_operations_extract_clear() {
     let path = write_temp_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "3": { "type": "clear" }
+                    "1b03": { "type": "clear" }
                 }
             }
         }"#,
@@ -321,7 +325,12 @@ fn scene_operations_extract_clear() {
     let _ = std::fs::remove_file(path);
 
     let operations = scene_operations("on_start", &config.scenes).unwrap();
-    assert_eq!(operations, vec![SceneOp::Clear { key: 3 }]);
+    assert_eq!(
+        operations,
+        vec![SceneOp::Clear {
+            reference: Reference::button(1, 3)
+        }]
+    );
 }
 
 /// A scene with no numbered buttons yields no operations.
@@ -360,9 +369,9 @@ fn scene_operations_reject_scene_not_an_object() {
     );
 }
 
-/// A non-numeric top-level key returns an error.
+/// A non-control-reference top-level key returns an error rooted at the scene and key.
 #[test]
-fn scene_operations_reject_non_numeric_key() {
+fn scene_operations_reject_non_reference_key() {
     let scenes = json!({
         "on_start": {
             "setup": {
@@ -372,7 +381,48 @@ fn scene_operations_reject_non_numeric_key() {
     });
     let error = scene_operations("on_start", &scenes).unwrap_err();
     assert!(
-        error.contains("key \"foo\" is not a button number"),
+        error.contains("scene \"on_start\": key \"foo\" is not a valid control reference"),
         "{error}"
+    );
+}
+
+/// Device and control numbers outside the reference limits are rejected when building
+/// the operation plan, exactly as at validation time.
+#[test]
+fn scene_operations_reject_out_of_range_references() {
+    for bad in ["0b01", "1b00", "1b100"] {
+        let scenes = json!({
+            "on_start": {
+                "setup": {
+                    bad: { "type": "image", "params": "/a" }
+                }
+            }
+        });
+        let error = scene_operations("on_start", &scenes).unwrap_err();
+        assert!(
+            error.contains("is not a valid control reference"),
+            "for reference {bad}: {error}"
+        );
+    }
+}
+
+/// Encoder references are legitimate control references and build operations that name
+/// the encoder; driving them is a later step.
+#[test]
+fn scene_operations_accept_encoder_references() {
+    let scenes = json!({
+        "on_start": {
+            "setup": {
+                "2e01": { "type": "text", "params": "/tmp/notes.txt" }
+            }
+        }
+    });
+    let operations = scene_operations("on_start", &scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![SceneOp::Text {
+            reference: Reference::encoder(2, 1),
+            path: "/tmp/notes.txt".to_string()
+        }]
     );
 }

@@ -60,11 +60,11 @@ fn parses_documented_config_structure() {
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "image", "params": "/path/reader.ico" },
-                    "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
+                    "1b01": { "type": "image", "params": "/path/reader.ico" },
+                    "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
                 },
                 "actions": {
-                    "1": { "pressed": "~" },
+                    "1b01": { "pressed": "~" },
                     "timer": { "1": "@Main" }
                 }
             },
@@ -78,9 +78,9 @@ fn parses_documented_config_structure() {
 
     assert!(config.scenes.get("on_start").is_some());
     assert!(config.scenes.get("Main").is_some());
-    assert_eq!(config.scenes["on_start"]["setup"]["1"]["type"], "image");
+    assert_eq!(config.scenes["on_start"]["setup"]["1b01"]["type"], "image");
     assert_eq!(
-        config.scenes["on_start"]["setup"]["1"]["params"],
+        config.scenes["on_start"]["setup"]["1b01"]["params"],
         "/path/reader.ico"
     );
     assert_eq!(config.scenes["on_start"]["actions"]["timer"]["1"], "@Main");
@@ -119,8 +119,8 @@ fn rejects_unknown_scene_key() {
 #[test]
 fn rejects_button_entry_not_an_object() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": "image"}}}"#,
-        "key \"1\" must be an object with \"type\" and \"params\"",
+        r#"{"on_start": {"setup": {"1b01": "image"}}}"#,
+        "key \"1b01\" must be an object with \"type\" and \"params\"",
     );
 }
 
@@ -128,7 +128,7 @@ fn rejects_button_entry_not_an_object() {
 #[test]
 fn rejects_button_entry_unknown_field() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": "/a", "from": "x"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/a", "from": "x"}}}}"#,
         "has unknown field \"from\"",
     );
 }
@@ -137,7 +137,7 @@ fn rejects_button_entry_unknown_field() {
 #[test]
 fn rejects_button_entry_without_type() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"params": "/a"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"params": "/a"}}}}"#,
         "type must be a string",
     );
 }
@@ -146,7 +146,7 @@ fn rejects_button_entry_without_type() {
 #[test]
 fn rejects_unknown_button_type() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "foo", "params": "/a"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "foo", "params": "/a"}}}}"#,
         "unknown type \"foo\"",
     );
 }
@@ -155,7 +155,7 @@ fn rejects_unknown_button_type() {
 #[test]
 fn rejects_button_params_not_a_string() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": 42}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": 42}}}}"#,
         "params must be a string",
     );
 }
@@ -164,7 +164,7 @@ fn rejects_button_params_not_a_string() {
 #[test]
 fn rejects_image_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": ""}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": ""}}}}"#,
         "image params must be a path",
     );
 }
@@ -173,7 +173,7 @@ fn rejects_image_with_empty_params() {
 #[test]
 fn rejects_exec_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "  "}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "  "}}}}"#,
         "text_exec params must be a program command line",
     );
 }
@@ -182,7 +182,7 @@ fn rejects_exec_with_empty_params() {
 #[test]
 fn rejects_exec_with_unbalanced_quotes() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "/bin/sh -c 'oops"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "/bin/sh -c 'oops"}}}}"#,
         "unbalanced quotes",
     );
 }
@@ -190,7 +190,7 @@ fn rejects_exec_with_unbalanced_quotes() {
 /// `clear` needs no params and is accepted as a bare type entry.
 #[test]
 fn accepts_clear_without_params() {
-    let path = write_temp_config(r#"{"on_start": {"setup": {"3": {"type": "clear"}}}}"#);
+    let path = write_temp_config(r#"{"on_start": {"setup": {"1b03": {"type": "clear"}}}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     assert!(config.is_ok(), "{:?}", config.err());
@@ -203,7 +203,7 @@ fn accepts_launch_with_command_line() {
         r#"{
             "on_start": {
                 "setup": {
-                    "4": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
+                    "1b04": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
                 }
             }
         }"#,
@@ -218,7 +218,7 @@ fn accepts_launch_with_command_line() {
 #[test]
 fn rejects_launch_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "  "}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "  "}}}}"#,
         "launch params must be a program command line",
     );
 }
@@ -227,7 +227,7 @@ fn rejects_launch_with_empty_params() {
 #[test]
 fn rejects_launch_with_unbalanced_quotes() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "/bin/sh -c 'oops"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "/bin/sh -c 'oops"}}}}"#,
         "unbalanced quotes",
     );
 }
@@ -239,7 +239,7 @@ fn warns_on_missing_launch_program() {
         r#"{
             "on_start": {
                 "setup": {
-                    "4": { "type": "launch", "params": "/does/not/exist --flag" }
+                    "1b04": { "type": "launch", "params": "/does/not/exist --flag" }
                 }
             }
         }"#,
@@ -248,7 +248,7 @@ fn warns_on_missing_launch_program() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("program not found"), "{warnings}");
-    assert!(warnings.contains("key \"4\""), "{warnings}");
+    assert!(warnings.contains("key \"1b04\""), "{warnings}");
 }
 
 // -- warnings --
@@ -260,7 +260,7 @@ fn warns_on_missing_image_file() {
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "image", "params": "/does/not/exist.ico" }
+                    "1b01": { "type": "image", "params": "/does/not/exist.ico" }
                 }
             }
         }"#,
@@ -269,7 +269,7 @@ fn warns_on_missing_image_file() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("file not found"), "{warnings}");
-    assert!(warnings.contains("key \"1\""), "{warnings}");
+    assert!(warnings.contains("key \"1b01\""), "{warnings}");
 }
 
 /// A missing text file is reported as a non-fatal warning.
@@ -279,7 +279,7 @@ fn warns_on_missing_text_file() {
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "text", "params": "/does/not/exist.txt" }
+                    "1b01": { "type": "text", "params": "/does/not/exist.txt" }
                 }
             }
         }"#,
@@ -288,7 +288,7 @@ fn warns_on_missing_text_file() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("file not found"), "{warnings}");
-    assert!(warnings.contains("key \"1\""), "{warnings}");
+    assert!(warnings.contains("key \"1b01\""), "{warnings}");
 }
 
 /// A missing program referenced by a button entry or an action is a non-fatal warning.
@@ -298,10 +298,10 @@ fn warns_on_missing_executable() {
         r#"{
             "on_start": {
                 "setup": {
-                    "3": { "type": "text_exec", "params": "/does/not/exist +%H:%M" }
+                    "1b03": { "type": "text_exec", "params": "/does/not/exist +%H:%M" }
                 },
                 "actions": {
-                    "1": { "pressed": "/does/not/exist/beep" }
+                    "1b01": { "pressed": "/does/not/exist/beep" }
                 }
             }
         }"#,
@@ -310,8 +310,8 @@ fn warns_on_missing_executable() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("program not found"), "{warnings}");
-    assert!(warnings.contains("key \"3\""), "{warnings}");
-    assert!(warnings.contains("actions.\"1\".pressed"), "{warnings}");
+    assert!(warnings.contains("key \"1b03\""), "{warnings}");
+    assert!(warnings.contains("actions.\"1b01\".pressed"), "{warnings}");
 }
 
 /// An existing but non-executable program is reported as a warning.
@@ -328,7 +328,7 @@ fn warns_on_non_executable_program() {
         r#"{{
         "on_start": {{
             "setup": {{
-                "1": {{ "type": "text_exec", "params": "{exe}" }}
+                "1b01": {{ "type": "text_exec", "params": "{exe}" }}
             }}
         }}
     }}"#
@@ -356,8 +356,8 @@ fn rejects_actions_not_an_object() {
 #[test]
 fn rejects_key_action_not_an_object() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": "pressed"}}}"#,
-        "actions.\"1\" must be an object of events",
+        r#"{"on_start": {"actions": {"1b01": "pressed"}}}"#,
+        "actions.\"1b01\" must be an object of events",
     );
 }
 
@@ -365,8 +365,8 @@ fn rejects_key_action_not_an_object() {
 #[test]
 fn rejects_event_value_not_a_string() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": 42}}}}"#,
-        "actions.\"1\".pressed must be a string",
+        r#"{"on_start": {"actions": {"1b01": {"pressed": 42}}}}"#,
+        "actions.\"1b01\".pressed must be a string",
     );
 }
 
@@ -374,7 +374,7 @@ fn rejects_event_value_not_a_string() {
 #[test]
 fn rejects_event_value_null() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": null}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": null}}}}"#,
         "pressed must be a string, got null",
     );
 }
@@ -383,7 +383,7 @@ fn rejects_event_value_null() {
 #[test]
 fn rejects_event_value_bool() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": true}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": true}}}}"#,
         "pressed must be a string, got bool",
     );
 }
@@ -392,7 +392,7 @@ fn rejects_event_value_bool() {
 #[test]
 fn rejects_event_value_array() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": [1]}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": [1]}}}}"#,
         "pressed must be a string, got an array",
     );
 }
@@ -401,7 +401,7 @@ fn rejects_event_value_array() {
 #[test]
 fn rejects_event_value_object() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": {}}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": {}}}}}"#,
         "pressed must be a string, got an object",
     );
 }
@@ -413,7 +413,7 @@ fn rejects_undefined_scene_reference() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1": { "pressed": "@Missing" },
+                    "1b01": { "pressed": "@Missing" },
                     "timer": { "1": "~" }
                 }
             }
@@ -427,14 +427,14 @@ fn rejects_undefined_scene_reference() {
         "{errors}"
     );
     assert!(errors.contains("scene \"on_start\""), "{errors}");
-    assert!(errors.contains("actions.\"1\".pressed"), "{errors}");
+    assert!(errors.contains("actions.\"1b01\".pressed"), "{errors}");
 }
 
 /// A bare `@` scene reference is rejected.
 #[test]
 fn rejects_empty_scene_reference() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": "@"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "@"}}}}"#,
         "is an empty scene reference",
     );
 }
@@ -546,4 +546,72 @@ fn reports_errors_from_all_scenes() {
             .contains("scene \"two\": actions.timer key \"soon\" is not a valid number of seconds"),
         "{errors}"
     );
+}
+
+// -- control references --
+
+/// A setup key that is not a control reference is rejected with the scene, key and reason.
+#[test]
+fn rejects_invalid_setup_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"0b01": {"type": "image", "params": "/a"}}}}"#,
+        "scene \"on_start\": key \"0b01\" is not a valid control reference",
+    );
+}
+
+/// The old plain button-number keys are no longer valid control references.
+#[test]
+fn rejects_legacy_numeric_button_keys() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "image", "params": "/a"}}}}"#,
+        "scene \"on_start\": key \"1\" is not a valid control reference",
+    );
+}
+
+/// An actions key that is not a control reference is rejected with the scene and location.
+#[test]
+fn rejects_invalid_action_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"0b01": {"pressed": "~"}}}}"#,
+        "scene \"on_start\": actions.\"0b01\" is not a valid control reference",
+    );
+}
+
+/// Device numbers are limited to a single digit; references to device 0 are invalid.
+#[test]
+fn rejects_zero_device_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"0b01": {"type": "clear"}}}}"#,
+        "the device must be a single digit from 1 to 9",
+    );
+}
+
+/// Control numbers are two digits from 01 to 99; bare, 00 and 100 forms are invalid.
+#[test]
+fn rejects_bad_control_numbers() {
+    for key in ["1b1", "1b00", "1b100"] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"setup": {{"{key}": {{"type": "clear"}}}}}}}}"#),
+            "is not a valid control reference",
+        );
+    }
+}
+
+/// A reference naming a device or encoder the program does not drive yet is still valid
+/// config: absent devices and encoders are skipped at runtime, not rejected at load.
+#[test]
+fn accepts_other_device_and_encoder_references() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "2b01": { "type": "image", "params": "/a" },
+                    "1e01": { "type": "clear" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
 }

@@ -73,16 +73,37 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 
 `config.json` drives all runtime behavior. Keys in the top-level object denote **scenes**, and a scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
 
+### Control references
+
+Buttons and encoders in `setup` and `actions` are addressed by **control references** of the form
+
+```
+<device><b|e><number>
+```
+
+- `<device>` is a single digit `1`–`9` naming the logical device. Only one device is supported so far: the first one found, which is always device `1`. The numbering exists so multi-device setups can come later without changing the config format.
+- `b` addresses a button, `e` an encoder.
+- `<number>` is the control number, always written with two digits, `01`–`99` (the AKP03E has 9 buttons and 3 encoders).
+
+For example `1b01` is button 1 on device 1, and `2e01` is encoder 1 on device 2.
+
+Rules for the program (and its future multi-device self):
+
+- References to devices `2`–`9` are valid config but are skipped at runtime with a warning (`device N is referenced but not present`).
+- Encoder references (`1e01`) are reserved: they validate, and are skipped at runtime with a warning until encoder handling is implemented.
+- Out-of-range button references (e.g. `1b99` on a 9-button device) are skipped with a warning.
+- The old plain numeric keys (`"1"`, `"3"`, ...) are no longer accepted; update them to `"1b01"`, `"1b03"`, ...
+
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
-- `setup` — a dictionary of numbered buttons. Numbered keys map a physical button to a dictionary with `type` and `params`:
+- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type` and `params`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-- `actions` — a dictionary of per-key behavior. Numerical keys are button numbers and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Action values have three forms:
   - `~` — stay on the same scene
@@ -97,21 +118,21 @@ Example:
 {
   "on_start": {
     "setup": {
-      "1": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/proc/uptime" }
+      "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/proc/uptime" }
     },
     "actions": {
-      "1": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "2": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "@Main" }
     }
   },
   "Main": {
     "setup": {
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/proc/uptime" }
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/proc/uptime" }
     },
     "actions": {
       "timer": { "1": "~" }
@@ -119,12 +140,12 @@ Example:
   },
   "Test": {
     "setup": {
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
-      "3": { "type": "clear" }
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+      "1b03": { "type": "clear" }
     },
     "actions": {
-      "1": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "3": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "~" }
     }
   }

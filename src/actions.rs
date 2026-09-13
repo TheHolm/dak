@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use image::DynamicImage;
 use mirajazz::device::Device;
@@ -193,10 +194,8 @@ fn check_button_op(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) {
-    if key.parse::<u8>().is_err() {
-        errors.push(format!(
-            "scene \"{scene_name}\": unknown key \"{key}\", expected a button number"
-        ));
+    if let Err(error) = Reference::parse(key) {
+        errors.push(format!("scene \"{scene_name}\": key \"{key}\" {error}"));
         return;
     }
 
@@ -296,6 +295,11 @@ fn check_actions(
     for (key, action) in map {
         if key == "timer" {
             check_timer(scenes, scene_name, action, errors, warnings);
+            continue;
+        }
+
+        if let Err(error) = Reference::parse(key) {
+            errors.push(format!("scene \"{scene_name}\": actions.\"{key}\" {error}"));
             continue;
         }
 
@@ -470,22 +474,31 @@ impl CommandSpec {
 /// A single operation derived from a scene's numbered button entries.
 #[derive(Debug, PartialEq)]
 pub enum SceneOp {
-    /// Load `path` as the image for a button. Keys are physical button numbers (1-based).
-    SetImage { key: u8, path: String },
-    /// Show the first lines of `path` as text on a button. Keys are physical button numbers (1-based).
-    Text { key: u8, path: String },
-    /// Run `command` and show its stdout as text on a button. Keys are physical button numbers (1-based).
-    TextExec { key: u8, command: CommandSpec },
-    /// Run `command` and set its stdout (an image file) as the button image. Keys are physical button numbers (1-based).
-    ImageExec { key: u8, command: CommandSpec },
+    /// Load `path` as the image for a button. References are physical buttons (1-based).
+    SetImage { reference: Reference, path: String },
+    /// Show the first lines of `path` as text on a button. References are physical buttons (1-based).
+    Text { reference: Reference, path: String },
+    /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
+    TextExec {
+        reference: Reference,
+        command: CommandSpec,
+    },
+    /// Run `command` and set its stdout (an image file) as the button image. References are physical buttons (1-based).
+    ImageExec {
+        reference: Reference,
+        command: CommandSpec,
+    },
     /// Run `command` detached from this program: own process group, no stdio, and not
-    /// killed when the program exits. The decoy button (`key`) is only a config slot;
-    /// nothing is drawn on it and nothing is restored on termination. Keys are physical
-    /// button numbers (1-based).
-    Launch { key: u8, command: CommandSpec },
-    /// Clear the image of a button. Keys are physical button numbers (1-based).
-    Clear { key: u8 },
-    /// Command kind that is not implemented.
+    /// killed when the program exits. The decoy reference is only a config slot;
+    /// nothing is drawn on it and nothing is restored on termination. References are
+    /// physical buttons (1-based).
+    Launch {
+        reference: Reference,
+        command: CommandSpec,
+    },
+    /// Clear the image of a button. References are physical buttons (1-based).
+    Clear { reference: Reference },
+    /// Control kind that is not implemented.
     Unsupported { kind: String },
 }
 
@@ -511,9 +524,8 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         .ok_or_else(|| format!("scene \"{scene_name}\": setup is not an object"))?;
 
     for (key, value) in map {
-        let button = key
-            .parse::<u8>()
-            .map_err(|_| format!("scene \"{scene_name}\": key \"{key}\" is not a button number"))?;
+        let reference = Reference::parse(key)
+            .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\" {error}"))?;
 
         let object = value.as_object().ok_or_else(|| {
             format!("scene \"{scene_name}\": key \"{key}\" must be an object with \"type\" and \"params\"")
@@ -535,35 +547,26 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
 
         match kind {
             "image" => operations.push(SceneOp::SetImage {
-                key: button,
+                reference,
                 path: params,
             }),
             "text" => operations.push(SceneOp::Text {
-                key: button,
+                reference,
                 path: params,
             }),
             "text_exec" => {
                 let command = params_command(scene_name, key, "text_exec", &params)?;
-                operations.push(SceneOp::TextExec {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::TextExec { reference, command });
             }
             "image_exec" => {
                 let command = params_command(scene_name, key, "image_exec", &params)?;
-                operations.push(SceneOp::ImageExec {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::ImageExec { reference, command });
             }
             "launch" => {
                 let command = params_command(scene_name, key, "launch", &params)?;
-                operations.push(SceneOp::Launch {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::Launch { reference, command });
             }
-            "clear" => operations.push(SceneOp::Clear { key: button }),
+            "clear" => operations.push(SceneOp::Clear { reference }),
             other => operations.push(SceneOp::Unsupported {
                 kind: other.to_string(),
             }),
@@ -715,6 +718,9 @@ pub trait ButtonDevice: Send + Sync {
 
     /// Sends all staged images to the device's LCDs.
     async fn flush(&self) -> Result<(), Self::Error>;
+
+    /// Number of buttons the device physically has.
+    fn key_count(&self) -> u8;
 }
 
 impl ButtonDevice for Device {
@@ -736,6 +742,10 @@ impl ButtonDevice for Device {
     async fn flush(&self) -> Result<(), Self::Error> {
         Device::flush(self).await
     }
+
+    fn key_count(&self) -> u8 {
+        Device::key_count(self) as u8
+    }
 }
 
 /// Runs scene operations against one device, managing asynchronous `image_exec` and
@@ -752,6 +762,9 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     tracker: ExecTracker,
     /// Output filter: debug lines for scene/device events only print when enabled.
     log: Log,
+    /// Config number of the device this runner drives. Operations targeting another
+    /// device's number are detected and skipped with a notice.
+    device_number: u8,
     /// Physical button numbers (1-based) that this runner applied any image operation to
     /// during the session. Termination cleanup clears exactly these buttons, so buttons the
     /// program never touched are left alone.
@@ -759,9 +772,10 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
-    /// Creates a runner bound to `device`, sending `exec` results through `exec_tx`,
-    /// reporting scene/device events through `log`.
+    /// Creates a runner driving the config device `device_number` bound to `device`,
+    /// sending `exec` results through `exec_tx`, reporting scene/device events through `log`.
     pub fn new(
+        device_number: u8,
         device: &'a D,
         image_format: ImageFormat,
         exec_tx: mpsc::Sender<ExecEvent>,
@@ -772,6 +786,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             image_format,
             tracker: ExecTracker::new(exec_tx),
             log,
+            device_number,
             changed_keys: std::collections::HashSet::new(),
         }
     }
@@ -790,6 +805,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
 
     /// Applies scene operations to the device; unsupported operations are skipped with a notice.
     ///
+    /// Operations targeting another device's number, encoder references (not implemented
+    /// yet) or buttons beyond the device's physical count are reported and skipped.
     /// Before touching a button, any still-running `exec` task for that button is cancelled:
     /// its process is killed, a red "Error" is drawn, and the failure is logged. Async
     /// results arriving later for the old generation are discarded.
@@ -798,15 +815,57 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         operations: &[SceneOp],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for operation in operations {
-            if let Some(key) = operation_key(operation) {
-                // record the button as "touched" so termination cleanup can restore exactly
-                // the buttons this session changed (unused buttons are left alone)
-                self.changed_keys.insert(key);
-                self.cancel_exec_if_running(key).await;
+            // Unsupported carries no reference, so it is skipped before any per-reference
+            // filtering can apply.
+            let Some(reference) = operation_reference(operation) else {
+                let SceneOp::Unsupported { kind } = operation else {
+                    unreachable!("operation without a reference must be Unsupported");
+                };
+                self.log.warn(format!(
+                    "scene setup \"{kind}\" on key is not supported and was skipped"
+                ));
+                continue;
+            };
+            let reference = *reference;
+
+            if reference.device != self.device_number {
+                self.log.warn(format!(
+                    "device {} is referenced but not present; skipping operation: {operation:?}",
+                    reference.device
+                ));
+                continue;
             }
+            if reference.kind == Kind::Encoder {
+                self.log.warn(format!(
+                    "{kind} {reference} is not supported yet; skipping operation: {operation:?}",
+                    kind = reference.kind.label()
+                ));
+                continue;
+            }
+
+            // A launch only runs its command; its reference is a config slot, so no
+            // button is drawn and none is restored on termination.
+            if let SceneOp::Launch { command, .. } = operation {
+                spawn_detached(command, self.log);
+                continue;
+            }
+
+            let key = reference.number;
+            if key > self.device.key_count() {
+                self.log.warn(format!(
+                    "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
+                    self.device.key_count()
+                ));
+                continue;
+            }
+
+            // record the button as "touched" so termination cleanup can restore exactly
+            // the buttons this session changed (unused buttons are left alone)
+            self.changed_keys.insert(key);
+            self.cancel_exec_if_running(key).await;
             match operation {
-                // config keys are physical buttons numbered from 1; mirajazz keys are 0-based
-                SceneOp::SetImage { key, path } => {
+                // config references are physical buttons numbered from 1; mirajazz keys are 0-based
+                SceneOp::SetImage { reference: _, path } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("set image from \"{path}\" on key {key}"),
@@ -821,7 +880,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     self.log
                         .debug(Subsystem::Device, format!("set image on button {key}"));
                 }
-                SceneOp::Text { key, path } => {
+                SceneOp::Text { reference: _, path } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("render text from \"{path}\" on key {key}"),
@@ -839,24 +898,30 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         format!("set image on button {key} from text"),
                     );
                 }
-                SceneOp::TextExec { key, command } => {
+                SceneOp::TextExec {
+                    reference: _,
+                    command,
+                } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("start text exec \"{}\" on key {key}", command.display()),
                     );
-                    self.start_exec_task(*key, ExecOutputKind::Text, command);
+                    self.start_exec_task(key, ExecOutputKind::Text, command);
                 }
-                SceneOp::ImageExec { key, command } => {
+                SceneOp::ImageExec {
+                    reference: _,
+                    command,
+                } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("start image exec \"{}\" on key {key}", command.display()),
                     );
-                    self.start_exec_task(*key, ExecOutputKind::Image, command);
+                    self.start_exec_task(key, ExecOutputKind::Image, command);
                 }
-                SceneOp::Launch { key: _, command } => {
-                    spawn_detached(command, self.log);
+                SceneOp::Launch { .. } => {
+                    unreachable!("Launch is handled before the per-button match")
                 }
-                SceneOp::Clear { key } => {
+                SceneOp::Clear { reference: _ } => {
                     self.log.debug(Subsystem::Scene, format!("clear key {key}"));
                     self.device
                         .clear_button_image(key.saturating_sub(1))
@@ -864,10 +929,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     self.log
                         .debug(Subsystem::Device, format!("clear image on button {key}"));
                 }
-                SceneOp::Unsupported { kind } => {
-                    self.log.warn(format!(
-                        "scene setup \"{kind}\" on key is not supported and was skipped"
-                    ));
+                SceneOp::Unsupported { .. } => {
+                    unreachable!("Unsupported operations are skipped before the match")
                 }
             }
         }
@@ -1041,16 +1104,19 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     }
 }
 
-/// Returns the 1-based physical button key an operation targets, if any.
-fn operation_key(operation: &SceneOp) -> Option<u8> {
+/// Returns the control reference an operation targets, if any.
+///
+/// Every operation carries a [Reference], including `Launch` whose reference is only a
+/// config slot; only `Unsupported` has no reference at all.
+fn operation_reference(operation: &SceneOp) -> Option<&Reference> {
     match operation {
-        SceneOp::SetImage { key, .. }
-        | SceneOp::Text { key, .. }
-        | SceneOp::TextExec { key, .. }
-        | SceneOp::ImageExec { key, .. }
-        | SceneOp::Clear { key } => Some(*key),
-        // Launch draws nothing, so it has no button image to restore on termination.
-        SceneOp::Launch { .. } | SceneOp::Unsupported { .. } => None,
+        SceneOp::SetImage { reference, .. }
+        | SceneOp::Text { reference, .. }
+        | SceneOp::TextExec { reference, .. }
+        | SceneOp::ImageExec { reference, .. }
+        | SceneOp::Launch { reference, .. }
+        | SceneOp::Clear { reference } => Some(reference),
+        SceneOp::Unsupported { .. } => None,
     }
 }
 
@@ -1280,15 +1346,15 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
-/// Resolves the `pressed` action for `key`, falling back to the previously active scene.
+/// Resolves the `pressed` action for `reference`, falling back to the previously active scene.
 ///
 /// Button actions are inherited from the previous scene: `scene_name` is consulted first,
-/// then `previous_scene`. A scene that explicitly configures the key ends the search —
+/// then `previous_scene`. A scene that explicitly configures the reference ends the search —
 /// its non-empty `pressed` value wins, an empty value means "bound but no action".
 pub fn action_for_key<'a>(
     scene_name: &str,
     previous_scene: Option<&str>,
-    key: u8,
+    reference: &Reference,
     scenes: &'a Value,
 ) -> Option<&'a str> {
     for name in std::iter::once(scene_name).chain(previous_scene) {
@@ -1300,7 +1366,7 @@ pub fn action_for_key<'a>(
         };
         let Some(key_actions) = actions
             .as_object()
-            .and_then(|map| map.get(&key.to_string()))
+            .and_then(|map| map.get(&reference.to_string()))
         else {
             continue;
         };
@@ -1546,42 +1612,70 @@ mod tests {
         }
     }
 
-    /// `operation_key` reports the button an operation targets, or `None` for commands
-    /// that do not touch a button at all.
+    /// `operation_reference` reports the reference an operation targets, or `None` only
+    /// for unsupported operations, which carry no reference at all.
     #[test]
-    fn operation_key_returns_button_number() {
+    fn operation_reference_reports_target_reference() {
         let image = super::SceneOp::SetImage {
-            key: 3,
+            reference: super::Reference::button(1, 3),
             path: "x.png".to_string(),
         };
         let text = super::SceneOp::Text {
-            key: 4,
+            reference: super::Reference::button(2, 4),
             path: "x.txt".to_string(),
         };
         let text_exec = super::SceneOp::TextExec {
-            key: 8,
+            reference: super::Reference::button(9, 8),
             command: super::CommandSpec {
                 program: "echo".to_string(),
                 args: vec![],
             },
         };
         let image_exec = super::SceneOp::ImageExec {
-            key: 9,
+            reference: super::Reference::button(1, 9),
             command: super::CommandSpec {
                 program: "convert".to_string(),
                 args: vec![],
             },
         };
-        let clear = super::SceneOp::Clear { key: 12 };
+        let launch = super::SceneOp::Launch {
+            reference: super::Reference::button(1, 5),
+            command: super::CommandSpec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+        };
+        let clear = super::SceneOp::Clear {
+            reference: super::Reference::encoder(1, 1),
+        };
         let unsupported = super::SceneOp::Unsupported {
             kind: "frobnicate".to_string(),
         };
-        assert_eq!(super::operation_key(&image), Some(3));
-        assert_eq!(super::operation_key(&text), Some(4));
-        assert_eq!(super::operation_key(&text_exec), Some(8));
-        assert_eq!(super::operation_key(&image_exec), Some(9));
-        assert_eq!(super::operation_key(&clear), Some(12));
-        assert_eq!(super::operation_key(&unsupported), None);
+        assert_eq!(
+            super::operation_reference(&image),
+            Some(&super::Reference::button(1, 3))
+        );
+        assert_eq!(
+            super::operation_reference(&text),
+            Some(&super::Reference::button(2, 4))
+        );
+        assert_eq!(
+            super::operation_reference(&text_exec),
+            Some(&super::Reference::button(9, 8))
+        );
+        assert_eq!(
+            super::operation_reference(&image_exec),
+            Some(&super::Reference::button(1, 9))
+        );
+        assert_eq!(
+            super::operation_reference(&launch),
+            Some(&super::Reference::button(1, 5))
+        );
+        assert_eq!(
+            super::operation_reference(&clear),
+            Some(&super::Reference::encoder(1, 1))
+        );
+        assert_eq!(super::operation_reference(&unsupported), None);
     }
 
     /// A fresh tracker accepts its first generation for a button but rejects unknown ones.

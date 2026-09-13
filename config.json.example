@@ -1,21 +1,21 @@
 {
   "on_start": {
     "setup": {
-      "1": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/tmp/aaa.txt" }
+      "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
-      "1": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "2": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "@Main" }
     }
   },
   "Main": {
     "setup": {
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/tmp/aaa.txt" }
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
       "timer": { "1": "~" }
@@ -23,12 +23,12 @@
   },
   "Test": {
     "setup": {
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
-      "3": { "type": "clear" }
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+      "1b03": { "type": "clear" }
     },
     "actions": {
-      "1": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "3": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "~" }
     }
   }

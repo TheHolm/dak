@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use dak::actions::{self, Action};
+use dak::baseplane::{Baseplane, Reference};
 use dak::log::{Log, Subsystem};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
@@ -46,9 +47,13 @@ const IMAGE_FORMAT: ImageFormat = ImageFormat {
     mirror: ImageMirroring::None,
 };
 
-/// Connects to every found Ajazz keypad, applies the `on_start` scene and reacts to keys,
-/// encoder events and scene timers: scene-switch actions enter the target scene, command
-/// actions run their program asynchronously.
+/// Connects to the first found Ajazz keypad, applies the `on_start` scene and reacts to
+/// keys, encoder events and scene timers: scene-switch actions enter the target scene,
+/// command actions run their program asynchronously.
+///
+/// Only a single device is driven for now — the first one discovered, addressed in the
+/// config as device 1. When multiple devices arrive, the baseplane will map serials to
+/// device numbers and the loop will drive every present device.
 #[tokio::main]
 async fn main() -> Result<(), MirajazzError> {
     let cli = Cli::parse();
@@ -81,7 +86,13 @@ async fn main() -> Result<(), MirajazzError> {
         }
     };
 
-    for dev in list_devices(&[QUERY]).await? {
+    // Discovered devices come back from an unordered set, so pick "the first" by
+    // iterating order. Only that first device is driven; later versions will address
+    // each device by its serial-backed config number.
+    let devices: Vec<_> = list_devices(&[QUERY]).await?.into_iter().collect();
+    let baseplane = Baseplane::single_first_device();
+    let device_number = baseplane.first_present_number().unwrap_or(1);
+    for dev in devices.iter().take(1) {
         log.debug(Subsystem::Device, "Connecting to device");
         for line in device_info_lines(
             &dev.id,
@@ -94,7 +105,7 @@ async fn main() -> Result<(), MirajazzError> {
         }
 
         // Connect to the device
-        let device = Device::connect(&dev, 2, 9, 3).await?;
+        let device = Device::connect(dev, 2, 9, 3).await?;
         let device = device.with_supports_both_keypress_states(true);
         let device = device.with_supports_both_encoder_states(true);
 
@@ -126,7 +137,8 @@ async fn main() -> Result<(), MirajazzError> {
 
         // async image_exec/text_exec results land on buttons through this runner and its channel
         let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
-        let mut runner = actions::SceneRunner::new(&device, IMAGE_FORMAT, exec_tx, log);
+        let mut runner =
+            actions::SceneRunner::new(device_number, &device, IMAGE_FORMAT, exec_tx, log);
 
         if let Err(error) = runner.enter_scene("on_start", &config.scenes).await {
             log.warn(format!("failed to apply on_start scene: {error}"));
@@ -176,10 +188,14 @@ async fn main() -> Result<(), MirajazzError> {
                     if pressed && !buttons_down[key] {
                         buttons_down[key] = true;
 
+                        // raw key codes are physical button numbers (1-based), so the
+                        // event addresses the button of the number on this device
+                        let reference = Reference::button(device_number, key as u8);
+
                         let Some(action) = actions::action_for_key(
                             &current_scene,
                             previous_scene.as_deref(),
-                            key as u8,
+                            &reference,
                             &config.scenes,
                         ) else {
                             continue;
