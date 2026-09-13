@@ -1,0 +1,549 @@
+//! Tests for config loading and validation (parse errors, structure, button entries, actions, timer).
+
+mod common;
+
+use dak::actions::{load_config, load_config_from_path};
+
+use crate::common::{assert_validation_error, error_texts, write_temp_config};
+
+/// A minimal valid config loads successfully.
+#[test]
+fn loads_valid_config() {
+    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok());
+}
+
+/// `load_config` reads the repository's `config.json`; also guards that the shipped sample stays valid.
+#[test]
+fn load_config_reads_repo_config_json() {
+    let config = load_config();
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// Malformed JSON is rejected with line and column information.
+#[test]
+fn rejects_invalid_json() {
+    let path = write_temp_config("{ \"on_start\": {");
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("invalid JSON at line "), "{errors}");
+    assert!(errors.contains(", column "), "{errors}");
+    assert!(path.to_str().unwrap().contains("dak_config"), "{errors}");
+}
+
+/// Loading a nonexistent config path returns an error.
+#[test]
+fn rejects_missing_file() {
+    assert!(load_config_from_path("/nonexistent/config.json").is_err());
+}
+
+/// A config whose root is not an object of scene names is rejected.
+#[test]
+fn rejects_non_object_config() {
+    let path = write_temp_config(r#"[1, 2, 3]"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("object whose keys are scene names"),
+        "{errors}"
+    );
+}
+
+/// The README-documented config structure loads and preserves scene, button and timer values.
+#[test]
+fn parses_documented_config_structure() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1": { "type": "image", "params": "/path/reader.ico" },
+                    "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
+                },
+                "actions": {
+                    "1": { "pressed": "~" },
+                    "timer": { "1": "@Main" }
+                }
+            },
+            "Main": {
+                "actions": { "timer": { "1": "~" } }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert!(config.scenes.get("on_start").is_some());
+    assert!(config.scenes.get("Main").is_some());
+    assert_eq!(config.scenes["on_start"]["setup"]["1"]["type"], "image");
+    assert_eq!(
+        config.scenes["on_start"]["setup"]["1"]["params"],
+        "/path/reader.ico"
+    );
+    assert_eq!(config.scenes["on_start"]["actions"]["timer"]["1"], "@Main");
+}
+
+// -- scene validation --
+
+/// A scene must be an object of numbered buttons and `actions`.
+#[test]
+fn rejects_scene_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": []}"#,
+        "scene \"on_start\" must be an object",
+    );
+}
+
+/// The old `set_scene` wrapper is gone: buttons live at the scene top level now.
+#[test]
+fn rejects_legacy_set_scene_key() {
+    assert_validation_error(
+        r#"{"on_start": {"set_scene": []}}"#,
+        "unknown key \"set_scene\"",
+    );
+}
+
+/// Top-level scene keys must be button numbers or the reserved "actions" key.
+#[test]
+fn rejects_unknown_scene_key() {
+    assert_validation_error(
+        r#"{"on_start": {"foo": {"type": "image", "params": "/a"}}}"#,
+        "unknown key \"foo\"",
+    );
+}
+
+/// A button entry must be an object with "type" and "params".
+#[test]
+fn rejects_button_entry_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": "image"}}}"#,
+        "key \"1\" must be an object with \"type\" and \"params\"",
+    );
+}
+
+/// Button entries accept only the "type" and "params" fields.
+#[test]
+fn rejects_button_entry_unknown_field() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "image", "params": "/a", "from": "x"}}}}"#,
+        "has unknown field \"from\"",
+    );
+}
+
+/// A button entry without a string "type" is rejected.
+#[test]
+fn rejects_button_entry_without_type() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"params": "/a"}}}}"#,
+        "type must be a string",
+    );
+}
+
+/// Unknown types are rejected with the list of known ones.
+#[test]
+fn rejects_unknown_button_type() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "foo", "params": "/a"}}}}"#,
+        "unknown type \"foo\"",
+    );
+}
+
+/// "params" must be a string when present.
+#[test]
+fn rejects_button_params_not_a_string() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "image", "params": 42}}}}"#,
+        "params must be a string",
+    );
+}
+
+/// `image` and `text` need a non-empty params path.
+#[test]
+fn rejects_image_with_empty_params() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "image", "params": ""}}}}"#,
+        "image params must be a path",
+    );
+}
+
+/// `image_exec` and `text_exec` need a program command line in params.
+#[test]
+fn rejects_exec_with_empty_params() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "  "}}}}"#,
+        "text_exec params must be a program command line",
+    );
+}
+
+/// Malformed command lines in exec params are rejected.
+#[test]
+fn rejects_exec_with_unbalanced_quotes() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "/bin/sh -c 'oops"}}}}"#,
+        "unbalanced quotes",
+    );
+}
+
+/// `clear` needs no params and is accepted as a bare type entry.
+#[test]
+fn accepts_clear_without_params() {
+    let path = write_temp_config(r#"{"on_start": {"setup": {"3": {"type": "clear"}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// `launch` is accepted like the `*_exec` commands: params hold the program command line.
+#[test]
+fn accepts_launch_with_command_line() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "4": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let config = config.expect("launch config should validate");
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+}
+
+/// A `launch` button without a command line is rejected.
+#[test]
+fn rejects_launch_with_empty_params() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "  "}}}}"#,
+        "launch params must be a program command line",
+    );
+}
+
+/// A malformed command line in launch params is rejected.
+#[test]
+fn rejects_launch_with_unbalanced_quotes() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "/bin/sh -c 'oops"}}}}"#,
+        "unbalanced quotes",
+    );
+}
+
+/// A missing `launch` program is reported as a non-fatal warning like the exec commands.
+#[test]
+fn warns_on_missing_launch_program() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "4": { "type": "launch", "params": "/does/not/exist --flag" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+    let warnings = config.warnings.join("\n");
+    assert!(warnings.contains("program not found"), "{warnings}");
+    assert!(warnings.contains("key \"4\""), "{warnings}");
+}
+
+// -- warnings --
+
+/// A missing image file is a non-fatal warning rooted at the button key.
+#[test]
+fn warns_on_missing_image_file() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1": { "type": "image", "params": "/does/not/exist.ico" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+    let warnings = config.warnings.join("\n");
+    assert!(warnings.contains("file not found"), "{warnings}");
+    assert!(warnings.contains("key \"1\""), "{warnings}");
+}
+
+/// A missing text file is reported as a non-fatal warning.
+#[test]
+fn warns_on_missing_text_file() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1": { "type": "text", "params": "/does/not/exist.txt" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+    let warnings = config.warnings.join("\n");
+    assert!(warnings.contains("file not found"), "{warnings}");
+    assert!(warnings.contains("key \"1\""), "{warnings}");
+}
+
+/// A missing program referenced by a button entry or an action is a non-fatal warning.
+#[test]
+fn warns_on_missing_executable() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "3": { "type": "text_exec", "params": "/does/not/exist +%H:%M" }
+                },
+                "actions": {
+                    "1": { "pressed": "/does/not/exist/beep" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+    let warnings = config.warnings.join("\n");
+    assert!(warnings.contains("program not found"), "{warnings}");
+    assert!(warnings.contains("key \"3\""), "{warnings}");
+    assert!(warnings.contains("actions.\"1\".pressed"), "{warnings}");
+}
+
+/// An existing but non-executable program is reported as a warning.
+#[test]
+fn warns_on_non_executable_program() {
+    let exe = "/tmp/dak_not_executable_program";
+    std::fs::write(exe, "").unwrap();
+    let mut perms = std::fs::metadata(exe).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o644);
+    std::fs::set_permissions(exe, perms).unwrap();
+
+    let path = write_temp_config(&format!(
+        r#"{{
+        "on_start": {{
+            "setup": {{
+                "1": {{ "type": "text_exec", "params": "{exe}" }}
+            }}
+        }}
+    }}"#
+    ));
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(exe);
+
+    let warnings = config.warnings.join("\n");
+    assert!(warnings.contains("is not executable"), "{warnings}");
+}
+
+// -- actions validation --
+
+/// `actions` must be an object.
+#[test]
+fn rejects_actions_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": []}}"#,
+        "actions must be an object",
+    );
+}
+
+/// A key entry must be an object mapping events to action values.
+#[test]
+fn rejects_key_action_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": "pressed"}}}"#,
+        "actions.\"1\" must be an object of events",
+    );
+}
+
+/// Action values must be strings.
+#[test]
+fn rejects_event_value_not_a_string() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": 42}}}}"#,
+        "actions.\"1\".pressed must be a string",
+    );
+}
+
+/// A null action value is rejected with its type name in the message.
+#[test]
+fn rejects_event_value_null() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": null}}}}"#,
+        "pressed must be a string, got null",
+    );
+}
+
+/// A boolean action value is rejected with its type name in the message.
+#[test]
+fn rejects_event_value_bool() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": true}}}}"#,
+        "pressed must be a string, got bool",
+    );
+}
+
+/// An array action value is rejected with its type name in the message.
+#[test]
+fn rejects_event_value_array() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": [1]}}}}"#,
+        "pressed must be a string, got an array",
+    );
+}
+
+/// An object action value is rejected with its type name in the message.
+#[test]
+fn rejects_event_value_object() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": {}}}}}"#,
+        "pressed must be a string, got an object",
+    );
+}
+
+/// A `@scene` action referencing a scene that does not exist is rejected with its location.
+#[test]
+fn rejects_undefined_scene_reference() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1": { "pressed": "@Missing" },
+                    "timer": { "1": "~" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("references undefined scene \"@Missing\""),
+        "{errors}"
+    );
+    assert!(errors.contains("scene \"on_start\""), "{errors}");
+    assert!(errors.contains("actions.\"1\".pressed"), "{errors}");
+}
+
+/// A bare `@` scene reference is rejected.
+#[test]
+fn rejects_empty_scene_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1": {"pressed": "@"}}}}"#,
+        "is an empty scene reference",
+    );
+}
+
+// -- timer validation --
+
+/// The `timer` entry must be a single-entry object; more entries are rejected.
+#[test]
+fn rejects_timer_with_multiple_entries() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "timer": { "1": "~", "2": "~" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("must contain exactly one entry"),
+        "{errors}"
+    );
+}
+
+/// A non-numeric timer seconds value is rejected.
+#[test]
+fn rejects_invalid_timer_seconds() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "timer": { "soon": "~" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("not a valid number of seconds"), "{errors}");
+}
+
+/// `timer` must be a single-entry object.
+#[test]
+fn rejects_timer_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"timer": "soon"}}}"#,
+        "actions.timer must be a single-entry object",
+    );
+}
+
+/// The timer action value must be a string.
+#[test]
+fn rejects_timer_value_not_a_string() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"timer": {"1": 42}}}}"#,
+        "actions.timer value must be a string",
+    );
+}
+
+/// A timer action referencing an undefined scene is rejected with the timer location.
+#[test]
+fn rejects_timer_referencing_undefined_scene() {
+    let path = write_temp_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "timer": { "1": "@Missing" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("references undefined scene \"@Missing\""),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("scene \"on_start\": actions.timer"),
+        "{errors}"
+    );
+}
+
+/// Validation reports every invalid scene in one go instead of stopping at the first.
+#[test]
+fn reports_errors_from_all_scenes() {
+    let path = write_temp_config(
+        r#"{
+            "one": { "bogus": 1 },
+            "two": {
+                "actions": { "timer": { "soon": "~" } }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("scene \"one\": unknown key \"bogus\""),
+        "{errors}"
+    );
+    assert!(
+        errors
+            .contains("scene \"two\": actions.timer key \"soon\" is not a valid number of seconds"),
+        "{errors}"
+    );
+}

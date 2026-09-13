@@ -1,0 +1,4 @@
+target/
+Cargo.lock
+.bash_history
+config.json

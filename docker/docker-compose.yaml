@@ -1,0 +1,8 @@
+services:
+  dak-build:
+    container_name: dak-build
+    build: .
+    tty: true                            # allocate a pseudo‑TTY (`-t`)
+    stdin_open: true
+    volumes:
+     - ..:/code
