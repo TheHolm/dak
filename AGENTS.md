@@ -50,4 +50,5 @@ Work in progress. Current known issues:
 - Every function and every test is documented with a `///` doc comment describing its purpose and any non-obvious behavior
 - All new code must be covered by tests — unit tests for private helpers and integration tests in `tests/` for public behaviour; never add production code without accompanying tests
 - Commits include a detailed description of what changed and why
+- When merging a branch to master, summarise all changes in the code since the branch started (or the last merge to master) and use that summary as the merge description
 - Never commit changes unless the user explicitly asks to commit
