@@ -70,15 +70,16 @@ async fn main() -> Result<(), MirajazzError> {
     };
 
     for dev in list_devices(&[QUERY]).await? {
-        log.debug(
-            Subsystem::Device,
-            format!(
-                "Connecting to {:04X}:{:04X}, {}",
-                dev.vendor_id,
-                dev.product_id,
-                dev.serial_number.clone().unwrap(),
-            ),
-        );
+        log.debug(Subsystem::Device, "Connecting to device");
+        for line in device_info_lines(
+            &dev.id,
+            &dev.serial_number,
+            dev.vendor_id,
+            dev.product_id,
+            &dev.name,
+        ) {
+            log.debug(Subsystem::Device, line);
+        }
 
         // Connect to the device
         let device = Device::connect(&dev, 2, 9, 3).await?;
@@ -354,6 +355,31 @@ async fn rearm_scene_timer(
     *timer_handle = arm_scene_timer(scene_name, scenes, timer_tx, log).await;
 }
 
+/// Builds the `-d device` lines printed when a device is found, one per
+/// identifying detail: VID:PID, the OS device id (on Linux the `/dev/hidrawN`
+/// path), the device name and the serial number reported by the USB stack.
+///
+/// The id is passed as a `Debug` value because its concrete type (`DeviceId`,
+/// behind `HidDeviceInfo.id`) is platform-specific and not re-exported by
+/// mirajazz; `Debug`-formatting it in the caller keeps this helper constructible
+/// in tests on any platform. A device without a serial is reported as "unknown"
+/// rather than crashing the connect line.
+fn device_info_lines(
+    id: &dyn std::fmt::Debug,
+    serial: &Option<String>,
+    vid: u16,
+    pid: u16,
+    name: &str,
+) -> Vec<String> {
+    let serial = serial.as_deref().unwrap_or("unknown");
+    vec![
+        format!("device id: {vid:04X}:{pid:04X}"),
+        format!("device path: {id:?}"),
+        format!("device name: {name}"),
+        format!("device serial: {serial}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -418,5 +444,50 @@ mod tests {
     fn cli_rejects_missing_flag_values() {
         assert!(Cli::try_parse_from(["dak", "-c"]).is_err());
         assert!(Cli::try_parse_from(["dak", "-d"]).is_err());
+    }
+
+    /// Debug-prints like the real Linux `DeviceId::DevPath`, so the device-line
+    /// assertions read the way the actual output does.
+    struct FakeDeviceId(&'static str);
+
+    impl std::fmt::Debug for FakeDeviceId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DevPath({:?})", self.0)
+        }
+    }
+
+    /// The device lines report VID:PID, OS device path, name and serial, one each.
+    #[test]
+    fn device_info_lines_report_each_detail() {
+        let lines = super::device_info_lines(
+            &FakeDeviceId("/dev/hidraw3"),
+            &Some("ABC123".to_string()),
+            0x0300,
+            0x3002,
+            "Ajazz HOTSPOTEKUSB HID DEMO",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "device id: 0300:3002".to_string(),
+                "device path: DevPath(\"/dev/hidraw3\")".to_string(),
+                "device name: Ajazz HOTSPOTEKUSB HID DEMO".to_string(),
+                "device serial: ABC123".to_string(),
+            ]
+        );
+    }
+
+    /// A missing serial number is reported as "unknown" instead of panicking.
+    #[test]
+    fn device_info_lines_without_serial_report_unknown() {
+        let lines = super::device_info_lines(
+            &FakeDeviceId("/dev/hidraw0"),
+            &None,
+            0x0300,
+            0x3002,
+            "keypad",
+        );
+        assert_eq!(lines[3], "device serial: unknown");
+        assert_eq!(lines[1], "device path: DevPath(\"/dev/hidraw0\")");
     }
 }
