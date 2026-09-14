@@ -6,4 +6,5 @@ pub mod actions;
 pub mod baseplane;
 pub mod log;
 pub mod map;
+pub mod press;
 pub mod text;

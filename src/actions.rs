@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
+use crate::press::PressDefaults;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -24,6 +25,8 @@ pub struct LoadedConfig {
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
     pub devices: ConfiguredDevices,
+    /// The timing knobs from the `defaults` section, with built-in defaults applied.
+    pub defaults: PressDefaults,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -195,9 +198,9 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes" && key != "devices" {
+        if key != "scenes" && key != "devices" && key != "defaults" {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\" and \"devices\""
+                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\" and \"defaults\""
             ));
         }
     }
@@ -218,6 +221,10 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     check_scenes(scenes, &mut warnings, &mut errors);
     let devices = map.get("devices").expect("checked above");
     let by_id = check_devices(devices, &mut errors);
+    let defaults = map
+        .get("defaults")
+        .map(|defaults| check_defaults(defaults, &mut errors))
+        .unwrap_or_default();
 
     if !errors.is_empty() {
         return Err(errors);
@@ -225,8 +232,56 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     Ok(LoadedConfig {
         scenes: scenes.clone(),
         devices: ConfiguredDevices { by_id },
+        defaults,
         warnings,
     })
+}
+
+/// Validates the optional `defaults` section: an object whose keys hold positive
+/// millisecond durations for the press-detection knobs. Missing keys fall back to
+/// [`PressDefaults::default`].
+fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
+    let map = match defaults.as_object() {
+        Some(map) => map,
+        None => {
+            errors.push(format!(
+                "config \"defaults\" must be an object, got {}",
+                value_type(defaults)
+            ));
+            return PressDefaults::default();
+        }
+    };
+
+    let mut result = PressDefaults::default();
+    for (key, value) in map {
+        if key != "short_press_duration" && key != "double_click_gap" {
+            errors.push(format!(
+                "defaults: unknown key \"{key}\", expected \"short_press_duration\" and \"double_click_gap\""
+            ));
+            continue;
+        }
+        let Some(number) = value.as_u64() else {
+            errors.push(format!(
+                "defaults.{key} must be a positive number of milliseconds, got {}",
+                value_type(value)
+            ));
+            continue;
+        };
+        if number == 0 {
+            errors.push(format!(
+                "defaults.{key} must be a positive number of milliseconds"
+            ));
+            continue;
+        }
+        match key.as_str() {
+            "short_press_duration" => {
+                result.short_press_duration = Duration::from_millis(number);
+            }
+            "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+            _ => unreachable!("unknown keys are rejected above"),
+        }
+    }
+    result
 }
 
 /// Validates the `scenes` section: an object whose keys are scene names.
@@ -1562,15 +1617,17 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
-/// Resolves the `pressed` action for `reference`, falling back to the previously active scene.
+/// Resolves the action bound to `event` (e.g. `"pressed"` or `"released"`) on `reference`,
+/// falling back to the previously active scene.
 ///
 /// Button actions are inherited from the previous scene: `scene_name` is consulted first,
 /// then `previous_scene`. A scene that explicitly configures the reference ends the search —
-/// its non-empty `pressed` value wins, an empty value means "bound but no action".
-pub fn action_for_key<'a>(
+/// its non-empty value for `event` wins, an empty value means "bound but no action".
+pub fn action_for_event<'a>(
     scene_name: &str,
     previous_scene: Option<&str>,
     reference: &Reference,
+    event: &str,
     scenes: &'a Value,
 ) -> Option<&'a str> {
     for name in std::iter::once(scene_name).chain(previous_scene) {
@@ -1587,7 +1644,7 @@ pub fn action_for_key<'a>(
             continue;
         };
         return key_actions
-            .get("pressed")
+            .get(event)
             .and_then(|value| value.as_str())
             .filter(|action| !action.is_empty());
     }

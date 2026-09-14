@@ -4,7 +4,10 @@ mod common;
 
 use dak::actions::{load_config, load_config_from_path};
 
-use crate::common::{assert_validation_error, error_texts, write_scenes_config, write_temp_config};
+use crate::common::{
+    assert_validation_error, error_texts, write_config_with_defaults, write_scenes_config,
+    write_temp_config,
+};
 
 /// A minimal valid config loads successfully.
 #[test]
@@ -121,7 +124,7 @@ fn rejects_config_without_devices_section() {
     );
 }
 
-/// Top-level keys other than "scenes" and "devices" are rejected.
+/// Top-level keys other than "scenes", "devices" and "defaults" are rejected.
 #[test]
 fn rejects_unknown_top_level_key() {
     let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "players": {}}"#);
@@ -132,6 +135,115 @@ fn rejects_unknown_top_level_key() {
         errors.contains("unknown top-level key \"players\""),
         "{errors}"
     );
+}
+
+/// A `defaults` section is optional; when absent the built-in press timings apply.
+#[test]
+fn absent_defaults_uses_builtin_durations() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults, dak::press::PressDefaults::default());
+}
+
+/// An empty `defaults` section is fine too: every key falls back to its built-in value.
+#[test]
+fn empty_defaults_uses_builtin_durations() {
+    let path = write_config_with_defaults(r#"{}"#, r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults, dak::press::PressDefaults::default());
+}
+
+/// Valid `defaults` values override the built-in timings and load fine.
+#[test]
+fn valid_defaults_load_and_apply() {
+    let path = write_config_with_defaults(
+        r#"{"short_press_duration": 150, "double_click_gap": 250}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(
+        config.defaults.short_press_duration,
+        std::time::Duration::from_millis(150)
+    );
+    assert_eq!(
+        config.defaults.double_click_gap,
+        std::time::Duration::from_millis(250)
+    );
+}
+
+/// A missing single key inside an otherwise valid `defaults` falls back to its built-in.
+#[test]
+fn partial_defaults_fall_back_per_key() {
+    let path = write_config_with_defaults(
+        r#"{"short_press_duration": 120}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(
+        config.defaults.short_press_duration,
+        std::time::Duration::from_millis(120)
+    );
+    assert_eq!(
+        config.defaults.double_click_gap,
+        std::time::Duration::from_millis(300)
+    );
+}
+
+/// A `defaults` section that is not an object is rejected.
+#[test]
+fn rejects_non_object_defaults() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "defaults": [300, 300]}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("config \"defaults\" must be an object"),
+        "{errors}"
+    );
+}
+
+/// Unknown keys in `defaults` are rejected.
+#[test]
+fn rejects_unknown_defaults_key() {
+    let path = write_config_with_defaults(
+        r#"{"short_press_duration": 300, "long_press_duration": 600}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains(
+            "defaults: unknown key \"long_press_duration\", expected \"short_press_duration\" and \"double_click_gap\""
+        ),
+        "{errors}"
+    );
+}
+
+/// Zero and non-numeric durations in `defaults` are rejected.
+#[test]
+fn rejects_invalid_defaults_values() {
+    for defaults in [
+        r#"{"short_press_duration": 0}"#,
+        r#"{"double_click_gap": "fast"}"#,
+    ] {
+        let path = write_config_with_defaults(defaults, r#"{"on_start": {"actions": {}}}"#);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains("must be a positive number of milliseconds"),
+            "for {defaults}: {errors}"
+        );
+    }
 }
 
 /// A scenes section that is not an object of scene names is rejected.

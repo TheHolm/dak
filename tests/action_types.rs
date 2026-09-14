@@ -1,9 +1,9 @@
-//! Tests for action value parsing (`parse_action`), per-key action lookup (`action_for_key`),
-//! and timer lookup (`timer_for_scene`).
+//! Tests for action value parsing (`parse_action`), per-key action lookup for the
+//! `pressed`/`released` events (`action_for_event`), and timer lookup (`timer_for_scene`).
 
 mod common;
 
-use dak::actions::{action_for_key, parse_action, timer_for_scene, Action};
+use dak::actions::{action_for_event, parse_action, timer_for_scene, Action};
 use dak::baseplane::Reference;
 
 use crate::common::write_scenes_config;
@@ -26,10 +26,10 @@ fn parse_action_classifies_actions() {
     );
 }
 
-/// `action_for_key` resolves the pressed action for a control reference, None when unbound
+/// `action_for_event` resolves the "pressed" action for a control reference, None when unbound
 /// or the scene is undefined.
 #[test]
-fn action_for_key_reads_pressed_action() {
+fn action_for_event_reads_pressed_action() {
     let path = write_scenes_config(
         r#"{
             "on_start": {
@@ -48,30 +48,60 @@ fn action_for_key_reads_pressed_action() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key("on_start", None, &Reference::button(1, 1), &config.scenes),
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 1),
+            "pressed",
+            &config.scenes
+        ),
         Some("~")
     );
     assert_eq!(
-        action_for_key("on_start", None, &Reference::button(1, 2), &config.scenes),
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 2),
+            "pressed",
+            &config.scenes
+        ),
         Some("@Test")
     );
     assert_eq!(
-        action_for_key("on_start", None, &Reference::button(1, 3), &config.scenes),
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 3),
+            "pressed",
+            &config.scenes
+        ),
         Some("/usr/bin/date +%H:%M")
     );
     assert_eq!(
-        action_for_key("on_start", None, &Reference::button(1, 9), &config.scenes),
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 9),
+            "pressed",
+            &config.scenes
+        ),
         None
     );
     assert_eq!(
-        action_for_key("Missing", None, &Reference::button(1, 1), &config.scenes),
+        action_for_event(
+            "Missing",
+            None,
+            &Reference::button(1, 1),
+            "pressed",
+            &config.scenes
+        ),
         None
     );
 }
 
 /// An action missing from the current scene is looked up in the previous scene.
 #[test]
-fn action_for_key_inherits_from_previous_scene() {
+fn action_for_event_inherits_from_previous_scene() {
     let path = write_scenes_config(
         r#"{
             "on_start": {
@@ -93,24 +123,31 @@ fn action_for_key_inherits_from_previous_scene() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key(
+        action_for_event(
             "Main",
             Some("on_start"),
             &Reference::button(1, 2),
+            "pressed",
             &config.scenes
         ),
         Some("@Test")
     );
     // Without a previous scene the same lookup finds nothing.
     assert_eq!(
-        action_for_key("Main", None, &Reference::button(1, 2), &config.scenes),
+        action_for_event(
+            "Main",
+            None,
+            &Reference::button(1, 2),
+            "pressed",
+            &config.scenes
+        ),
         None
     );
 }
 
 /// A scene without an `actions` field at all still falls through to the previous scene.
 #[test]
-fn action_for_key_inherits_when_scene_has_no_actions() {
+fn action_for_event_inherits_when_scene_has_no_actions() {
     let path = write_scenes_config(
         r#"{
             "on_start": {
@@ -128,16 +165,23 @@ fn action_for_key_inherits_when_scene_has_no_actions() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key(
+        action_for_event(
             "Main",
             Some("on_start"),
             &Reference::button(1, 2),
+            "pressed",
             &config.scenes
         ),
         Some("@Test")
     );
     assert_eq!(
-        action_for_key("Main", None, &Reference::button(1, 2), &config.scenes),
+        action_for_event(
+            "Main",
+            None,
+            &Reference::button(1, 2),
+            "pressed",
+            &config.scenes
+        ),
         None
     );
 }
@@ -145,7 +189,7 @@ fn action_for_key_inherits_when_scene_has_no_actions() {
 /// A scene that explicitly configures a reference wins over the previous scene, and an
 /// empty `pressed` value means bound-but-no-action, so it ends the search.
 #[test]
-fn action_for_key_explicit_binding_overrides_inheritance() {
+fn action_for_event_explicit_binding_overrides_inheritance() {
     let path = write_scenes_config(
         r#"{
             "on_start": {
@@ -167,19 +211,165 @@ fn action_for_key_explicit_binding_overrides_inheritance() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key(
+        action_for_event(
             "Main",
             Some("on_start"),
             &Reference::button(1, 2),
+            "pressed",
             &config.scenes
         ),
         None
     );
     assert_eq!(
-        action_for_key(
+        action_for_event(
             "Main",
             Some("on_start"),
             &Reference::button(1, 9),
+            "pressed",
+            &config.scenes
+        ),
+        None
+    );
+}
+
+/// `action_for_event` resolves the `released` action for a control reference, independently
+/// of the `pressed` binding; None when unbound.
+#[test]
+fn action_for_event_reads_released_action() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1b01": { "pressed": "~", "released": "@Test" },
+                    "1b02": { "released": "/usr/bin/date +%H:%M" }
+                }
+            },
+            "Test": {
+                "actions": {}
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 1),
+            "released",
+            &config.scenes
+        ),
+        Some("@Test")
+    );
+    // A pressed binding does not leak into the released lookup.
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 1),
+            "pressed",
+            &config.scenes
+        ),
+        Some("~")
+    );
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 2),
+            "released",
+            &config.scenes
+        ),
+        Some("/usr/bin/date +%H:%M")
+    );
+    // No released binding at all.
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 9),
+            "released",
+            &config.scenes
+        ),
+        None
+    );
+}
+
+/// A `released` action missing from the current scene is looked up in the previous scene.
+#[test]
+fn action_for_event_released_inherits_from_previous_scene() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1b02": { "released": "@Test" }
+                }
+            },
+            "Main": {
+                "actions": {}
+            },
+            "Test": {
+                "actions": {}
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        action_for_event(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 2),
+            "released",
+            &config.scenes
+        ),
+        Some("@Test")
+    );
+    // Without a previous scene the same lookup finds nothing.
+    assert_eq!(
+        action_for_event(
+            "Main",
+            None,
+            &Reference::button(1, 2),
+            "released",
+            &config.scenes
+        ),
+        None
+    );
+}
+
+/// An empty `released` value in the current scene means bound-but-no-action, so it ends
+/// the search instead of falling through to the previous scene.
+#[test]
+fn action_for_event_empty_released_binding_suppresses_inheritance() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1b02": { "released": "@Test" }
+                }
+            },
+            "Main": {
+                "actions": {
+                    "1b02": { "released": "" }
+                }
+            },
+            "Test": {
+                "actions": {}
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        action_for_event(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 2),
+            "released",
             &config.scenes
         ),
         None
