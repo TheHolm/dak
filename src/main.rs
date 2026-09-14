@@ -283,7 +283,7 @@ async fn run_device(
     let (timer_tx, mut timer_rx) = mpsc::channel::<String>(1);
     let mut timer_handle = arm_scene_timer(&current_scene, &scenes, &timer_tx, log).await;
 
-    // Actions are inherited from the previously active scene (see `action_for_key`),
+    // Actions are inherited from the previously active scene (see `action_for_event`),
     // so the scene we came from is remembered across scene switches.
     let mut previous_scene: Option<String> = None;
 
@@ -318,33 +318,37 @@ async fn run_device(
                     // event addresses the button of the number on this device
                     let reference = Reference::button(device_number, key as u8);
 
-                    let Some(action) = actions::action_for_key(
-                        &current_scene,
-                        previous_scene.as_deref(),
-                        &reference,
-                        &scenes,
-                    ) else {
-                        continue;
-                    };
-
-                    log.debug(
-                        Subsystem::Actions,
-                        format!("key {key} pressed -> \"{action}\""),
-                    );
-
-                    run_action(
+                    run_bound_action(
                         log,
                         &mut runner,
                         &mut current_scene,
                         &mut previous_scene,
                         &scenes,
-                        action,
+                        &reference,
+                        "pressed",
+                        key,
                         &mut timer_handle,
                         &timer_tx,
                     )
                     .await;
                 } else if !pressed && buttons_down[key] {
                     buttons_down[key] = false;
+
+                    let reference = Reference::button(device_number, key as u8);
+
+                    run_bound_action(
+                        log,
+                        &mut runner,
+                        &mut current_scene,
+                        &mut previous_scene,
+                        &scenes,
+                        &reference,
+                        "released",
+                        key,
+                        &mut timer_handle,
+                        &timer_tx,
+                    )
+                    .await;
                 }
             }
             action = timer_rx.recv() => {
@@ -391,6 +395,56 @@ async fn run_device(
 
     device.shutdown().await?;
     Ok(())
+}
+
+/// Resolves the action `reference` has bound to `event` (e.g. `pressed` or `released`)
+/// and runs it, logging the dispatch. Unbound references simply do nothing.
+///
+/// The action is looked up in the current scene first, then in the previously active
+/// scene (see `actions::action_for_event`), so pushed buttons keep their released
+/// behavior after a scene switch.
+///
+/// The parameter list mirrors `run_action`: each device has exactly one input loop and
+/// the shared state it needs is passed flat rather than bundled into a context type.
+#[allow(clippy::too_many_arguments)]
+async fn run_bound_action(
+    log: Log,
+    runner: &mut actions::SceneRunner<'_, Device>,
+    current_scene: &mut String,
+    previous_scene: &mut Option<String>,
+    scenes: &Value,
+    reference: &Reference,
+    event: &str,
+    key: usize,
+    timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    timer_tx: &mpsc::Sender<String>,
+) {
+    let Some(action) = actions::action_for_event(
+        current_scene,
+        previous_scene.as_deref(),
+        reference,
+        event,
+        scenes,
+    ) else {
+        return;
+    };
+
+    log.debug(
+        Subsystem::Actions,
+        format!("key {key} {event} -> \"{action}\""),
+    );
+
+    run_action(
+        log,
+        runner,
+        current_scene,
+        previous_scene,
+        scenes,
+        action,
+        timer_handle,
+        timer_tx,
+    )
+    .await;
 }
 
 /// Executes a scene action: stays (re-applying the current scene), switches scene,

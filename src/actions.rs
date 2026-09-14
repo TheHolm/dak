@@ -1562,15 +1562,17 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
-/// Resolves the `pressed` action for `reference`, falling back to the previously active scene.
+/// Resolves the action bound to `event` (e.g. `"pressed"` or `"released"`) on `reference`,
+/// falling back to the previously active scene.
 ///
 /// Button actions are inherited from the previous scene: `scene_name` is consulted first,
 /// then `previous_scene`. A scene that explicitly configures the reference ends the search —
-/// its non-empty `pressed` value wins, an empty value means "bound but no action".
-pub fn action_for_key<'a>(
+/// its non-empty value for `event` wins, an empty value means "bound but no action".
+pub fn action_for_event<'a>(
     scene_name: &str,
     previous_scene: Option<&str>,
     reference: &Reference,
+    event: &str,
     scenes: &'a Value,
 ) -> Option<&'a str> {
     for name in std::iter::once(scene_name).chain(previous_scene) {
@@ -1587,7 +1589,7 @@ pub fn action_for_key<'a>(
             continue;
         };
         return key_actions
-            .get("pressed")
+            .get(event)
             .and_then(|value| value.as_str())
             .filter(|action| !action.is_empty());
     }
