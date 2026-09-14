@@ -99,6 +99,29 @@ pub struct EncoderMapping {
     pub ccw: u8,
 }
 
+impl Mapping {
+    /// Resolves a raw report code to the logical button number of the button
+    /// whose captured press code (while held) or release code (when released)
+    /// matches it. Returns `None` when no button in the definition uses that
+    /// code, which is expected for unreported noise.
+    ///
+    /// The raw codes are device-specific — buttons without a display commonly
+    /// report codes far above their number — so the runtime never treats a
+    /// code as a button number; it always resolves through the mapping.
+    pub fn button_number(&self, code: u8, pressed: bool) -> Option<u8> {
+        self.buttons
+            .iter()
+            .find(|button| {
+                if pressed {
+                    button.press == code
+                } else {
+                    button.release == code
+                }
+            })
+            .map(|button| button.number)
+    }
+}
+
 /// Runs the whole `dak --map` wizard: device selection, count confirmation,
 /// screen count, button and encoder capture, display sanity check, JSON output,
 /// and screen clearing/shutdown.
@@ -289,19 +312,66 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         buttons,
         encoders,
     };
-    match serde_json::to_string_pretty(&mapping) {
-        Ok(json) => println!("{json}"),
-        Err(error) => {
-            log.error(format!("failed to serialize mapping: {error}"));
-            return Err(MirajazzError::BadData);
-        }
-    }
+    println!("{}", mapping_json(&mapping));
 
     device.clear_all_button_images().await?;
     device.flush().await?;
     device.shutdown().await?;
     log.debug(Subsystem::Device, "screens cleared, device shut down");
     Ok(())
+}
+
+/// Renders a [`Mapping`] as JSON in the compact form the shipped example
+/// config uses: a pretty outer object with one line per button and per
+/// encoder. Unlike `serde_json`'s pretty printing, this keeps the
+/// one-`devices`-entry shape that drops straight into a config file.
+fn mapping_json(mapping: &Mapping) -> String {
+    let mut lines = String::from("{\n");
+    for field in ["device_id", "device_name", "serial"] {
+        let value: &str = match field {
+            "device_id" => &mapping.device_id,
+            "device_name" => &mapping.device_name,
+            _ => &mapping.serial,
+        };
+        lines.push_str(&format!(
+            "  \"{field}\": {},\n",
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+        ));
+    }
+    for (field, value) in [
+        ("key_count", mapping.key_count as u64),
+        ("encoder_count", mapping.encoder_count as u64),
+        ("screens", mapping.screens as u64),
+    ] {
+        lines.push_str(&format!("  \"{field}\": {value},\n"));
+    }
+    lines.push_str("  \"buttons\": [\n");
+    for (index, button) in mapping.buttons.iter().enumerate() {
+        let comma = if index + 1 == mapping.buttons.len() {
+            ""
+        } else {
+            ","
+        };
+        lines.push_str(&format!(
+            "    {{ \"number\": {}, \"press\": {}, \"release\": {}, \"screen\": {}, \"draw_id\": {} }}{comma}\n",
+            button.number, button.press, button.release, button.screen, button.draw_id
+        ));
+    }
+    lines.push_str("  ],\n");
+    lines.push_str("  \"encoders\": [\n");
+    for (index, encoder) in mapping.encoders.iter().enumerate() {
+        let comma = if index + 1 == mapping.encoders.len() {
+            ""
+        } else {
+            ","
+        };
+        lines.push_str(&format!(
+            "    {{ \"number\": {}, \"cw\": {}, \"ccw\": {} }}{comma}\n",
+            encoder.number, encoder.cw, encoder.ccw
+        ));
+    }
+    lines.push_str("  ]\n}");
+    lines
 }
 
 /// The OS device path from a raw `DeviceId`.
@@ -646,11 +716,13 @@ fn is_no(input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::capture::{PressCapture, TwistCapture};
+    use super::mapping_json;
     use super::HidDeviceId;
     use super::{
         device_details, device_summary, is_no, parse_key_list, parse_key_number, parse_number,
         parse_yes_no, raw_event,
     };
+    use super::{ButtonMapping, EncoderMapping, Mapping};
     use std::collections::HashSet;
 
     /// `parse_number` accepts surrounding whitespace and the decimal format the
@@ -747,6 +819,124 @@ mod tests {
         assert_eq!(capture.feed(0x61, 0), None);
         assert_eq!(capture.feed(0x60, 0), None);
         assert_eq!(capture.feed(0x33, 0), Some((0x60, 0x33)));
+    }
+
+    /// Raw codes resolve to the button number through the captured press and
+    /// release codes, whether those codes match the number or not.
+    #[test]
+    fn button_number_resolves_raw_codes_to_logical_numbers() {
+        let mapping = Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "Ajazz HOTSPOTEKUSB HID DEMO".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 9,
+            encoder_count: 3,
+            screens: 6,
+            buttons: vec![
+                ButtonMapping {
+                    number: 1,
+                    press: 1,
+                    release: 1,
+                    screen: true,
+                    draw_id: 1,
+                },
+                ButtonMapping {
+                    number: 7,
+                    press: 48,
+                    release: 48,
+                    screen: false,
+                    draw_id: -1,
+                },
+            ],
+            encoders: vec![],
+        };
+        assert_eq!(mapping.button_number(1, true), Some(1));
+        assert_eq!(mapping.button_number(1, false), Some(1));
+        assert_eq!(mapping.button_number(48, true), Some(7));
+        assert_eq!(mapping.button_number(48, false), Some(7));
+        assert_eq!(mapping.button_number(99, true), None);
+        assert_eq!(mapping.button_number(99, false), None);
+    }
+
+    /// A button with distinct press and release codes resolves correctly in
+    /// both directions.
+    #[test]
+    fn button_number_uses_distinct_press_and_release_codes() {
+        let mapping = Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "t".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 1,
+            encoder_count: 0,
+            screens: 1,
+            buttons: vec![ButtonMapping {
+                number: 3,
+                press: 0x60,
+                release: 0x61,
+                screen: true,
+                draw_id: 3,
+            }],
+            encoders: vec![],
+        };
+        assert_eq!(mapping.button_number(0x60, true), Some(3));
+        assert_eq!(mapping.button_number(0x60, false), None);
+        assert_eq!(mapping.button_number(0x61, true), None);
+        assert_eq!(mapping.button_number(0x61, false), Some(3));
+    }
+
+    /// The mapping JSON matches the one-line-per-button example-config form,
+    /// escaping string fields like `serde_json` would.
+    #[test]
+    fn mapping_json_uses_compact_one_line_entries() {
+        let mapping = Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: r#"HID "DEMO""#.to_string(),
+            serial: "unknown".to_string(),
+            key_count: 2,
+            encoder_count: 1,
+            screens: 1,
+            buttons: vec![
+                ButtonMapping {
+                    number: 1,
+                    press: 1,
+                    release: 1,
+                    screen: true,
+                    draw_id: 1,
+                },
+                ButtonMapping {
+                    number: 2,
+                    press: 48,
+                    release: 48,
+                    screen: false,
+                    draw_id: -1,
+                },
+            ],
+            encoders: vec![EncoderMapping {
+                number: 1,
+                cw: 81,
+                ccw: 80,
+            }],
+        };
+        assert_eq!(
+            mapping_json(&mapping),
+            concat!(
+                "{\n",
+                "  \"device_id\": \"0300:3002\",\n",
+                "  \"device_name\": \"HID \\\"DEMO\\\"\",\n",
+                "  \"serial\": \"unknown\",\n",
+                "  \"key_count\": 2,\n",
+                "  \"encoder_count\": 1,\n",
+                "  \"screens\": 1,\n",
+                "  \"buttons\": [\n",
+                "    { \"number\": 1, \"press\": 1, \"release\": 1, \"screen\": true, \"draw_id\": 1 },\n",
+                "    { \"number\": 2, \"press\": 48, \"release\": 48, \"screen\": false, \"draw_id\": -1 }\n",
+                "  ],\n",
+                "  \"encoders\": [\n",
+                "    { \"number\": 1, \"cw\": 81, \"ccw\": 80 }\n",
+                "  ]\n",
+                "}"
+            )
+        );
     }
 
     /// Debug-prints like the real Linux `DeviceId::DevPath`, so the summary

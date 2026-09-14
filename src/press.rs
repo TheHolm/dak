@@ -26,7 +26,7 @@ pub struct PressDefaults {
 impl Default for PressDefaults {
     fn default() -> Self {
         Self {
-            short_press_duration: Duration::from_millis(200),
+            short_press_duration: Duration::from_millis(300),
             double_click_gap: Duration::from_millis(300),
         }
     }
@@ -151,10 +151,10 @@ impl ClickDetector {
 mod tests {
     use super::*;
 
-    /// The default knobs: 200 ms short/long boundary and 300 ms double-click gap.
+    /// The default knobs: 300 ms short/long boundary and 300 ms double-click gap.
     #[test]
-    fn defaults_are_200ms_short_and_300ms_gap() {
-        assert_eq!(defaults().short_press_duration, Duration::from_millis(200));
+    fn defaults_are_300ms_boundaries() {
+        assert_eq!(defaults().short_press_duration, Duration::from_millis(300));
         assert_eq!(defaults().double_click_gap, Duration::from_millis(300));
     }
 
@@ -278,7 +278,7 @@ mod tests {
         let mut detector = ClickDetector::new(defaults());
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
-            detector.release(t0 + Duration::from_millis(200)),
+            detector.release(t0 + Duration::from_millis(300)),
             ReleaseDecision::Short
         );
     }

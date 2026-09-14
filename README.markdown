@@ -62,7 +62,7 @@ file and exits. Run `dak --help` for the exact, generated usage text.
 All runtime behavior is driven by `config.json` instead of the hard-coded demo once shipped in `main.rs`:
 
 - **Scenes** — buttons can display images, static text files, or the output of async commands (`image_exec` / `text_exec` with a 5-second timeout); scenes switch on key/encoder input, from the scene timer, or on demand.
-- **Per-key actions** — `pressed`, `released`, `short_press`, `long_press` and `double_click` bindings, with actions inherited from the previously active scene.
+- **Per-key actions** — `short_press`, `long_press`, `double_click`, `pressed` and `released` bindings, with actions inherited from the previously active scene.
 - **Timers** — each scene can run a `timer` action after a number of seconds; button presses and scene switches re-arm it only when appropriate.
 
 ## Platform support
@@ -107,12 +107,12 @@ The optional top-level `defaults` section tunes how the complex button presses a
 
 ```json
 "defaults": {
-  "short_press_duration": 200,
+  "short_press_duration": 300,
   "double_click_gap": 300
 }
 ```
 
-- `short_press_duration` (default `200`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
+- `short_press_duration` (default `300`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
 - `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
 
 Complex events are decided on the release edge, per button:
@@ -154,7 +154,9 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. `pressed` fires on the press edge, `released` on the release edge, and the complex events fire on release as described in [Defaults](#defaults). The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+
+Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
 Action values have three forms:
   - `~` — stay on the same scene
@@ -175,8 +177,8 @@ Example scenes:
       "1b04": { "type": "text", "params": "/proc/uptime" }
     },
     "actions": {
-      "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "short_press": "~", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+      "1b02": { "short_press": "@Test", "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "timer": { "1": "@Main" }
     }
   },
@@ -195,8 +197,8 @@ Example scenes:
       "1b03": { "type": "clear" }
     },
     "actions": {
-      "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "short_press": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+      "1b03": { "short_press": "@on_start", "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "timer": { "1": "~" }
     }
   }

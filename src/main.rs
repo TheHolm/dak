@@ -312,30 +312,41 @@ async fn run_device(
                 if !data.starts_with(&[65, 67, 75]) {
                     continue;
                 }
-                let key = data[9] as usize;
+                // The raw code in the report names a button by its captured
+                // press/release code, not by its number (buttons without a
+                // display report far larger codes). Translate it through the
+                // definition and skip reports that no button uses.
+                let code = data[9];
                 let pressed = data[10] != 0;
                 let state = if pressed { "pressed" } else { "released" };
                 log.debug(
                     Subsystem::Device,
-                    format!("Key {}, {state}", data[9]),
+                    format!("Key {code}, {state}"),
                 );
 
-                if key >= buttons_down.len() {
+                let Some(key) = definition.button_number(code, pressed) else {
+                    log.debug(
+                        Subsystem::Device,
+                        format!("no button uses raw code {code}; skipping"),
+                    );
+                    continue;
+                };
+                let index = (key - 1) as usize;
+                if index >= buttons_down.len() {
                     continue;
                 }
 
-                if pressed && !buttons_down[key] {
-                    buttons_down[key] = true;
+                if pressed && !buttons_down[index] {
+                    buttons_down[index] = true;
 
-                    // raw key codes are physical button numbers (1-based), so the
-                    // event addresses the button of the number on this device
-                    let reference = Reference::button(device_number, key as u8);
+                    // the event addresses the button of the mapped number
+                    let reference = Reference::button(device_number, key);
 
                     // A press inside the double-click gap turns the click into the
                     // second half of a double click: cancel the first click's pending
                     // short-press confirmation so it cannot fire as a short too.
                     if let PressDecision::Double = click_detector.press(Instant::now()) {
-                        if let Some(pending) = pending_shorts.remove(&(key as u8)) {
+                        if let Some(pending) = pending_shorts.remove(&key) {
                             pending.alive.store(false, Ordering::Relaxed);
                             pending.handle.abort();
                         }
@@ -349,15 +360,15 @@ async fn run_device(
                         &scenes,
                         &reference,
                         "pressed",
-                        key,
+                        key as usize,
                         &mut timer_handle,
                         &timer_tx,
                     )
                     .await;
-                } else if !pressed && buttons_down[key] {
-                    buttons_down[key] = false;
+                } else if !pressed && buttons_down[index] {
+                    buttons_down[index] = false;
 
-                    let reference = Reference::button(device_number, key as u8);
+                    let reference = Reference::button(device_number, key);
                     let release_time = Instant::now();
 
                     run_bound_action(
@@ -368,7 +379,7 @@ async fn run_device(
                         &scenes,
                         &reference,
                         "released",
-                        key,
+                        key as usize,
                         &mut timer_handle,
                         &timer_tx,
                     )
@@ -388,7 +399,7 @@ async fn run_device(
                                 &scenes,
                                 &reference,
                                 "double_click",
-                                key,
+                                key as usize,
                                 &mut timer_handle,
                                 &timer_tx,
                             )
@@ -407,7 +418,7 @@ async fn run_device(
                                 &scenes,
                                 &reference,
                                 "long_press",
-                                key,
+                                key as usize,
                                 &mut timer_handle,
                                 &timer_tx,
                             )
@@ -424,15 +435,10 @@ async fn run_device(
                             let handle = tokio::spawn(async move {
                                 tokio::time::sleep(gap).await;
                                 if task_alive.load(Ordering::Relaxed) {
-                                    let _ = tx
-                                        .send((key as u8, ClickEvent::ShortPress))
-                                        .await;
+                                    let _ = tx.send((key, ClickEvent::ShortPress)).await;
                                 }
                             });
-                            pending_shorts.insert(
-                                key as u8,
-                                PendingShortPress { alive, handle },
-                            );
+                            pending_shorts.insert(key, PendingShortPress { alive, handle });
                         }
                     }
                 }

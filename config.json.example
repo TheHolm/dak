@@ -8,8 +8,8 @@
         "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
       },
       "actions": {
-        "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-        "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "1b01": { "short_press": "~", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1b02": { "short_press": "@Test", "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "timer": { "1": "@Main" }
       }
     },
@@ -28,14 +28,14 @@
         "1b03": { "type": "clear" }
       },
       "actions": {
-        "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-        "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "1b01": { "short_press": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1b03": { "short_press": "@on_start", "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "timer": { "1": "~" }
       }
     }
   },
   "defaults": {
-    "short_press_duration": 200,
+    "short_press_duration": 300,
     "double_click_gap": 300
   },
   "devices": {
@@ -53,14 +53,14 @@
         { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
         { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
         { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
-        { "number": 7, "press": 7, "release": 7, "screen": false, "draw_id": -1 },
-        { "number": 8, "press": 8, "release": 8, "screen": false, "draw_id": -1 },
-        { "number": 9, "press": 9, "release": 9, "screen": false, "draw_id": -1 }
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
       ],
       "encoders": [
-        { "number": 1, "cw": 144, "ccw": 145 },
-        { "number": 2, "cw": 146, "ccw": 147 },
-        { "number": 3, "cw": 148, "ccw": 149 }
+        { "number": 1, "cw": 81, "ccw": 80 },
+        { "number": 2, "cw": 145, "ccw": 144 },
+        { "number": 3, "cw": 97, "ccw": 96 }
       ]
     }
   }
