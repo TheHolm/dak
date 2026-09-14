@@ -34,6 +34,10 @@
       }
     }
   },
+  "defaults": {
+    "short_press_duration": 200,
+    "double_click_gap": 300
+  },
   "devices": {
     "1": {
       "device_id": "0300:3002",

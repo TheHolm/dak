@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use mirajazz::{
@@ -17,6 +20,7 @@ use dak::actions::{self, Action};
 use dak::baseplane::{Baseplane, Reference};
 use dak::log::{Log, Subsystem};
 use dak::map::Mapping;
+use dak::press::{ClickDetector, ClickEvent, PressDecision, PressDefaults, ReleaseDecision};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
 #[derive(Debug, Parser)]
@@ -166,6 +170,7 @@ async fn main() -> Result<(), MirajazzError> {
             device_info,
             scenes,
             log,
+            config.defaults,
         )));
     }
     for handle in handles {
@@ -183,19 +188,21 @@ async fn main() -> Result<(), MirajazzError> {
 }
 
 /// Runs one present device: connects with the key/encoder counts from its config
-/// definition, applies the `on_start` scene, and reacts to keys, encoder events and scene
-/// timers until the reader closes or Ctrl-C is pressed, then restores the buttons this
-/// session changed and shuts the device down.
+/// definition, applies the `on_start` scene, and reacts to keys, encoder events, scene
+/// timers and complex press events until the reader closes or Ctrl-C is pressed, then
+/// restores the buttons this session changed and shuts the device down.
 ///
 /// `device_number` is the id the definition is keyed under in the config; the runner
 /// drives references naming this number and skips references to other devices with a
-/// warning, so the same scenes address every device by its own number.
+/// warning, so the same scenes address every device by its own number. `defaults`
+/// carries the press-detection timing knobs from the config `defaults` section.
 async fn run_device(
     device_number: u8,
     definition: Mapping,
     device_info: HidDeviceInfo,
     scenes: Value,
     log: Log,
+    defaults: PressDefaults,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -267,6 +274,14 @@ async fn run_device(
         &screenless_buttons,
     );
 
+    // Complex press events (short/long press, double click): the detector decides
+    // which event each press or release produces. Only the short press outlives its
+    // release — it is confirmed through this channel after the double-click gap — so a
+    // second press inside the gap can cancel the first click's pending confirmation.
+    let (click_tx, mut click_rx) = mpsc::channel::<(u8, ClickEvent)>(8);
+    let mut click_detector = ClickDetector::new(defaults);
+    let mut pending_shorts: HashMap<u8, PendingShortPress> = HashMap::new();
+
     if let Err(error) = runner.enter_scene("on_start", &scenes).await {
         log.warn(format!("failed to apply on_start scene: {error}"));
     }
@@ -299,12 +314,10 @@ async fn run_device(
                 }
                 let key = data[9] as usize;
                 let pressed = data[10] != 0;
+                let state = if pressed { "pressed" } else { "released" };
                 log.debug(
                     Subsystem::Device,
-                    format!(
-                        "Key {}, state {}",
-                        data[9], data[10]
-                    ),
+                    format!("Key {}, {state}", data[9]),
                 );
 
                 if key >= buttons_down.len() {
@@ -317,6 +330,16 @@ async fn run_device(
                     // raw key codes are physical button numbers (1-based), so the
                     // event addresses the button of the number on this device
                     let reference = Reference::button(device_number, key as u8);
+
+                    // A press inside the double-click gap turns the click into the
+                    // second half of a double click: cancel the first click's pending
+                    // short-press confirmation so it cannot fire as a short too.
+                    if let PressDecision::Double = click_detector.press(Instant::now()) {
+                        if let Some(pending) = pending_shorts.remove(&(key as u8)) {
+                            pending.alive.store(false, Ordering::Relaxed);
+                            pending.handle.abort();
+                        }
+                    }
 
                     run_bound_action(
                         log,
@@ -335,6 +358,7 @@ async fn run_device(
                     buttons_down[key] = false;
 
                     let reference = Reference::button(device_number, key as u8);
+                    let release_time = Instant::now();
 
                     run_bound_action(
                         log,
@@ -349,6 +373,68 @@ async fn run_device(
                         &timer_tx,
                     )
                     .await;
+
+                    match click_detector.release(release_time) {
+                        ReleaseDecision::Double => {
+                            log.debug(
+                                Subsystem::Device,
+                                format!("key {key} double click detected"),
+                            );
+                            run_bound_action(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &reference,
+                                "double_click",
+                                key,
+                                &mut timer_handle,
+                                &timer_tx,
+                            )
+                            .await;
+                        }
+                        ReleaseDecision::Long => {
+                            log.debug(
+                                Subsystem::Device,
+                                format!("key {key} long press detected"),
+                            );
+                            run_bound_action(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &reference,
+                                "long_press",
+                                key,
+                                &mut timer_handle,
+                                &timer_tx,
+                            )
+                            .await;
+                        }
+                        ReleaseDecision::Short => {
+                            // The short press only fires once the double-click gap has
+                            // passed without a second press; a second press inside the
+                            // window flips the flag and aborts this task.
+                            let alive = Arc::new(AtomicBool::new(true));
+                            let task_alive = alive.clone();
+                            let tx = click_tx.clone();
+                            let gap = defaults.double_click_gap;
+                            let handle = tokio::spawn(async move {
+                                tokio::time::sleep(gap).await;
+                                if task_alive.load(Ordering::Relaxed) {
+                                    let _ = tx
+                                        .send((key as u8, ClickEvent::ShortPress))
+                                        .await;
+                                }
+                            });
+                            pending_shorts.insert(
+                                key as u8,
+                                PendingShortPress { alive, handle },
+                            );
+                        }
+                    }
                 }
             }
             action = timer_rx.recv() => {
@@ -370,6 +456,36 @@ async fn run_device(
                     &timer_tx,
                 )
                 .await;
+            }
+            click = click_rx.recv() => {
+                let Some((key, event)) = click else {
+                    break;
+                };
+                // The confirmation task finished on its own; drop its handle.
+                pending_shorts.remove(&key);
+                click_detector.confirm_single();
+                let reference = Reference::button(device_number, key);
+                match event {
+                    ClickEvent::ShortPress => {
+                        log.debug(
+                            Subsystem::Device,
+                            format!("key {key} single press detected"),
+                        );
+                        run_bound_action(
+                            log,
+                            &mut runner,
+                            &mut current_scene,
+                            &mut previous_scene,
+                            &scenes,
+                            &reference,
+                            "short_press",
+                            key as usize,
+                            &mut timer_handle,
+                            &timer_tx,
+                        )
+                        .await;
+                    }
+                }
             }
             event = exec_rx.recv() => {
                 let Some(event) = event else {
@@ -395,6 +511,20 @@ async fn run_device(
 
     device.shutdown().await?;
     Ok(())
+}
+
+/// A delayed short-press confirmation for one button.
+///
+/// The task sleeps `double_click_gap` after the release, then sends the short press
+/// event unless `alive` was flipped first — which happens when the double click's
+/// second press lands inside the window. The abort is a best-effort second line of
+/// defence; the flag is what makes the cancellation authoritative.
+struct PendingShortPress {
+    /// False once the click turned out to be a double click's first half.
+    alive: Arc<AtomicBool>,
+    /// The sleeping confirmation task; dropped when it finishes on its own or aborted
+    /// when a double click cancels it.
+    handle: tokio::task::JoinHandle<()>,
 }
 
 /// Resolves the action `reference` has bound to `event` (e.g. `pressed` or `released`)

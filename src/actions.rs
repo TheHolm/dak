@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
+use crate::press::PressDefaults;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -24,6 +25,8 @@ pub struct LoadedConfig {
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
     pub devices: ConfiguredDevices,
+    /// The timing knobs from the `defaults` section, with built-in defaults applied.
+    pub defaults: PressDefaults,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -195,9 +198,9 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes" && key != "devices" {
+        if key != "scenes" && key != "devices" && key != "defaults" {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\" and \"devices\""
+                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\" and \"defaults\""
             ));
         }
     }
@@ -218,6 +221,10 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     check_scenes(scenes, &mut warnings, &mut errors);
     let devices = map.get("devices").expect("checked above");
     let by_id = check_devices(devices, &mut errors);
+    let defaults = map
+        .get("defaults")
+        .map(|defaults| check_defaults(defaults, &mut errors))
+        .unwrap_or_default();
 
     if !errors.is_empty() {
         return Err(errors);
@@ -225,8 +232,56 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     Ok(LoadedConfig {
         scenes: scenes.clone(),
         devices: ConfiguredDevices { by_id },
+        defaults,
         warnings,
     })
+}
+
+/// Validates the optional `defaults` section: an object whose keys hold positive
+/// millisecond durations for the press-detection knobs. Missing keys fall back to
+/// [`PressDefaults::default`].
+fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
+    let map = match defaults.as_object() {
+        Some(map) => map,
+        None => {
+            errors.push(format!(
+                "config \"defaults\" must be an object, got {}",
+                value_type(defaults)
+            ));
+            return PressDefaults::default();
+        }
+    };
+
+    let mut result = PressDefaults::default();
+    for (key, value) in map {
+        if key != "short_press_duration" && key != "double_click_gap" {
+            errors.push(format!(
+                "defaults: unknown key \"{key}\", expected \"short_press_duration\" and \"double_click_gap\""
+            ));
+            continue;
+        }
+        let Some(number) = value.as_u64() else {
+            errors.push(format!(
+                "defaults.{key} must be a positive number of milliseconds, got {}",
+                value_type(value)
+            ));
+            continue;
+        };
+        if number == 0 {
+            errors.push(format!(
+                "defaults.{key} must be a positive number of milliseconds"
+            ));
+            continue;
+        }
+        match key.as_str() {
+            "short_press_duration" => {
+                result.short_press_duration = Duration::from_millis(number);
+            }
+            "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+            _ => unreachable!("unknown keys are rejected above"),
+        }
+    }
+    result
 }
 
 /// Validates the `scenes` section: an object whose keys are scene names.

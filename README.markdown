@@ -71,10 +71,11 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 
 ## Config structure
 
-`config.json` drives all runtime behavior. The top level of the config is a dictionary with exactly two keys:
+`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to three keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
+- `"defaults"` — optional press-detection timing knobs (see [Defaults](#defaults))
 
 ### Comments
 
@@ -99,6 +100,26 @@ JSON itself has no comment syntax, so `dak` strips comments before parsing: both
   }
 }
 ```
+
+### Defaults
+
+The optional top-level `defaults` section tunes how the complex button presses are detected. All keys are optional and fall back to their built-in values when missing:
+
+```json
+"defaults": {
+  "short_press_duration": 200,
+  "double_click_gap": 300
+}
+```
+
+- `short_press_duration` (default `200`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
+- `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
+
+Complex events are decided on the release edge, per button:
+
+- a press held past `short_press_duration` fires `long_press` on its release;
+- a second press landing inside `double_click_gap` of the previous release is a `double_click` firing on that second release, no matter how long the second press is held, and its first click never fires `short_press`;
+- anything else is a `short_press`, which only fires once `double_click_gap` has passed without a second press — so the first click of a double click is never reported as a short press too.
 
 ### Scenes
 
@@ -133,7 +154,7 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. `pressed` fires on the press edge, `released` on the release edge, and the complex events fire on release as described in [Defaults](#defaults). The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Action values have three forms:
   - `~` — stay on the same scene

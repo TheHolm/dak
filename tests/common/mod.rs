@@ -26,6 +26,14 @@ pub fn write_scenes_config(scenes_json: &str) -> PathBuf {
     write_temp_config(&format!("{{\"scenes\": {scenes_json}, \"devices\": {{}}}}"))
 }
 
+/// Wraps `scenes_json` and `defaults_json` in the top-level config structure and writes it
+/// to a unique temp file, returning its path. The `devices` section is left empty.
+pub fn write_config_with_defaults(defaults_json: &str, scenes_json: &str) -> PathBuf {
+    write_temp_config(&format!(
+        "{{\"scenes\": {scenes_json}, \"devices\": {{}}, \"defaults\": {defaults_json}}}"
+    ))
+}
+
 /// Loads `scenes_json` (wrapped into the top-level config structure) and asserts the
 /// returned errors contain `expected`.
 pub fn assert_validation_error(scenes_json: &str, expected: &str) {
