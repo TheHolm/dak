@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use dak::actions::{self, Action};
 use dak::baseplane::{Baseplane, Reference};
 use dak::log::{Log, Subsystem};
-use dak::map::Mapping;
+use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, PressDecision, PressDefaults, ReleaseDecision};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
@@ -275,12 +275,14 @@ async fn run_device(
     );
 
     // Complex press events (short/long press, double click): the detector decides
-    // which event each press or release produces. Only the short press outlives its
-    // release — it is confirmed through this channel after the double-click gap — so a
-    // second press inside the gap can cancel the first click's pending confirmation.
-    let (click_tx, mut click_rx) = mpsc::channel::<(u8, ClickEvent)>(8);
+    // which event each press or release produces. Widgets are addressed by their
+    // reference, so buttons and pushed encoders share one registry; only the short
+    // press outlives its release — it is confirmed through this channel after the
+    // double-click gap — so a second press inside the gap can cancel the first
+    // click's pending confirmation.
+    let (click_tx, mut click_rx) = mpsc::channel::<(Reference, ClickEvent)>(8);
     let mut click_detector = ClickDetector::new(defaults);
-    let mut pending_shorts: HashMap<u8, PendingShortPress> = HashMap::new();
+    let mut pending_shorts: HashMap<Reference, PendingShortPress> = HashMap::new();
 
     if let Err(error) = runner.enter_scene("on_start", &scenes).await {
         log.warn(format!("failed to apply on_start scene: {error}"));
@@ -291,7 +293,10 @@ async fn run_device(
 
     let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
     let mut current_scene = String::from("on_start");
-    let mut buttons_down = vec![false; device.key_count()];
+    // Button and pushed-encoder controls currently held down, so repeated press
+    // reports of the same widget are not re-dispatched and releases without a
+    // press are ignored.
+    let mut down_controls: std::collections::HashSet<Reference> = std::collections::HashSet::new();
 
     // Timer events are delivered through a channel so the input loop can react to
     // them without blocking on the device reader.
@@ -312,10 +317,10 @@ async fn run_device(
                 if !data.starts_with(&[65, 67, 75]) {
                     continue;
                 }
-                // The raw code in the report names a button by its captured
-                // press/release code, not by its number (buttons without a
+                // The raw code in the report names a widget by its captured
+                // press/release or turn code, not by its number (buttons without a
                 // display report far larger codes). Translate it through the
-                // definition and skip reports that no button uses.
+                // definition and skip reports that no widget uses.
                 let code = data[9];
                 let pressed = data[10] != 0;
                 let state = if pressed { "pressed" } else { "released" };
@@ -324,122 +329,93 @@ async fn run_device(
                     format!("Key {code}, {state}"),
                 );
 
-                let Some(key) = definition.button_number(code, pressed) else {
+                let Some(event) = definition.control_event(code, pressed) else {
                     log.debug(
                         Subsystem::Device,
-                        format!("no button uses raw code {code}; skipping"),
+                        format!("no control uses raw code {code}; skipping"),
                     );
                     continue;
                 };
-                let index = (key - 1) as usize;
-                if index >= buttons_down.len() {
-                    continue;
-                }
 
-                if pressed && !buttons_down[index] {
-                    buttons_down[index] = true;
-
-                    // the event addresses the button of the mapped number
-                    let reference = Reference::button(device_number, key);
-
-                    // A press inside the double-click gap turns the click into the
-                    // second half of a double click: cancel the first click's pending
-                    // short-press confirmation so it cannot fire as a short too.
-                    if let PressDecision::Double = click_detector.press(Instant::now()) {
-                        if let Some(pending) = pending_shorts.remove(&key) {
-                            pending.alive.store(false, Ordering::Relaxed);
-                            pending.handle.abort();
+                match event {
+                    ControlEvent::Button { number } => {
+                        if number > definition.key_count {
+                            log.debug(
+                                Subsystem::Device,
+                                format!("button {number} is out of range (device has {} buttons); skipping", definition.key_count),
+                            );
+                            continue;
                         }
+                        let reference = Reference::button(device_number, number);
+                        run_pressable_edge(
+                            log,
+                            &mut runner,
+                            &mut current_scene,
+                            &mut previous_scene,
+                            &scenes,
+                            &reference,
+                            pressed,
+                            &mut down_controls,
+                            &mut click_detector,
+                            &click_tx,
+                            &mut pending_shorts,
+                            defaults,
+                            &mut timer_handle,
+                            &timer_tx,
+                        )
+                        .await;
                     }
-
-                    run_bound_action(
-                        log,
-                        &mut runner,
-                        &mut current_scene,
-                        &mut previous_scene,
-                        &scenes,
-                        &reference,
-                        "pressed",
-                        key as usize,
-                        &mut timer_handle,
-                        &timer_tx,
-                    )
-                    .await;
-                } else if !pressed && buttons_down[index] {
-                    buttons_down[index] = false;
-
-                    let reference = Reference::button(device_number, key);
-                    let release_time = Instant::now();
-
-                    run_bound_action(
-                        log,
-                        &mut runner,
-                        &mut current_scene,
-                        &mut previous_scene,
-                        &scenes,
-                        &reference,
-                        "released",
-                        key as usize,
-                        &mut timer_handle,
-                        &timer_tx,
-                    )
-                    .await;
-
-                    match click_detector.release(release_time) {
-                        ReleaseDecision::Double => {
+                    ControlEvent::EncoderPress { number } => {
+                        if number > definition.encoder_count {
                             log.debug(
                                 Subsystem::Device,
-                                format!("key {key} double click detected"),
+                                format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
                             );
-                            run_bound_action(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &reference,
-                                "double_click",
-                                key as usize,
-                                &mut timer_handle,
-                                &timer_tx,
-                            )
-                            .await;
+                            continue;
                         }
-                        ReleaseDecision::Long => {
+                        let reference = Reference::encoder(device_number, number);
+                        run_pressable_edge(
+                            log,
+                            &mut runner,
+                            &mut current_scene,
+                            &mut previous_scene,
+                            &scenes,
+                            &reference,
+                            pressed,
+                            &mut down_controls,
+                            &mut click_detector,
+                            &click_tx,
+                            &mut pending_shorts,
+                            defaults,
+                            &mut timer_handle,
+                            &timer_tx,
+                        )
+                        .await;
+                    }
+                    ControlEvent::EncoderTurn { number, direction } => {
+                        if number > definition.encoder_count {
                             log.debug(
                                 Subsystem::Device,
-                                format!("key {key} long press detected"),
+                                format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
                             );
-                            run_bound_action(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &reference,
-                                "long_press",
-                                key as usize,
-                                &mut timer_handle,
-                                &timer_tx,
-                            )
-                            .await;
+                            continue;
                         }
-                        ReleaseDecision::Short => {
-                            // The short press only fires once the double-click gap has
-                            // passed without a second press; a second press inside the
-                            // window flips the flag and aborts this task.
-                            let alive = Arc::new(AtomicBool::new(true));
-                            let task_alive = alive.clone();
-                            let tx = click_tx.clone();
-                            let gap = defaults.double_click_gap;
-                            let handle = tokio::spawn(async move {
-                                tokio::time::sleep(gap).await;
-                                if task_alive.load(Ordering::Relaxed) {
-                                    let _ = tx.send((key, ClickEvent::ShortPress)).await;
-                                }
-                            });
-                            pending_shorts.insert(key, PendingShortPress { alive, handle });
-                        }
+                        let event = match direction {
+                            TwistDirection::Clockwise => "turn_cw",
+                            TwistDirection::CounterClockwise => "turn_ccw",
+                        };
+                        run_bound_action(
+                            log,
+                            &mut runner,
+                            &mut current_scene,
+                            &mut previous_scene,
+                            &scenes,
+                            &Reference::encoder(device_number, number),
+                            event,
+                            &mut timer_handle,
+                            &timer_tx,
+                        )
+                        .await;
                     }
                 }
             }
@@ -464,18 +440,17 @@ async fn run_device(
                 .await;
             }
             click = click_rx.recv() => {
-                let Some((key, event)) = click else {
+                let Some((pending_reference, event)) = click else {
                     break;
                 };
                 // The confirmation task finished on its own; drop its handle.
-                pending_shorts.remove(&key);
+                pending_shorts.remove(&pending_reference);
                 click_detector.confirm_single();
-                let reference = Reference::button(device_number, key);
                 match event {
                     ClickEvent::ShortPress => {
                         log.debug(
                             Subsystem::Device,
-                            format!("key {key} single press detected"),
+                            format!("{pending_reference} single press detected"),
                         );
                         run_bound_action(
                             log,
@@ -483,9 +458,8 @@ async fn run_device(
                             &mut current_scene,
                             &mut previous_scene,
                             &scenes,
-                            &reference,
+                            &pending_reference,
                             "short_press",
-                            key as usize,
                             &mut timer_handle,
                             &timer_tx,
                         )
@@ -519,7 +493,8 @@ async fn run_device(
     Ok(())
 }
 
-/// A delayed short-press confirmation for one button.
+/// A delayed short-press confirmation for one pressable control (a button or a
+/// pushed encoder).
 ///
 /// The task sleeps `double_click_gap` after the release, then sends the short press
 /// event unless `alive` was flipped first — which happens when the double click's
@@ -533,8 +508,9 @@ struct PendingShortPress {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// Resolves the action `reference` has bound to `event` (e.g. `pressed` or `released`)
-/// and runs it, logging the dispatch. Unbound references simply do nothing.
+/// Resolves the action `reference` has bound to `event` (e.g. `pressed`,
+/// `released` or `turn_cw`) and runs it, logging the dispatch. Unbound
+/// references simply do nothing.
 ///
 /// The action is looked up in the current scene first, then in the previously active
 /// scene (see `actions::action_for_event`), so pushed buttons keep their released
@@ -551,7 +527,6 @@ async fn run_bound_action(
     scenes: &Value,
     reference: &Reference,
     event: &str,
-    key: usize,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<String>,
 ) {
@@ -567,7 +542,7 @@ async fn run_bound_action(
 
     log.debug(
         Subsystem::Actions,
-        format!("key {key} {event} -> \"{action}\""),
+        format!("{reference} {event} -> \"{action}\""),
     );
 
     run_action(
@@ -581,6 +556,134 @@ async fn run_bound_action(
         timer_tx,
     )
     .await;
+}
+
+/// Feeds one press or release edge of a pressable control (a keypad button or a
+/// pushed encoder) into the input handling: tracks the down state, runs the
+/// `pressed`/`released` edge actions, and drives the shared [`ClickDetector`]
+/// for `short_press` / `long_press` / `double_click`.
+///
+/// All pressable controls share one detector and one pending-short registry keyed
+/// by [`Reference`], so encoder pushes behave exactly like buttons — including
+/// double-click detection across the whole keypad.
+///
+/// The parameter list is deliberately kept flat over bundling the shared state into one
+/// struct, mirroring `run_action` and `run_bound_action`.
+#[allow(clippy::too_many_arguments)]
+async fn run_pressable_edge(
+    log: Log,
+    runner: &mut actions::SceneRunner<'_, Device>,
+    current_scene: &mut String,
+    previous_scene: &mut Option<String>,
+    scenes: &Value,
+    reference: &Reference,
+    pressed: bool,
+    down_controls: &mut std::collections::HashSet<Reference>,
+    click_detector: &mut ClickDetector,
+    click_tx: &mpsc::Sender<(Reference, ClickEvent)>,
+    pending_shorts: &mut HashMap<Reference, PendingShortPress>,
+    defaults: PressDefaults,
+    timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    timer_tx: &mpsc::Sender<String>,
+) {
+    if pressed && !down_controls.contains(reference) {
+        down_controls.insert(*reference);
+
+        // A press inside the double-click gap turns the click into the
+        // second half of a double click: cancel the first click's pending
+        // short-press confirmation so it cannot fire as a short too.
+        if let PressDecision::Double = click_detector.press(Instant::now()) {
+            if let Some(pending) = pending_shorts.remove(reference) {
+                pending.alive.store(false, Ordering::Relaxed);
+                pending.handle.abort();
+            }
+        }
+
+        run_bound_action(
+            log,
+            runner,
+            current_scene,
+            previous_scene,
+            scenes,
+            reference,
+            "pressed",
+            timer_handle,
+            timer_tx,
+        )
+        .await;
+    } else if !pressed && down_controls.contains(reference) {
+        down_controls.remove(reference);
+        let release_time = Instant::now();
+
+        run_bound_action(
+            log,
+            runner,
+            current_scene,
+            previous_scene,
+            scenes,
+            reference,
+            "released",
+            timer_handle,
+            timer_tx,
+        )
+        .await;
+
+        match click_detector.release(release_time) {
+            ReleaseDecision::Double => {
+                log.debug(
+                    Subsystem::Device,
+                    format!("{reference} double click detected"),
+                );
+                run_bound_action(
+                    log,
+                    runner,
+                    current_scene,
+                    previous_scene,
+                    scenes,
+                    reference,
+                    "double_click",
+                    timer_handle,
+                    timer_tx,
+                )
+                .await;
+            }
+            ReleaseDecision::Long => {
+                log.debug(
+                    Subsystem::Device,
+                    format!("{reference} long press detected"),
+                );
+                run_bound_action(
+                    log,
+                    runner,
+                    current_scene,
+                    previous_scene,
+                    scenes,
+                    reference,
+                    "long_press",
+                    timer_handle,
+                    timer_tx,
+                )
+                .await;
+            }
+            ReleaseDecision::Short => {
+                // The short press only fires once the double-click gap has
+                // passed without a second press; a second press inside the
+                // window flips the flag and aborts this task.
+                let alive = Arc::new(AtomicBool::new(true));
+                let task_alive = alive.clone();
+                let tx = click_tx.clone();
+                let pending_reference = *reference;
+                let gap = defaults.double_click_gap;
+                let handle = tokio::spawn(async move {
+                    tokio::time::sleep(gap).await;
+                    if task_alive.load(Ordering::Relaxed) {
+                        let _ = tx.send((pending_reference, ClickEvent::ShortPress)).await;
+                    }
+                });
+                pending_shorts.insert(pending_reference, PendingShortPress { alive, handle });
+            }
+        }
+    }
 }
 
 /// Executes a scene action: stays (re-applying the current scene), switches scene,

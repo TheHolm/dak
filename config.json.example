@@ -30,6 +30,7 @@
       "actions": {
         "1b01": { "short_press": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "1b03": { "short_press": "@on_start", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1e01": { "turn_cw": "~", "turn_ccw": "@Test", "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
         "timer": { "1": "~" }
       }
     }
@@ -58,9 +59,9 @@
         { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
       ],
       "encoders": [
-        { "number": 1, "cw": 81, "ccw": 80 },
-        { "number": 2, "cw": 145, "ccw": 144 },
-        { "number": 3, "cw": 97, "ccw": 96 }
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
       ]
     }
   }

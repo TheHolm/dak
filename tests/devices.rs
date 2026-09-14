@@ -51,6 +51,67 @@ fn loads_config_with_devices_section() {
     assert!(!config.devices.by_id.contains_key(&2));
 }
 
+/// An encoder definition with push/release codes loads them into the mapping.
+#[test]
+fn loads_encoder_push_codes() {
+    let path = write_temp_config(
+        r#"{
+            "scenes": { "on_start": { "actions": {} } },
+            "devices": {
+                "1": {
+                    "device_id": "0300:3002",
+                    "device_name": "pad",
+                    "serial": "ABC123",
+                    "key_count": 9,
+                    "encoder_count": 1,
+                    "screens": 6,
+                    "buttons": [],
+                    "encoders": [
+                        { "number": 1, "cw": 144, "ccw": 145, "press": 146, "release": 146 }
+                    ]
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    let encoder = &config.devices.by_id[&1].encoders[0];
+    assert_eq!(encoder.press, 146);
+    assert_eq!(encoder.release, 146);
+}
+
+/// An older encoder definition without push codes still loads, with the push
+/// codes defaulting to zero (no captured push).
+#[test]
+fn loads_encoder_without_push_codes() {
+    let path = write_temp_config(
+        r#"{
+            "scenes": { "on_start": { "actions": {} } },
+            "devices": {
+                "1": {
+                    "device_id": "0300:3002",
+                    "device_name": "pad",
+                    "serial": "ABC123",
+                    "key_count": 9,
+                    "encoder_count": 1,
+                    "screens": 6,
+                    "buttons": [],
+                    "encoders": [
+                        { "number": 1, "cw": 144, "ccw": 145 }
+                    ]
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    let encoder = &config.devices.by_id[&1].encoders[0];
+    assert_eq!(encoder.press, 0);
+    assert_eq!(encoder.release, 0);
+}
+
 /// Multiple devices can be declared; each lands under its own id in ascending order.
 #[test]
 fn loads_multiple_device_definitions() {

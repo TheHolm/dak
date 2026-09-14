@@ -3,11 +3,11 @@
 //! Unlike the normal mode this wizard never reads `config.json` and never
 //! executes actions. It walks the user through picking a device, confirming
 //! (or entering) the key/encoder counts, reporting how many buttons have
-//! screens, capturing the raw code each physical button and encoder produces,
-//! and a manual display sanity check. Counts and codes are typed as numbers,
-//! confirmations as `y`/`yes`/`n`/`no`; the collected mapping is printed as
-//! JSON to stdout, then the device screens are cleared and the device is shut
-//! down.
+//! screens, capturing the raw code each physical button, encoder twist and
+//! encoder push produces, and a manual display sanity check. Counts and codes
+//! are typed as numbers, confirmations as `y`/`yes`/`n`/`no`; the collected
+//! mapping is printed as JSON to stdout, then the device screens are cleared
+//! and the device is shut down.
 
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -88,7 +88,7 @@ pub struct ButtonMapping {
     pub draw_id: i8,
 }
 
-/// Mapping of one encoder's twist codes.
+/// Mapping of one encoder's twist and push codes.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct EncoderMapping {
     /// Logical encoder number (1-based), the order the user turned them in.
@@ -97,6 +97,43 @@ pub struct EncoderMapping {
     pub cw: u8,
     /// Raw code observed for the second turn (the other direction).
     pub ccw: u8,
+    /// Raw code reported while the pushed knob is held down (`data[10] != 0`).
+    /// Zero means the push was never captured (older configs): the knob's push
+    /// is then ignored at runtime.
+    #[serde(default)]
+    pub press: u8,
+    /// Raw code reported when a pushed knob is released (`data[10] == 0`).
+    /// Zero means the push was never captured (older configs). Press and
+    /// release are most often the same code.
+    #[serde(default)]
+    pub release: u8,
+}
+
+/// Direction of one encoder turn, from the knob's perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwistDirection {
+    /// One notch clockwise.
+    Clockwise,
+    /// One notch counter-clockwise.
+    CounterClockwise,
+}
+
+/// What a raw report code addresses and how the report is read.
+///
+/// Buttons and pushed encoders are press/release controls (a non-zero `data[10]`
+/// marks the down edge); an encoder turn is a discrete notch event with no
+/// release edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlEvent {
+    /// A keypad button's press or release edge.
+    Button { number: u8 },
+    /// An encoder knob's push (down or up edge), acting like a button.
+    EncoderPress { number: u8 },
+    /// One notch of an encoder wheel.
+    EncoderTurn {
+        number: u8,
+        direction: TwistDirection,
+    },
 }
 
 impl Mapping {
@@ -119,6 +156,51 @@ impl Mapping {
                 }
             })
             .map(|button| button.number)
+    }
+
+    /// Resolves a raw report code to the [`ControlEvent`] it represents, looking
+    /// up button edges, encoder pushes and encoder turns in that order. Returns
+    /// `None` when no control in the definition uses the code, which is expected
+    /// for unreported noise.
+    ///
+    /// The wizard captures only distinct codes per device, so a code normally
+    /// addresses at most one control; a hand-written config may collide, and then
+    /// buttons win over pushes, pushes over turns. An encoder without captured
+    /// push codes (both zero, as in configs written before the wizard learned to
+    /// capture knob pushes) never reports a push, so the raw code `0` some
+    /// firmware sends when nothing is pressed stays inert.
+    pub fn control_event(&self, code: u8, pressed: bool) -> Option<ControlEvent> {
+        if let Some(number) = self.button_number(code, pressed) {
+            return Some(ControlEvent::Button { number });
+        }
+        if self
+            .encoders
+            .iter()
+            .any(|encoder| encoder.press != 0 || encoder.release != 0)
+        {
+            if let Some(encoder) = self
+                .encoders
+                .iter()
+                .find(|encoder| encoder.press == code || encoder.release == code)
+            {
+                return Some(ControlEvent::EncoderPress {
+                    number: encoder.number,
+                });
+            }
+        }
+        if let Some(encoder) = self.encoders.iter().find(|encoder| encoder.cw == code) {
+            return Some(ControlEvent::EncoderTurn {
+                number: encoder.number,
+                direction: TwistDirection::Clockwise,
+            });
+        }
+        if let Some(encoder) = self.encoders.iter().find(|encoder| encoder.ccw == code) {
+            return Some(ControlEvent::EncoderTurn {
+                number: encoder.number,
+                direction: TwistDirection::CounterClockwise,
+            });
+        }
+        None
     }
 }
 
@@ -225,7 +307,9 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     }
     println!();
 
-    // Step 5: capture one encoder at a time, one notch per direction.
+    // Step 5: capture one encoder at a time, one notch per direction. Encoder
+    // knobs are pushed as buttons too, so the push/release codes are captured
+    // for each encoder after its two twist codes.
     let mut encoders = Vec::new();
     for number in 1..=encoder_count {
         println!("turn encoder {number}: one notch clockwise, then one notch counter-clockwise");
@@ -233,7 +317,18 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         println!("encoder {number} -> first turn code {cw}, second turn code {ccw}");
         used.insert(cw);
         used.insert(ccw);
-        encoders.push(EncoderMapping { number, cw, ccw });
+        println!("press encoder {number}: push the knob, hold it, then release it");
+        let (press, release) = capture_press_release(&reader, &used).await?;
+        println!("encoder {number} -> push code {press}, release code {release}");
+        used.insert(press);
+        used.insert(release);
+        encoders.push(EncoderMapping {
+            number,
+            cw,
+            ccw,
+            press,
+            release,
+        });
     }
     println!();
 
@@ -366,8 +461,8 @@ fn mapping_json(mapping: &Mapping) -> String {
             ","
         };
         lines.push_str(&format!(
-            "    {{ \"number\": {}, \"cw\": {}, \"ccw\": {} }}{comma}\n",
-            encoder.number, encoder.cw, encoder.ccw
+            "    {{ \"number\": {}, \"cw\": {}, \"ccw\": {}, \"press\": {}, \"release\": {} }}{comma}\n",
+            encoder.number, encoder.cw, encoder.ccw, encoder.press, encoder.release
         ));
     }
     lines.push_str("  ]\n}");
@@ -722,7 +817,7 @@ mod tests {
         device_details, device_summary, is_no, parse_key_list, parse_key_number, parse_number,
         parse_yes_no, raw_event,
     };
-    use super::{ButtonMapping, EncoderMapping, Mapping};
+    use super::{ButtonMapping, ControlEvent, EncoderMapping, Mapping, TwistDirection};
     use std::collections::HashSet;
 
     /// `parse_number` accepts surrounding whitespace and the decimal format the
@@ -915,6 +1010,8 @@ mod tests {
                 number: 1,
                 cw: 81,
                 ccw: 80,
+                press: 79,
+                release: 79,
             }],
         };
         assert_eq!(
@@ -932,7 +1029,7 @@ mod tests {
                 "    { \"number\": 2, \"press\": 48, \"release\": 48, \"screen\": false, \"draw_id\": -1 }\n",
                 "  ],\n",
                 "  \"encoders\": [\n",
-                "    { \"number\": 1, \"cw\": 81, \"ccw\": 80 }\n",
+                "    { \"number\": 1, \"cw\": 81, \"ccw\": 80, \"press\": 79, \"release\": 79 }\n",
                 "  ]\n",
                 "}"
             )
@@ -1067,6 +1164,8 @@ mod tests {
                 number: 1,
                 cw: 0x90,
                 ccw: 0x91,
+                press: 0x92,
+                release: 0x92,
             }],
         };
         let value = serde_json::to_value(&mapping).unwrap();
@@ -1080,5 +1179,172 @@ mod tests {
         assert_eq!(value["buttons"][1]["draw_id"], -1);
         assert_eq!(value["encoders"][0]["cw"], 0x90);
         assert_eq!(value["encoders"][0]["ccw"], 0x91);
+        assert_eq!(value["encoders"][0]["press"], 0x92);
+        assert_eq!(value["encoders"][0]["release"], 0x92);
+    }
+
+    /// `Mapping::control_event` resolves a pressed/released button code to a
+    /// button reference, including the large scan codes of screenless buttons.
+    #[test]
+    fn control_event_resolves_button_edges() {
+        let mapping = sample_mapping();
+        assert_eq!(
+            mapping.control_event(3, true),
+            Some(ControlEvent::Button { number: 3 })
+        );
+        assert_eq!(
+            mapping.control_event(3, false),
+            Some(ControlEvent::Button { number: 3 })
+        );
+        assert_eq!(
+            mapping.control_event(37, true),
+            Some(ControlEvent::Button { number: 7 })
+        );
+        assert_eq!(
+            mapping.control_event(37, false),
+            Some(ControlEvent::Button { number: 7 })
+        );
+    }
+
+    /// A distinct button press code only resolves while pressed, its release
+    /// code only on the release edge, mirroring `button_number`.
+    #[test]
+    fn control_event_resolves_distinct_button_press_and_release_codes() {
+        let mapping = Mapping {
+            buttons: vec![ButtonMapping {
+                number: 3,
+                press: 0x60,
+                release: 0x61,
+                screen: true,
+                draw_id: 3,
+            }],
+            ..sample_mapping()
+        };
+        assert_eq!(
+            mapping.control_event(0x60, true),
+            Some(ControlEvent::Button { number: 3 })
+        );
+        assert_eq!(mapping.control_event(0x60, false), None);
+        assert_eq!(
+            mapping.control_event(0x61, false),
+            Some(ControlEvent::Button { number: 3 })
+        );
+        assert_eq!(mapping.control_event(0x61, true), None);
+    }
+
+    /// Both encoder twist codes resolve to an encoder turn with the right
+    /// direction, regardless of the reported state.
+    #[test]
+    fn control_event_resolves_encoder_turns_to_directions() {
+        let mapping = sample_mapping();
+        assert_eq!(
+            mapping.control_event(81, false),
+            Some(ControlEvent::EncoderTurn {
+                number: 1,
+                direction: TwistDirection::Clockwise,
+            })
+        );
+        assert_eq!(
+            mapping.control_event(81, true),
+            Some(ControlEvent::EncoderTurn {
+                number: 1,
+                direction: TwistDirection::Clockwise,
+            })
+        );
+        assert_eq!(
+            mapping.control_event(80, false),
+            Some(ControlEvent::EncoderTurn {
+                number: 1,
+                direction: TwistDirection::CounterClockwise,
+            })
+        );
+    }
+
+    /// The knob's push code resolves to an encoder press on both edges.
+    #[test]
+    fn control_event_resolves_encoder_push_and_release() {
+        let mapping = sample_mapping();
+        assert_eq!(
+            mapping.control_event(79, true),
+            Some(ControlEvent::EncoderPress { number: 1 })
+        );
+        assert_eq!(
+            mapping.control_event(79, false),
+            Some(ControlEvent::EncoderPress { number: 1 })
+        );
+        assert_eq!(mapping.control_event(78, true), None);
+    }
+
+    /// Codes no control in the definition uses are reported as unknown.
+    #[test]
+    fn control_event_returns_none_for_unmapped_codes() {
+        let mapping = sample_mapping();
+        for code in [0, 9, 42, 200, 255] {
+            assert_eq!(mapping.control_event(code, true), None);
+            assert_eq!(mapping.control_event(code, false), None);
+        }
+    }
+
+    /// An encoder definition without push codes (older configs) still resolves
+    /// its turns but never reports a push.
+    #[test]
+    fn control_event_without_push_codes_ignores_pushes() {
+        let mapping = Mapping {
+            encoders: vec![EncoderMapping {
+                number: 1,
+                cw: 81,
+                ccw: 80,
+                press: 0,
+                release: 0,
+            }],
+            ..sample_mapping()
+        };
+        assert_eq!(mapping.control_event(0, true), None);
+        assert!(matches!(
+            mapping.control_event(81, true),
+            Some(ControlEvent::EncoderTurn { .. })
+        ));
+    }
+
+    /// A reusable encoder-bearing mapping for the resolver tests.
+    fn sample_mapping() -> Mapping {
+        Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "keypad".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 9,
+            encoder_count: 1,
+            screens: 6,
+            buttons: vec![
+                ButtonMapping {
+                    number: 1,
+                    press: 1,
+                    release: 1,
+                    screen: true,
+                    draw_id: 1,
+                },
+                ButtonMapping {
+                    number: 3,
+                    press: 3,
+                    release: 3,
+                    screen: true,
+                    draw_id: 3,
+                },
+                ButtonMapping {
+                    number: 7,
+                    press: 37,
+                    release: 37,
+                    screen: false,
+                    draw_id: -1,
+                },
+            ],
+            encoders: vec![EncoderMapping {
+                number: 1,
+                cw: 81,
+                ccw: 80,
+                press: 79,
+                release: 79,
+            }],
+        }
     }
 }

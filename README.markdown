@@ -63,6 +63,7 @@ All runtime behavior is driven by `config.json` instead of the hard-coded demo o
 
 - **Scenes** — buttons can display images, static text files, or the output of async commands (`image_exec` / `text_exec` with a 5-second timeout); scenes switch on key/encoder input, from the scene timer, or on demand.
 - **Per-key actions** — `short_press`, `long_press`, `double_click`, `pressed` and `released` bindings, with actions inherited from the previously active scene.
+- **Encoders** — each encoder binds `turn_cw` / `turn_ccw` per rotation notch, and the knob itself is pressable like a button: pushing it fires the same `pressed` / `released` / `short_press` / `long_press` / `double_click` events.
 - **Timers** — each scene can run a `timer` action after a number of seconds; button presses and scene switches re-arm it only when appropriate.
 
 ## Platform support
@@ -115,7 +116,9 @@ The optional top-level `defaults` section tunes how the complex button presses a
 - `short_press_duration` (default `300`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
 - `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
 
-Complex events are decided on the release edge, per button:
+Complex events are decided on the release edge, per pressable control: buttons and
+pushed encoders share the same detection, so a pushed encoder's knob behaves exactly
+like an extra button:
 
 - a press held past `short_press_duration` fires `long_press` on its release;
 - a second press landing inside `double_click_gap` of the previous release is a `double_click` firing on that second release, no matter how long the second press is held, and its first click never fires `short_press`;
@@ -140,9 +143,9 @@ For example `1b01` is button 1 on device 1, and `2e01` is encoder 1 on device 2.
 Rules for the program:
 
 - References to devices that are **not present** — whose definition was not matched to any discovered device — are skipped at runtime with a warning (`device N is referenced but not present`).
-- Encoder references (`1e01`) are reserved: encoder setup/actions are skipped at runtime with a warning. Assigning an image to an encoder — a `setup` entry with `type` `image`, `text`, `image_exec` or `text_exec` on an `e` key — is a config error and the program refuses to start.
+- Encoder references (`1e01`) work in `actions`: `turn_cw` / `turn_ccw` bind one rotation notch each, and the knob push binds the same `pressed` / `released` / `short_press` / `long_press` / `double_click` events as a button. Encoders are not allowed in `setup`: `setup` configures button screens only, and a `setup` entry on an `e` key — any `type` of `image`, `text`, `image_exec` or `text_exec` — is a config error and the program refuses to start.
 - Assigning an image to a button that has no display (`"screen": false` in its device definition) is skipped at runtime with a warning; the file is not even read and nothing is transferred to the device.
-- Out-of-range button references (e.g. `1b99` on a 9-button device) are skipped with a warning.
+- Out-of-range button or encoder references (e.g. `1b99` on a 9-button device, or `1e04` on a 3-encoder one) are skipped with a warning.
 - The old plain numeric keys (`"1"`, `"3"`, ...) are no longer accepted; update them to `"1b01"`, `"1b03"`, ...
 
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
@@ -154,7 +157,7 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
@@ -213,6 +216,8 @@ The `devices` section declares the individual devices the config drives. Its key
 dak --map
 ```
 
+Each `buttons` entry maps a button `number` to the raw codes it sends when pressed and released, and whether the button has a screen (`screen` `true`/`false` with its `draw_id`). Each `encoders` entry maps an encoder `number` to its `cw`/`ccw` codes — one `turn_cw`/`turn_ccw` action per rotation notch — and, after the wizard replays a knob push, its `press`/`release` codes; an encoder without push codes still turns, but its knob push is ignored at runtime.
+
 A device definition looks like this:
 
 ```json
@@ -228,7 +233,7 @@ A device definition looks like this:
     { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 }
   ],
   "encoders": [
-    { "number": 1, "cw": 144, "ccw": 145 }
+    { "number": 1, "cw": 144, "ccw": 145, "press": 146, "release": 146 }
   ]
 }
 ```
