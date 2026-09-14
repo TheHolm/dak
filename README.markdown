@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.2**.
+The current version is **v0.3.0**.
 
 ## Usage
 
@@ -71,18 +71,69 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 
 ## Config structure
 
-`config.json` drives all runtime behavior. Keys in the top-level object denote **scenes**, and a scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
+`config.json` drives all runtime behavior. The top level of the config is a dictionary with exactly two keys:
+
+- `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
+- `"devices"` — the individual device definitions (see [Devices](#devices))
+
+### Comments
+
+JSON itself has no comment syntax, so `dak` strips comments before parsing: both `//` line comments and `/* ... */` block comments may appear anywhere the JSON grammar allows whitespace, including at the very top or bottom of the file. Comment markers inside a string are part of the string value, not comments. Example:
+
+```json
+{
+  // which scene starts the program
+  "scenes": { "on_start": { "actions": {} } },
+  /* one keypad, wired by serial */
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "ABC123", // fall back to "unknown" if your pad has no serial
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [],
+      "encoders": []
+    }
+  }
+}
+```
+
+### Scenes
+
+A scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
+
+Buttons and encoders in `setup` and `actions` are addressed by **control references** of the form
+
+```
+<device><b|e><number>
+```
+
+- `<device>` is a single digit `1`–`9` naming a logical device. Each digit names one device definition from the `devices` section; at startup every definition matched to discovered hardware is driven, so a reference names a specific physical device by its id.
+- `b` addresses a button, `e` an encoder.
+- `<number>` is the control number, always written with two digits, `01`–`99` (the AKP03E has 9 buttons and 3 encoders).
+
+For example `1b01` is button 1 on device 1, and `2e01` is encoder 1 on device 2.
+
+Rules for the program:
+
+- References to devices that are **not present** — whose definition was not matched to any discovered device — are skipped at runtime with a warning (`device N is referenced but not present`).
+- Encoder references (`1e01`) are reserved: encoder setup/actions are skipped at runtime with a warning. Assigning an image to an encoder — a `setup` entry with `type` `image`, `text`, `image_exec` or `text_exec` on an `e` key — is a config error and the program refuses to start.
+- Assigning an image to a button that has no display (`"screen": false` in its device definition) is skipped at runtime with a warning; the file is not even read and nothing is transferred to the device.
+- Out-of-range button references (e.g. `1b99` on a 9-button device) are skipped with a warning.
+- The old plain numeric keys (`"1"`, `"3"`, ...) are no longer accepted; update them to `"1b01"`, `"1b03"`, ...
 
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
-- `setup` — a dictionary of numbered buttons. Numbered keys map a physical button to a dictionary with `type` and `params`:
+- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type` and `params`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-- `actions` — a dictionary of per-key behavior. Numerical keys are button numbers and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-button behavior. Keys are control references (e.g. `1b01`) and map to the actions for `pressed`, `released`, `short_press`, `long_press` and `double_click`. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Action values have three forms:
   - `~` — stay on the same scene
@@ -91,27 +142,27 @@ Action values have three forms:
 
 Commands are executed asynchronously, so a running command does not block button input or the timer.
 
-Example:
+Example scenes:
 
 ```json
 {
   "on_start": {
     "setup": {
-      "1": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/proc/uptime" }
+      "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/proc/uptime" }
     },
     "actions": {
-      "1": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "2": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "@Main" }
     }
   },
   "Main": {
     "setup": {
-      "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "4": { "type": "text", "params": "/proc/uptime" }
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b04": { "type": "text", "params": "/proc/uptime" }
     },
     "actions": {
       "timer": { "1": "~" }
@@ -119,13 +170,79 @@ Example:
   },
   "Test": {
     "setup": {
-      "2": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
-      "3": { "type": "clear" }
+      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+      "1b03": { "type": "clear" }
     },
     "actions": {
-      "1": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "3": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+      "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "~" }
+    }
+  }
+}
+```
+
+### Devices
+
+The `devices` section declares the individual devices the config drives. Its keys are **logical device ids** (single digits `1`–`9`, the same digits the control references use), and each value is a device definition — the exact JSON that `dak --map` prints when it has walked you through picking a device and capturing its buttons and encoders:
+
+```
+dak --map
+```
+
+A device definition looks like this:
+
+```json
+{
+  "device_id": "0300:3002",
+  "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+  "serial": "unknown",
+  "key_count": 9,
+  "encoder_count": 3,
+  "screens": 6,
+  "buttons": [
+    { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+    { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 }
+  ],
+  "encoders": [
+    { "number": 1, "cw": 144, "ccw": 145 }
+  ]
+}
+```
+
+At startup each definition is matched against the discovered hardware:
+
+- A definition whose serial is anything but `"unknown"` matches only the device reporting that exact serial, which tells identical devices apart.
+- A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
+
+Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with an error.
+
+A complete config combining both sections looks like:
+
+```json
+{
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "image", "params": "/path/reader.ico" }
+      },
+      "actions": {
+        "timer": { "1": "@Main" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 }
+      ],
+      "encoders": []
     }
   }
 }

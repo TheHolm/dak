@@ -1,10 +1,12 @@
 use serde_json::{self, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
+use crate::map::Mapping;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -18,8 +20,24 @@ use std::os::unix::process::CommandExt as _;
 /// Parsed and validated config plus any non-fatal warnings collected while validating it.
 #[derive(Debug)]
 pub struct LoadedConfig {
+    /// The validated `scenes` section: a dictionary whose keys are scene names.
     pub scenes: Value,
+    /// The validated `devices` section, keyed by logical device id.
+    pub devices: ConfiguredDevices,
+    /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
+}
+
+/// Device definitions from the config `devices` section, keyed by logical device id.
+///
+/// The ids are the digits control references use (`1b01` addresses device `1`). Each
+/// definition describes one physical device in exactly the shape `dak --map` prints it;
+/// the runtime matches these definitions against the discovered hardware and drives every
+/// matched device.
+#[derive(Debug, Default)]
+pub struct ConfiguredDevices {
+    /// The device definitions, keyed by logical device id in ascending order.
+    pub by_id: BTreeMap<u8, Mapping>,
 }
 
 /// Loads and validates `config.json` from the current working directory.
@@ -88,7 +106,7 @@ pub fn load_config_from_path(path: &str) -> Result<LoadedConfig, Vec<String>> {
     let content =
         fs::read_to_string(path).map_err(|e| vec![format!("Couldn't open {path}: {e}")])?;
 
-    let json: Value = serde_json::from_str(&content)
+    let json: Value = serde_json::from_str(&strip_comments(&content))
         .map_err(|error| vec![format_json_error(path, &content, &error)])?;
 
     validate(&json)
@@ -105,31 +123,190 @@ fn format_json_error(path: &str, content: &str, error: &serde_json::Error) -> St
     )
 }
 
-/// Validates the whole scene tree, returning all errors at once or warnings with the parsed config.
-fn validate(scenes: &Value) -> Result<LoadedConfig, Vec<String>> {
+/// Removes `//` line and `/* */` block comments from a JSON config so it can carry
+/// comments, while leaving string contents and other JSON text untouched.
+///
+/// The comment text is replaced with an equal number of spaces, keeping `\n` newlines
+/// in place. The output therefore has the same length and the same line starts as the
+/// input, so a later JSON parse error still reports line and column numbers relative
+/// to the original file. An unterminated `/*` comments out the rest of the file.
+pub fn strip_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let c = chars[index];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+                index += 1;
+            }
+            '/' if index + 1 < chars.len() && chars[index + 1] == '/' => {
+                while index < chars.len() && chars[index] != '\n' {
+                    out.push(' ');
+                    index += 1;
+                }
+            }
+            '/' if index + 1 < chars.len() && chars[index + 1] == '*' => {
+                index += 2;
+                while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    out.push(if chars[index] == '\n' { '\n' } else { ' ' });
+                    index += 1;
+                }
+                index = (index + 2).min(chars.len());
+            }
+            _ => {
+                out.push(c);
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Validates the whole config (the `scenes` and `devices` sections), returning all errors at
+/// once or warnings with the parsed config.
+fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    let map = match scenes.as_object() {
+    let map = match config.as_object() {
         Some(map) => map,
         None => {
             return Err(vec![
-                "Config must be a JSON object whose keys are scene names".to_string(),
+                "Config must be a JSON object with \"scenes\" and \"devices\" keys".to_string(),
             ]);
         }
     };
 
-    for (scene_name, scene) in map {
-        check_scene(scenes, scene_name, scene, &mut warnings, &mut errors);
+    for key in map.keys() {
+        if key != "scenes" && key != "devices" {
+            errors.push(format!(
+                "unknown top-level key \"{key}\", expected \"scenes\" and \"devices\""
+            ));
+        }
     }
+
+    let missing_scenes = !map.contains_key("scenes");
+    let missing_devices = !map.contains_key("devices");
+    if missing_scenes {
+        errors.push("the config is missing the \"scenes\" section".to_string());
+    }
+    if missing_devices {
+        errors.push("the config is missing the \"devices\" section".to_string());
+    }
+    if missing_scenes || missing_devices {
+        return Err(errors);
+    }
+
+    let scenes = map.get("scenes").expect("checked above");
+    check_scenes(scenes, &mut warnings, &mut errors);
+    let devices = map.get("devices").expect("checked above");
+    let by_id = check_devices(devices, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(LoadedConfig {
         scenes: scenes.clone(),
+        devices: ConfiguredDevices { by_id },
         warnings,
     })
+}
+
+/// Validates the `scenes` section: an object whose keys are scene names.
+fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+    let map = match scenes.as_object() {
+        Some(map) => map,
+        None => {
+            errors
+                .push("config \"scenes\" must be an object whose keys are scene names".to_string());
+            return;
+        }
+    };
+
+    for (scene_name, scene) in map {
+        check_scene(scenes, scene_name, scene, warnings, errors);
+    }
+}
+
+/// Validates the `devices` section: a dictionary keyed by logical device id, each value a
+/// device mapping in the shape `dak --map` prints out.
+///
+/// Invalid ids and mappings are reported; the valid definitions are collected into a map
+/// keyed by device id, which holds the definitions that parsed even when other entries
+/// failed (the caller only accepts the result when there were no errors at all).
+fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapping> {
+    let mut by_id = BTreeMap::new();
+    let map = match devices.as_object() {
+        Some(map) => map,
+        None => {
+            errors.push("config \"devices\" must be an object of logical device ids".to_string());
+            return by_id;
+        }
+    };
+
+    for (id, value) in map {
+        let Some(number) = parse_device_id(id) else {
+            errors.push(format!(
+                "device id \"{id}\" is not a valid logical device id, expected a single digit from 1 to 9"
+            ));
+            continue;
+        };
+        match serde_json::from_value::<Mapping>(value.clone()) {
+            Ok(mapping) => {
+                by_id.insert(number, mapping);
+            }
+            Err(error) => errors.push(format!(
+                "device \"{id}\" is not a valid device mapping: {error}"
+            )),
+        }
+    }
+    by_id
+}
+
+/// Parses one logical device id from a `devices` dictionary key.
+///
+/// Device ids are the digits control references use: exactly one digit from `1` to 9.
+fn parse_device_id(id: &str) -> Option<u8> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 1 || !(b'1'..=b'9').contains(&bytes[0]) {
+        return None;
+    }
+    Some(bytes[0] - b'0')
+}
+
+/// Whether a discovered device matches a config device definition.
+///
+/// A definition whose serial is anything but the "unknown" placeholder only matches a
+/// discovered device reporting that exact serial, so identical devices are told apart. A
+/// definition whose serial is "unknown" falls back to comparing the VID:PID string, so
+/// devices without serials still work as long as only one of their kind is connected.
+pub fn discovered_device_matches(
+    definition: &Mapping,
+    serial: &Option<String>,
+    vendor_id: u16,
+    product_id: u16,
+) -> bool {
+    if definition.serial != "unknown" {
+        return serial.as_deref() == Some(definition.serial.as_str());
+    }
+    definition.device_id == format!("{vendor_id:04X}:{product_id:04X}")
 }
 
 /// Validates a scene: the reserved `setup` key holds numbered button operations
@@ -193,12 +370,13 @@ fn check_button_op(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) {
-    if key.parse::<u8>().is_err() {
-        errors.push(format!(
-            "scene \"{scene_name}\": unknown key \"{key}\", expected a button number"
-        ));
-        return;
-    }
+    let reference = match Reference::parse(key) {
+        Ok(reference) => reference,
+        Err(error) => {
+            errors.push(format!("scene \"{scene_name}\": key \"{key}\" {error}"));
+            return;
+        }
+    };
 
     let location = format!("key \"{key}\"");
     let object = match value.as_object() {
@@ -227,6 +405,17 @@ fn check_button_op(
             return;
         }
     };
+
+    // Encoders have no display, so assigning an image to one is a config error; the
+    // program must not start with it.
+    if reference.kind == Kind::Encoder
+        && matches!(kind, "image" | "text" | "image_exec" | "text_exec")
+    {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} cannot assign {kind} to encoder {reference}"
+        ));
+        return;
+    }
 
     let params = match object.get("params") {
         Some(value) => match value.as_str() {
@@ -296,6 +485,11 @@ fn check_actions(
     for (key, action) in map {
         if key == "timer" {
             check_timer(scenes, scene_name, action, errors, warnings);
+            continue;
+        }
+
+        if let Err(error) = Reference::parse(key) {
+            errors.push(format!("scene \"{scene_name}\": actions.\"{key}\" {error}"));
             continue;
         }
 
@@ -470,22 +664,31 @@ impl CommandSpec {
 /// A single operation derived from a scene's numbered button entries.
 #[derive(Debug, PartialEq)]
 pub enum SceneOp {
-    /// Load `path` as the image for a button. Keys are physical button numbers (1-based).
-    SetImage { key: u8, path: String },
-    /// Show the first lines of `path` as text on a button. Keys are physical button numbers (1-based).
-    Text { key: u8, path: String },
-    /// Run `command` and show its stdout as text on a button. Keys are physical button numbers (1-based).
-    TextExec { key: u8, command: CommandSpec },
-    /// Run `command` and set its stdout (an image file) as the button image. Keys are physical button numbers (1-based).
-    ImageExec { key: u8, command: CommandSpec },
+    /// Load `path` as the image for a button. References are physical buttons (1-based).
+    SetImage { reference: Reference, path: String },
+    /// Show the first lines of `path` as text on a button. References are physical buttons (1-based).
+    Text { reference: Reference, path: String },
+    /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
+    TextExec {
+        reference: Reference,
+        command: CommandSpec,
+    },
+    /// Run `command` and set its stdout (an image file) as the button image. References are physical buttons (1-based).
+    ImageExec {
+        reference: Reference,
+        command: CommandSpec,
+    },
     /// Run `command` detached from this program: own process group, no stdio, and not
-    /// killed when the program exits. The decoy button (`key`) is only a config slot;
-    /// nothing is drawn on it and nothing is restored on termination. Keys are physical
-    /// button numbers (1-based).
-    Launch { key: u8, command: CommandSpec },
-    /// Clear the image of a button. Keys are physical button numbers (1-based).
-    Clear { key: u8 },
-    /// Command kind that is not implemented.
+    /// killed when the program exits. The decoy reference is only a config slot;
+    /// nothing is drawn on it and nothing is restored on termination. References are
+    /// physical buttons (1-based).
+    Launch {
+        reference: Reference,
+        command: CommandSpec,
+    },
+    /// Clear the image of a button. References are physical buttons (1-based).
+    Clear { reference: Reference },
+    /// Control kind that is not implemented.
     Unsupported { kind: String },
 }
 
@@ -511,9 +714,8 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         .ok_or_else(|| format!("scene \"{scene_name}\": setup is not an object"))?;
 
     for (key, value) in map {
-        let button = key
-            .parse::<u8>()
-            .map_err(|_| format!("scene \"{scene_name}\": key \"{key}\" is not a button number"))?;
+        let reference = Reference::parse(key)
+            .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\" {error}"))?;
 
         let object = value.as_object().ok_or_else(|| {
             format!("scene \"{scene_name}\": key \"{key}\" must be an object with \"type\" and \"params\"")
@@ -535,35 +737,26 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
 
         match kind {
             "image" => operations.push(SceneOp::SetImage {
-                key: button,
+                reference,
                 path: params,
             }),
             "text" => operations.push(SceneOp::Text {
-                key: button,
+                reference,
                 path: params,
             }),
             "text_exec" => {
                 let command = params_command(scene_name, key, "text_exec", &params)?;
-                operations.push(SceneOp::TextExec {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::TextExec { reference, command });
             }
             "image_exec" => {
                 let command = params_command(scene_name, key, "image_exec", &params)?;
-                operations.push(SceneOp::ImageExec {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::ImageExec { reference, command });
             }
             "launch" => {
                 let command = params_command(scene_name, key, "launch", &params)?;
-                operations.push(SceneOp::Launch {
-                    key: button,
-                    command,
-                });
+                operations.push(SceneOp::Launch { reference, command });
             }
-            "clear" => operations.push(SceneOp::Clear { key: button }),
+            "clear" => operations.push(SceneOp::Clear { reference }),
             other => operations.push(SceneOp::Unsupported {
                 kind: other.to_string(),
             }),
@@ -715,6 +908,9 @@ pub trait ButtonDevice: Send + Sync {
 
     /// Sends all staged images to the device's LCDs.
     async fn flush(&self) -> Result<(), Self::Error>;
+
+    /// Number of buttons the device physically has.
+    fn key_count(&self) -> u8;
 }
 
 impl ButtonDevice for Device {
@@ -736,6 +932,10 @@ impl ButtonDevice for Device {
     async fn flush(&self) -> Result<(), Self::Error> {
         Device::flush(self).await
     }
+
+    fn key_count(&self) -> u8 {
+        Device::key_count(self) as u8
+    }
 }
 
 /// Runs scene operations against one device, managing asynchronous `image_exec` and
@@ -752,27 +952,40 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     tracker: ExecTracker,
     /// Output filter: debug lines for scene/device events only print when enabled.
     log: Log,
+    /// Config number of the device this runner drives. Operations targeting another
+    /// device's number are detected and skipped with a notice.
+    device_number: u8,
     /// Physical button numbers (1-based) that this runner applied any image operation to
     /// during the session. Termination cleanup clears exactly these buttons, so buttons the
     /// program never touched are left alone.
     changed_keys: std::collections::HashSet<u8>,
+    /// Physical button numbers (1-based) that have no display on this device. Image
+    /// operations targetting them are skipped with a warning: the hardware ignores them.
+    screenless_buttons: std::collections::HashSet<u8>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
-    /// Creates a runner bound to `device`, sending `exec` results through `exec_tx`,
-    /// reporting scene/device events through `log`.
+    /// Creates a runner driving the config device `device_number` bound to `device`,
+    /// sending `exec` results through `exec_tx`, reporting scene/device events through `log`.
+    ///
+    /// `screenless_buttons` lists the device buttons that have no display; image
+    /// assignment to them is skipped with a warning (see [`SceneRunner`]).
     pub fn new(
+        device_number: u8,
         device: &'a D,
         image_format: ImageFormat,
         exec_tx: mpsc::Sender<ExecEvent>,
         log: Log,
+        screenless_buttons: &std::collections::HashSet<u8>,
     ) -> Self {
         Self {
             device,
             image_format,
             tracker: ExecTracker::new(exec_tx),
             log,
+            device_number,
             changed_keys: std::collections::HashSet::new(),
+            screenless_buttons: screenless_buttons.clone(),
         }
     }
 
@@ -790,23 +1003,85 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
 
     /// Applies scene operations to the device; unsupported operations are skipped with a notice.
     ///
-    /// Before touching a button, any still-running `exec` task for that button is cancelled:
-    /// its process is killed, a red "Error" is drawn, and the failure is logged. Async
-    /// results arriving later for the old generation are discarded.
+    /// Operations targeting another device's number, encoder references (not implemented
+    /// yet), buttons beyond the device's physical count, or buttons without a display are
+    /// reported and skipped. Before touching a button, any still-running `exec` task for
+    /// that button is cancelled: its process is killed, a red "Error" is drawn, and the
+    /// failure is logged. Async results arriving later for the old generation are
+    /// discarded.
     pub async fn apply_scene_operations(
         &mut self,
         operations: &[SceneOp],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for operation in operations {
-            if let Some(key) = operation_key(operation) {
-                // record the button as "touched" so termination cleanup can restore exactly
-                // the buttons this session changed (unused buttons are left alone)
-                self.changed_keys.insert(key);
-                self.cancel_exec_if_running(key).await;
+            // Unsupported carries no reference, so it is skipped before any per-reference
+            // filtering can apply.
+            let Some(reference) = operation_reference(operation) else {
+                let SceneOp::Unsupported { kind } = operation else {
+                    unreachable!("operation without a reference must be Unsupported");
+                };
+                self.log.warn(format!(
+                    "scene setup \"{kind}\" on key is not supported and was skipped"
+                ));
+                continue;
+            };
+            let reference = *reference;
+
+            if reference.device != self.device_number {
+                self.log.warn(format!(
+                    "device {} is referenced but not present; skipping operation: {operation:?}",
+                    reference.device
+                ));
+                continue;
             }
+            if reference.kind == Kind::Encoder {
+                self.log.warn(format!(
+                    "{kind} {reference} is not supported yet; skipping operation: {operation:?}",
+                    kind = reference.kind.label()
+                ));
+                continue;
+            }
+
+            // A launch only runs its command; its reference is a config slot, so no
+            // button is drawn and none is restored on termination.
+            if let SceneOp::Launch { command, .. } = operation {
+                spawn_detached(command, self.log);
+                continue;
+            }
+
+            let key = reference.number;
+            if key > self.device.key_count() {
+                self.log.warn(format!(
+                    "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
+                    self.device.key_count()
+                ));
+                continue;
+            }
+
+            // A button without a display cannot show any image: assignment is pointless
+            // and the hardware ignores the transfer, so warn and skip the work.
+            if self.screenless_buttons.contains(&key)
+                && matches!(
+                    operation,
+                    SceneOp::SetImage { .. }
+                        | SceneOp::Text { .. }
+                        | SceneOp::TextExec { .. }
+                        | SceneOp::ImageExec { .. }
+                )
+            {
+                self.log.warn(format!(
+                    "button {reference} has no display; skipping operation: {operation:?}"
+                ));
+                continue;
+            }
+
+            // record the button as "touched" so termination cleanup can restore exactly
+            // the buttons this session changed (unused buttons are left alone)
+            self.changed_keys.insert(key);
+            self.cancel_exec_if_running(key).await;
             match operation {
-                // config keys are physical buttons numbered from 1; mirajazz keys are 0-based
-                SceneOp::SetImage { key, path } => {
+                // config references are physical buttons numbered from 1; mirajazz keys are 0-based
+                SceneOp::SetImage { reference: _, path } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("set image from \"{path}\" on key {key}"),
@@ -821,7 +1096,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     self.log
                         .debug(Subsystem::Device, format!("set image on button {key}"));
                 }
-                SceneOp::Text { key, path } => {
+                SceneOp::Text { reference: _, path } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("render text from \"{path}\" on key {key}"),
@@ -839,24 +1114,30 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         format!("set image on button {key} from text"),
                     );
                 }
-                SceneOp::TextExec { key, command } => {
+                SceneOp::TextExec {
+                    reference: _,
+                    command,
+                } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("start text exec \"{}\" on key {key}", command.display()),
                     );
-                    self.start_exec_task(*key, ExecOutputKind::Text, command);
+                    self.start_exec_task(key, ExecOutputKind::Text, command);
                 }
-                SceneOp::ImageExec { key, command } => {
+                SceneOp::ImageExec {
+                    reference: _,
+                    command,
+                } => {
                     self.log.debug(
                         Subsystem::Scene,
                         format!("start image exec \"{}\" on key {key}", command.display()),
                     );
-                    self.start_exec_task(*key, ExecOutputKind::Image, command);
+                    self.start_exec_task(key, ExecOutputKind::Image, command);
                 }
-                SceneOp::Launch { key: _, command } => {
-                    spawn_detached(command, self.log);
+                SceneOp::Launch { .. } => {
+                    unreachable!("Launch is handled before the per-button match")
                 }
-                SceneOp::Clear { key } => {
+                SceneOp::Clear { reference: _ } => {
                     self.log.debug(Subsystem::Scene, format!("clear key {key}"));
                     self.device
                         .clear_button_image(key.saturating_sub(1))
@@ -864,10 +1145,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     self.log
                         .debug(Subsystem::Device, format!("clear image on button {key}"));
                 }
-                SceneOp::Unsupported { kind } => {
-                    self.log.warn(format!(
-                        "scene setup \"{kind}\" on key is not supported and was skipped"
-                    ));
+                SceneOp::Unsupported { .. } => {
+                    unreachable!("Unsupported operations are skipped before the match")
                 }
             }
         }
@@ -1041,16 +1320,19 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     }
 }
 
-/// Returns the 1-based physical button key an operation targets, if any.
-fn operation_key(operation: &SceneOp) -> Option<u8> {
+/// Returns the control reference an operation targets, if any.
+///
+/// Every operation carries a [Reference], including `Launch` whose reference is only a
+/// config slot; only `Unsupported` has no reference at all.
+fn operation_reference(operation: &SceneOp) -> Option<&Reference> {
     match operation {
-        SceneOp::SetImage { key, .. }
-        | SceneOp::Text { key, .. }
-        | SceneOp::TextExec { key, .. }
-        | SceneOp::ImageExec { key, .. }
-        | SceneOp::Clear { key } => Some(*key),
-        // Launch draws nothing, so it has no button image to restore on termination.
-        SceneOp::Launch { .. } | SceneOp::Unsupported { .. } => None,
+        SceneOp::SetImage { reference, .. }
+        | SceneOp::Text { reference, .. }
+        | SceneOp::TextExec { reference, .. }
+        | SceneOp::ImageExec { reference, .. }
+        | SceneOp::Launch { reference, .. }
+        | SceneOp::Clear { reference } => Some(reference),
+        SceneOp::Unsupported { .. } => None,
     }
 }
 
@@ -1280,15 +1562,15 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
-/// Resolves the `pressed` action for `key`, falling back to the previously active scene.
+/// Resolves the `pressed` action for `reference`, falling back to the previously active scene.
 ///
 /// Button actions are inherited from the previous scene: `scene_name` is consulted first,
-/// then `previous_scene`. A scene that explicitly configures the key ends the search —
+/// then `previous_scene`. A scene that explicitly configures the reference ends the search —
 /// its non-empty `pressed` value wins, an empty value means "bound but no action".
 pub fn action_for_key<'a>(
     scene_name: &str,
     previous_scene: Option<&str>,
-    key: u8,
+    reference: &Reference,
     scenes: &'a Value,
 ) -> Option<&'a str> {
     for name in std::iter::once(scene_name).chain(previous_scene) {
@@ -1300,7 +1582,7 @@ pub fn action_for_key<'a>(
         };
         let Some(key_actions) = actions
             .as_object()
-            .and_then(|map| map.get(&key.to_string()))
+            .and_then(|map| map.get(&reference.to_string()))
         else {
             continue;
         };
@@ -1546,42 +1828,218 @@ mod tests {
         }
     }
 
-    /// `operation_key` reports the button an operation targets, or `None` for commands
-    /// that do not touch a button at all.
+    /// A backslash escapes the following character, so a space-separated command can
+    /// pass arguments containing spaces without quoting.
     #[test]
-    fn operation_key_returns_button_number() {
+    fn parse_command_line_backslash_escapes_next_character() {
+        let spec = super::parse_command_line("/bin/echo one\\ two\\ three").unwrap();
+        assert_eq!(spec.program, "/bin/echo");
+        assert_eq!(spec.args, vec!["one two three"]);
+    }
+
+    /// A trailing backslash has no following character to escape; the command
+    /// parses fine and the trailing backslash contributes nothing.
+    #[test]
+    fn parse_command_line_backslash_at_end_is_fine() {
+        let params = "/bin/echo one \\";
+        let spec = super::parse_command_line(params).unwrap();
+        assert_eq!(spec.program, "/bin/echo");
+        assert_eq!(spec.args, vec!["one"]);
+    }
+
+    /// `parse_device_id` accepts exactly the single digits 1..=9 used in references.
+    #[test]
+    fn parse_device_id_accepts_single_digits() {
+        assert_eq!(super::parse_device_id("1"), Some(1));
+        assert_eq!(super::parse_device_id("9"), Some(9));
+        assert_eq!(super::parse_device_id("0"), None);
+        assert_eq!(super::parse_device_id("10"), None);
+        assert_eq!(super::parse_device_id("a"), None);
+        assert_eq!(super::parse_device_id(""), None);
+    }
+
+    /// `strip_comments` removes both line and block comments outside strings, keeping
+    /// non-comment text (and the newline layout) intact.
+    #[test]
+    fn strip_comments_removes_line_and_block_comments() {
+        let input = r#"// leading comment
+{
+  "scenes": /* inline */ {},
+  "devices": {
+    // picked device
+    "1": { }
+  } // trailing
+}"#;
+        let stripped = super::strip_comments(input);
+        assert!(!stripped.contains("//"));
+        assert!(!stripped.contains("/*"));
+        let json: Value = serde_json::from_str(&stripped).unwrap();
+        assert!(json["devices"]["1"].is_object());
+        // Line starts are preserved so error positions stay useful.
+        assert_eq!(stripped.lines().count(), input.lines().count());
+    }
+
+    /// `strip_comments` treats `//` and `/* ... */` inside a string as literal text,
+    /// since they are part of the string value and not comments.
+    #[test]
+    fn strip_comments_leaves_strings_untouched() {
+        let input = r#"{ "actions": "@//not/a/comment", "setup": "/* also not */" }"#;
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert_eq!(json["actions"], "@//not/a/comment");
+        assert_eq!(json["setup"], "/* also not */");
+    }
+
+    /// `strip_comments` honours escaped quotes, so `\"` inside a string does not end
+    /// the string early and comment-like text after it stays inside the string.
+    #[test]
+    fn strip_comments_honours_escaped_quotes() {
+        let input = r#"{ "text": "say \"//hi\"" }"#;
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert_eq!(json["text"], "say \"//hi\"");
+    }
+
+    /// An unterminated `/*` comment comments out the rest of the file, so a config
+    /// may leave a trailing comment open at the end.
+    #[test]
+    fn strip_comments_handles_unterminated_block_comment() {
+        let input = "{ \"scenes\": {} }\n/* never closed";
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert!(json["scenes"].is_object());
+    }
+
+    /// A definition with a real serial matches only a discovered device reporting that
+    /// exact serial, telling identical devices apart.
+    #[test]
+    fn discovered_device_matches_by_serial() {
+        let definition = super::Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "keypad".to_string(),
+            serial: "ABC123".to_string(),
+            key_count: 9,
+            encoder_count: 3,
+            screens: 6,
+            buttons: vec![],
+            encoders: vec![],
+        };
+        assert!(super::discovered_device_matches(
+            &definition,
+            &Some("ABC123".to_string()),
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &Some("OTHER".to_string()),
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3002
+        ));
+    }
+
+    /// A definition whose serial is "unknown" falls back to the VID:PID string, so
+    /// devices without serials still match as long as only one of their kind is present.
+    #[test]
+    fn discovered_device_matches_falls_back_to_vid_pid() {
+        let definition = super::Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "keypad".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 9,
+            encoder_count: 3,
+            screens: 6,
+            buttons: vec![],
+            encoders: vec![],
+        };
+        assert!(super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3003
+        ));
+        // A reported serial never overrides the VID:PID fallback.
+        assert!(super::discovered_device_matches(
+            &definition,
+            &Some("ANY".to_string()),
+            0x0300,
+            0x3002
+        ));
+    }
+
+    /// `operation_reference` reports the reference an operation targets, or `None` only
+    /// for unsupported operations, which carry no reference at all.
+    #[test]
+    fn operation_reference_reports_target_reference() {
         let image = super::SceneOp::SetImage {
-            key: 3,
+            reference: super::Reference::button(1, 3),
             path: "x.png".to_string(),
         };
         let text = super::SceneOp::Text {
-            key: 4,
+            reference: super::Reference::button(2, 4),
             path: "x.txt".to_string(),
         };
         let text_exec = super::SceneOp::TextExec {
-            key: 8,
+            reference: super::Reference::button(9, 8),
             command: super::CommandSpec {
                 program: "echo".to_string(),
                 args: vec![],
             },
         };
         let image_exec = super::SceneOp::ImageExec {
-            key: 9,
+            reference: super::Reference::button(1, 9),
             command: super::CommandSpec {
                 program: "convert".to_string(),
                 args: vec![],
             },
         };
-        let clear = super::SceneOp::Clear { key: 12 };
+        let launch = super::SceneOp::Launch {
+            reference: super::Reference::button(1, 5),
+            command: super::CommandSpec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+        };
+        let clear = super::SceneOp::Clear {
+            reference: super::Reference::encoder(1, 1),
+        };
         let unsupported = super::SceneOp::Unsupported {
             kind: "frobnicate".to_string(),
         };
-        assert_eq!(super::operation_key(&image), Some(3));
-        assert_eq!(super::operation_key(&text), Some(4));
-        assert_eq!(super::operation_key(&text_exec), Some(8));
-        assert_eq!(super::operation_key(&image_exec), Some(9));
-        assert_eq!(super::operation_key(&clear), Some(12));
-        assert_eq!(super::operation_key(&unsupported), None);
+        assert_eq!(
+            super::operation_reference(&image),
+            Some(&super::Reference::button(1, 3))
+        );
+        assert_eq!(
+            super::operation_reference(&text),
+            Some(&super::Reference::button(2, 4))
+        );
+        assert_eq!(
+            super::operation_reference(&text_exec),
+            Some(&super::Reference::button(9, 8))
+        );
+        assert_eq!(
+            super::operation_reference(&image_exec),
+            Some(&super::Reference::button(1, 9))
+        );
+        assert_eq!(
+            super::operation_reference(&launch),
+            Some(&super::Reference::button(1, 5))
+        );
+        assert_eq!(
+            super::operation_reference(&clear),
+            Some(&super::Reference::encoder(1, 1))
+        );
+        assert_eq!(super::operation_reference(&unsupported), None);
     }
 
     /// A fresh tracker accepts its first generation for a button but rejects unknown ones.

@@ -4,8 +4,9 @@
 mod common;
 
 use dak::actions::{action_for_key, parse_action, timer_for_scene, Action};
+use dak::baseplane::Reference;
 
-use crate::common::write_temp_config;
+use crate::common::write_scenes_config;
 
 /// Action values classify as Stay (`~`), SwitchScene (`@name`) or Command.
 #[test]
@@ -25,17 +26,17 @@ fn parse_action_classifies_actions() {
     );
 }
 
-/// `action_for_key` resolves the pressed action for a 1-based key, None when unbound
+/// `action_for_key` resolves the pressed action for a control reference, None when unbound
 /// or the scene is undefined.
 #[test]
 fn action_for_key_reads_pressed_action() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "1": { "pressed": "~" },
-                    "2": { "pressed": "@Test" },
-                    "3": { "pressed": "/usr/bin/date +%H:%M" }
+                    "1b01": { "pressed": "~" },
+                    "1b02": { "pressed": "@Test" },
+                    "1b03": { "pressed": "/usr/bin/date +%H:%M" }
                 }
             },
             "Test": {
@@ -47,29 +48,35 @@ fn action_for_key_reads_pressed_action() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key("on_start", None, 1, &config.scenes),
+        action_for_key("on_start", None, &Reference::button(1, 1), &config.scenes),
         Some("~")
     );
     assert_eq!(
-        action_for_key("on_start", None, 2, &config.scenes),
+        action_for_key("on_start", None, &Reference::button(1, 2), &config.scenes),
         Some("@Test")
     );
     assert_eq!(
-        action_for_key("on_start", None, 3, &config.scenes),
+        action_for_key("on_start", None, &Reference::button(1, 3), &config.scenes),
         Some("/usr/bin/date +%H:%M")
     );
-    assert_eq!(action_for_key("on_start", None, 9, &config.scenes), None);
-    assert_eq!(action_for_key("Missing", None, 1, &config.scenes), None);
+    assert_eq!(
+        action_for_key("on_start", None, &Reference::button(1, 9), &config.scenes),
+        None
+    );
+    assert_eq!(
+        action_for_key("Missing", None, &Reference::button(1, 1), &config.scenes),
+        None
+    );
 }
 
 /// An action missing from the current scene is looked up in the previous scene.
 #[test]
 fn action_for_key_inherits_from_previous_scene() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "2": { "pressed": "@Test" }
+                    "1b02": { "pressed": "@Test" }
                 }
             },
             "Main": {
@@ -86,21 +93,29 @@ fn action_for_key_inherits_from_previous_scene() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key("Main", Some("on_start"), 2, &config.scenes),
+        action_for_key(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 2),
+            &config.scenes
+        ),
         Some("@Test")
     );
     // Without a previous scene the same lookup finds nothing.
-    assert_eq!(action_for_key("Main", None, 2, &config.scenes), None);
+    assert_eq!(
+        action_for_key("Main", None, &Reference::button(1, 2), &config.scenes),
+        None
+    );
 }
 
 /// A scene without an `actions` field at all still falls through to the previous scene.
 #[test]
 fn action_for_key_inherits_when_scene_has_no_actions() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "2": { "pressed": "@Test" }
+                    "1b02": { "pressed": "@Test" }
                 }
             },
             "Main": {},
@@ -113,26 +128,34 @@ fn action_for_key_inherits_when_scene_has_no_actions() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key("Main", Some("on_start"), 2, &config.scenes),
+        action_for_key(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 2),
+            &config.scenes
+        ),
         Some("@Test")
     );
-    assert_eq!(action_for_key("Main", None, 2, &config.scenes), None);
+    assert_eq!(
+        action_for_key("Main", None, &Reference::button(1, 2), &config.scenes),
+        None
+    );
 }
 
-/// A scene that explicitly configures a key wins over the previous scene, and an
+/// A scene that explicitly configures a reference wins over the previous scene, and an
 /// empty `pressed` value means bound-but-no-action, so it ends the search.
 #[test]
 fn action_for_key_explicit_binding_overrides_inheritance() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "2": { "pressed": "@Test" }
+                    "1b02": { "pressed": "@Test" }
                 }
             },
             "Main": {
                 "actions": {
-                    "2": { "pressed": "" }
+                    "1b02": { "pressed": "" }
                 }
             },
             "Test": {
@@ -144,11 +167,21 @@ fn action_for_key_explicit_binding_overrides_inheritance() {
     let _ = std::fs::remove_file(path);
 
     assert_eq!(
-        action_for_key("Main", Some("on_start"), 2, &config.scenes),
+        action_for_key(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 2),
+            &config.scenes
+        ),
         None
     );
     assert_eq!(
-        action_for_key("Main", Some("on_start"), 9, &config.scenes),
+        action_for_key(
+            "Main",
+            Some("on_start"),
+            &Reference::button(1, 9),
+            &config.scenes
+        ),
         None
     );
 }
@@ -156,7 +189,7 @@ fn action_for_key_explicit_binding_overrides_inheritance() {
 /// `timer_for_scene` returns the seconds and action for a scene with a timer.
 #[test]
 fn timer_for_scene_returns_seconds_and_action() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -183,11 +216,11 @@ fn timer_for_scene_returns_seconds_and_action() {
 /// `timer_for_scene` returns None when the scene has no timer.
 #[test]
 fn timer_for_scene_returns_none_without_timer() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "1": { "pressed": "~" }
+                    "1b01": { "pressed": "~" }
                 }
             }
         }"#,
@@ -201,7 +234,7 @@ fn timer_for_scene_returns_none_without_timer() {
 /// `timer_for_scene` returns None for an undefined scene.
 #[test]
 fn timer_for_scene_returns_none_for_undefined_scene() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(path);
 
@@ -211,7 +244,7 @@ fn timer_for_scene_returns_none_for_undefined_scene() {
 /// `timer_for_scene` returns None when actions is empty.
 #[test]
 fn timer_for_scene_returns_none_with_empty_actions() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(path);
 

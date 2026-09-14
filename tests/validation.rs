@@ -4,14 +4,54 @@ mod common;
 
 use dak::actions::{load_config, load_config_from_path};
 
-use crate::common::{assert_validation_error, error_texts, write_temp_config};
+use crate::common::{assert_validation_error, error_texts, write_scenes_config, write_temp_config};
 
 /// A minimal valid config loads successfully.
 #[test]
 fn loads_valid_config() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
+    assert!(config.is_ok());
+}
+
+/// A config carrying `//` and `/* */` comments loads; comments are allowed anywhere
+/// outside string values.
+#[test]
+fn loads_config_with_comments() {
+    let path = write_temp_config(
+        r#"// file-global comment
+{
+  "scenes": { /* scenes section */ "on_start": { "actions": { "1b01": { "pressed": "~" } } } },
+  "devices": {
+    "1": { // picked by hand
+      "device_id": "0300:3002",
+      "device_name": "keypad",
+      "serial": "unknown", // fall back to VID:PID
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [ { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 } ],
+      "encoders": []
+    }
+  }
+} // trailing comment
+"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap_or_else(|errors| panic!("commented config failed: {errors:?}"));
+    assert!(config.devices.by_id.contains_key(&1));
+}
+
+/// A comment is not allowed inside a string, so `//` at the start of an action value
+/// stays part of the value and must be a valid action reference.
+#[test]
+fn comment_markers_inside_strings_are_not_comments() {
+    let path =
+        write_scenes_config(r#"{"on_start": { "actions": { "1b01": { "pressed": "~" } } } }"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
     assert!(config.is_ok());
 }
 
@@ -40,7 +80,7 @@ fn rejects_missing_file() {
     assert!(load_config_from_path("/nonexistent/config.json").is_err());
 }
 
-/// A config whose root is not an object of scene names is rejected.
+/// A config whose root is not an object of scenes and devices is rejected.
 #[test]
 fn rejects_non_object_config() {
     let path = write_temp_config(r#"[1, 2, 3]"#);
@@ -48,7 +88,61 @@ fn rejects_non_object_config() {
     let _ = std::fs::remove_file(path);
     let errors = error_texts(config.unwrap_err());
     assert!(
-        errors.contains("object whose keys are scene names"),
+        errors.contains("object with \"scenes\" and \"devices\" keys"),
+        "{errors}"
+    );
+}
+
+/// The new top level requires both "scenes" and "devices"; a missing "scenes" section
+/// is reported.
+#[test]
+fn rejects_config_without_scenes_section() {
+    let path = write_temp_config(r#"{"devices": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("missing the \"scenes\" section"),
+        "{errors}"
+    );
+}
+
+/// The new top level requires both "scenes" and "devices"; a missing "devices" section
+/// is reported.
+#[test]
+fn rejects_config_without_devices_section() {
+    let path = write_temp_config(r#"{"scenes": {"on_start": {"actions": {}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("missing the \"devices\" section"),
+        "{errors}"
+    );
+}
+
+/// Top-level keys other than "scenes" and "devices" are rejected.
+#[test]
+fn rejects_unknown_top_level_key() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "players": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("unknown top-level key \"players\""),
+        "{errors}"
+    );
+}
+
+/// A scenes section that is not an object of scene names is rejected.
+#[test]
+fn rejects_scenes_section_not_an_object() {
+    let path = write_temp_config(r#"{"scenes": [1, 2], "devices": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("config \"scenes\" must be an object whose keys are scene names"),
         "{errors}"
     );
 }
@@ -56,15 +150,15 @@ fn rejects_non_object_config() {
 /// The README-documented config structure loads and preserves scene, button and timer values.
 #[test]
 fn parses_documented_config_structure() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "image", "params": "/path/reader.ico" },
-                    "3": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
+                    "1b01": { "type": "image", "params": "/path/reader.ico" },
+                    "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
                 },
                 "actions": {
-                    "1": { "pressed": "~" },
+                    "1b01": { "pressed": "~" },
                     "timer": { "1": "@Main" }
                 }
             },
@@ -78,9 +172,9 @@ fn parses_documented_config_structure() {
 
     assert!(config.scenes.get("on_start").is_some());
     assert!(config.scenes.get("Main").is_some());
-    assert_eq!(config.scenes["on_start"]["setup"]["1"]["type"], "image");
+    assert_eq!(config.scenes["on_start"]["setup"]["1b01"]["type"], "image");
     assert_eq!(
-        config.scenes["on_start"]["setup"]["1"]["params"],
+        config.scenes["on_start"]["setup"]["1b01"]["params"],
         "/path/reader.ico"
     );
     assert_eq!(config.scenes["on_start"]["actions"]["timer"]["1"], "@Main");
@@ -119,8 +213,8 @@ fn rejects_unknown_scene_key() {
 #[test]
 fn rejects_button_entry_not_an_object() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": "image"}}}"#,
-        "key \"1\" must be an object with \"type\" and \"params\"",
+        r#"{"on_start": {"setup": {"1b01": "image"}}}"#,
+        "key \"1b01\" must be an object with \"type\" and \"params\"",
     );
 }
 
@@ -128,7 +222,7 @@ fn rejects_button_entry_not_an_object() {
 #[test]
 fn rejects_button_entry_unknown_field() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": "/a", "from": "x"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/a", "from": "x"}}}}"#,
         "has unknown field \"from\"",
     );
 }
@@ -137,7 +231,7 @@ fn rejects_button_entry_unknown_field() {
 #[test]
 fn rejects_button_entry_without_type() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"params": "/a"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"params": "/a"}}}}"#,
         "type must be a string",
     );
 }
@@ -146,8 +240,27 @@ fn rejects_button_entry_without_type() {
 #[test]
 fn rejects_unknown_button_type() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "foo", "params": "/a"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "foo", "params": "/a"}}}}"#,
         "unknown type \"foo\"",
+    );
+}
+
+/// A scene's `setup` section must be an object of numbered buttons.
+#[test]
+fn rejects_setup_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": [1, 2]}}"#,
+        "setup must be an object of numbered buttons",
+    );
+}
+
+/// A scene's `setup` section must be an object of numbered buttons; the error also
+/// covers a bare string value.
+#[test]
+fn rejects_setup_not_an_object_when_string() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": "1b01"}}"#,
+        "setup must be an object of numbered buttons",
     );
 }
 
@@ -155,7 +268,7 @@ fn rejects_unknown_button_type() {
 #[test]
 fn rejects_button_params_not_a_string() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": 42}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": 42}}}}"#,
         "params must be a string",
     );
 }
@@ -164,7 +277,7 @@ fn rejects_button_params_not_a_string() {
 #[test]
 fn rejects_image_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "image", "params": ""}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": ""}}}}"#,
         "image params must be a path",
     );
 }
@@ -173,7 +286,7 @@ fn rejects_image_with_empty_params() {
 #[test]
 fn rejects_exec_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "  "}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "  "}}}}"#,
         "text_exec params must be a program command line",
     );
 }
@@ -182,7 +295,7 @@ fn rejects_exec_with_empty_params() {
 #[test]
 fn rejects_exec_with_unbalanced_quotes() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "text_exec", "params": "/bin/sh -c 'oops"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "/bin/sh -c 'oops"}}}}"#,
         "unbalanced quotes",
     );
 }
@@ -190,7 +303,7 @@ fn rejects_exec_with_unbalanced_quotes() {
 /// `clear` needs no params and is accepted as a bare type entry.
 #[test]
 fn accepts_clear_without_params() {
-    let path = write_temp_config(r#"{"on_start": {"setup": {"3": {"type": "clear"}}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"setup": {"1b03": {"type": "clear"}}}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     assert!(config.is_ok(), "{:?}", config.err());
@@ -199,11 +312,11 @@ fn accepts_clear_without_params() {
 /// `launch` is accepted like the `*_exec` commands: params hold the program command line.
 #[test]
 fn accepts_launch_with_command_line() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "4": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
+                    "1b04": { "type": "launch", "params": "/bin/sh -c 'echo detached'" }
                 }
             }
         }"#,
@@ -218,7 +331,7 @@ fn accepts_launch_with_command_line() {
 #[test]
 fn rejects_launch_with_empty_params() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "  "}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "  "}}}}"#,
         "launch params must be a program command line",
     );
 }
@@ -227,7 +340,7 @@ fn rejects_launch_with_empty_params() {
 #[test]
 fn rejects_launch_with_unbalanced_quotes() {
     assert_validation_error(
-        r#"{"on_start": {"setup": {"1": {"type": "launch", "params": "/bin/sh -c 'oops"}}}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "/bin/sh -c 'oops"}}}}"#,
         "unbalanced quotes",
     );
 }
@@ -235,11 +348,11 @@ fn rejects_launch_with_unbalanced_quotes() {
 /// A missing `launch` program is reported as a non-fatal warning like the exec commands.
 #[test]
 fn warns_on_missing_launch_program() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "4": { "type": "launch", "params": "/does/not/exist --flag" }
+                    "1b04": { "type": "launch", "params": "/does/not/exist --flag" }
                 }
             }
         }"#,
@@ -248,7 +361,7 @@ fn warns_on_missing_launch_program() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("program not found"), "{warnings}");
-    assert!(warnings.contains("key \"4\""), "{warnings}");
+    assert!(warnings.contains("key \"1b04\""), "{warnings}");
 }
 
 // -- warnings --
@@ -256,11 +369,11 @@ fn warns_on_missing_launch_program() {
 /// A missing image file is a non-fatal warning rooted at the button key.
 #[test]
 fn warns_on_missing_image_file() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "image", "params": "/does/not/exist.ico" }
+                    "1b01": { "type": "image", "params": "/does/not/exist.ico" }
                 }
             }
         }"#,
@@ -269,17 +382,17 @@ fn warns_on_missing_image_file() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("file not found"), "{warnings}");
-    assert!(warnings.contains("key \"1\""), "{warnings}");
+    assert!(warnings.contains("key \"1b01\""), "{warnings}");
 }
 
 /// A missing text file is reported as a non-fatal warning.
 #[test]
 fn warns_on_missing_text_file() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "1": { "type": "text", "params": "/does/not/exist.txt" }
+                    "1b01": { "type": "text", "params": "/does/not/exist.txt" }
                 }
             }
         }"#,
@@ -288,20 +401,20 @@ fn warns_on_missing_text_file() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("file not found"), "{warnings}");
-    assert!(warnings.contains("key \"1\""), "{warnings}");
+    assert!(warnings.contains("key \"1b01\""), "{warnings}");
 }
 
 /// A missing program referenced by a button entry or an action is a non-fatal warning.
 #[test]
 fn warns_on_missing_executable() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
-                    "3": { "type": "text_exec", "params": "/does/not/exist +%H:%M" }
+                    "1b03": { "type": "text_exec", "params": "/does/not/exist +%H:%M" }
                 },
                 "actions": {
-                    "1": { "pressed": "/does/not/exist/beep" }
+                    "1b01": { "pressed": "/does/not/exist/beep" }
                 }
             }
         }"#,
@@ -310,8 +423,8 @@ fn warns_on_missing_executable() {
     let _ = std::fs::remove_file(path);
     let warnings = config.warnings.join("\n");
     assert!(warnings.contains("program not found"), "{warnings}");
-    assert!(warnings.contains("key \"3\""), "{warnings}");
-    assert!(warnings.contains("actions.\"1\".pressed"), "{warnings}");
+    assert!(warnings.contains("key \"1b03\""), "{warnings}");
+    assert!(warnings.contains("actions.\"1b01\".pressed"), "{warnings}");
 }
 
 /// An existing but non-executable program is reported as a warning.
@@ -324,11 +437,11 @@ fn warns_on_non_executable_program() {
     perms.set_mode(0o644);
     std::fs::set_permissions(exe, perms).unwrap();
 
-    let path = write_temp_config(&format!(
+    let path = write_scenes_config(&format!(
         r#"{{
         "on_start": {{
             "setup": {{
-                "1": {{ "type": "text_exec", "params": "{exe}" }}
+                "1b01": {{ "type": "text_exec", "params": "{exe}" }}
             }}
         }}
     }}"#
@@ -356,8 +469,8 @@ fn rejects_actions_not_an_object() {
 #[test]
 fn rejects_key_action_not_an_object() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": "pressed"}}}"#,
-        "actions.\"1\" must be an object of events",
+        r#"{"on_start": {"actions": {"1b01": "pressed"}}}"#,
+        "actions.\"1b01\" must be an object of events",
     );
 }
 
@@ -365,8 +478,8 @@ fn rejects_key_action_not_an_object() {
 #[test]
 fn rejects_event_value_not_a_string() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": 42}}}}"#,
-        "actions.\"1\".pressed must be a string",
+        r#"{"on_start": {"actions": {"1b01": {"pressed": 42}}}}"#,
+        "actions.\"1b01\".pressed must be a string",
     );
 }
 
@@ -374,7 +487,7 @@ fn rejects_event_value_not_a_string() {
 #[test]
 fn rejects_event_value_null() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": null}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": null}}}}"#,
         "pressed must be a string, got null",
     );
 }
@@ -383,7 +496,7 @@ fn rejects_event_value_null() {
 #[test]
 fn rejects_event_value_bool() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": true}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": true}}}}"#,
         "pressed must be a string, got bool",
     );
 }
@@ -392,7 +505,7 @@ fn rejects_event_value_bool() {
 #[test]
 fn rejects_event_value_array() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": [1]}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": [1]}}}}"#,
         "pressed must be a string, got an array",
     );
 }
@@ -401,7 +514,7 @@ fn rejects_event_value_array() {
 #[test]
 fn rejects_event_value_object() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": {}}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": {}}}}}"#,
         "pressed must be a string, got an object",
     );
 }
@@ -409,11 +522,11 @@ fn rejects_event_value_object() {
 /// A `@scene` action referencing a scene that does not exist is rejected with its location.
 #[test]
 fn rejects_undefined_scene_reference() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
-                    "1": { "pressed": "@Missing" },
+                    "1b01": { "pressed": "@Missing" },
                     "timer": { "1": "~" }
                 }
             }
@@ -427,14 +540,14 @@ fn rejects_undefined_scene_reference() {
         "{errors}"
     );
     assert!(errors.contains("scene \"on_start\""), "{errors}");
-    assert!(errors.contains("actions.\"1\".pressed"), "{errors}");
+    assert!(errors.contains("actions.\"1b01\".pressed"), "{errors}");
 }
 
 /// A bare `@` scene reference is rejected.
 #[test]
 fn rejects_empty_scene_reference() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1": {"pressed": "@"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "@"}}}}"#,
         "is an empty scene reference",
     );
 }
@@ -444,7 +557,7 @@ fn rejects_empty_scene_reference() {
 /// The `timer` entry must be a single-entry object; more entries are rejected.
 #[test]
 fn rejects_timer_with_multiple_entries() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -465,7 +578,7 @@ fn rejects_timer_with_multiple_entries() {
 /// A non-numeric timer seconds value is rejected.
 #[test]
 fn rejects_invalid_timer_seconds() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -501,7 +614,7 @@ fn rejects_timer_value_not_a_string() {
 /// A timer action referencing an undefined scene is rejected with the timer location.
 #[test]
 fn rejects_timer_referencing_undefined_scene() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -526,7 +639,7 @@ fn rejects_timer_referencing_undefined_scene() {
 /// Validation reports every invalid scene in one go instead of stopping at the first.
 #[test]
 fn reports_errors_from_all_scenes() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "one": { "bogus": 1 },
             "two": {
@@ -546,4 +659,110 @@ fn reports_errors_from_all_scenes() {
             .contains("scene \"two\": actions.timer key \"soon\" is not a valid number of seconds"),
         "{errors}"
     );
+}
+
+// -- control references --
+
+/// A setup key that is not a control reference is rejected with the scene, key and reason.
+#[test]
+fn rejects_invalid_setup_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"0b01": {"type": "image", "params": "/a"}}}}"#,
+        "scene \"on_start\": key \"0b01\" is not a valid control reference",
+    );
+}
+
+/// The old plain button-number keys are no longer valid control references.
+#[test]
+fn rejects_legacy_numeric_button_keys() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1": {"type": "image", "params": "/a"}}}}"#,
+        "scene \"on_start\": key \"1\" is not a valid control reference",
+    );
+}
+
+/// An actions key that is not a control reference is rejected with the scene and location.
+#[test]
+fn rejects_invalid_action_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"0b01": {"pressed": "~"}}}}"#,
+        "scene \"on_start\": actions.\"0b01\" is not a valid control reference",
+    );
+}
+
+/// Device numbers are limited to a single digit; references to device 0 are invalid.
+#[test]
+fn rejects_zero_device_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"0b01": {"type": "clear"}}}}"#,
+        "the device must be a single digit from 1 to 9",
+    );
+}
+
+/// Control numbers are two digits from 01 to 99; bare, 00 and 100 forms are invalid.
+#[test]
+fn rejects_bad_control_numbers() {
+    for key in ["1b1", "1b00", "1b100"] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"setup": {{"{key}": {{"type": "clear"}}}}}}}}"#),
+            "is not a valid control reference",
+        );
+    }
+}
+
+/// A reference naming a device or encoder the program does not drive yet is still valid
+/// config: absent devices and encoders are skipped at runtime, not rejected at load.
+#[test]
+fn accepts_other_device_and_encoder_references() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "2b01": { "type": "image", "params": "/a" },
+                    "1e01": { "type": "clear" }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A setup entry that assigns an image to an encoder is a config error: encoders have
+/// no display, so the program refuses to load the config.
+#[test]
+fn rejects_image_assignment_to_encoder() {
+    for entry in [
+        r#"{"type": "image", "params": "/a"}"#,
+        r#"{"type": "text", "params": "/a"}"#,
+        r#"{"type": "image_exec", "params": "/usr/bin/text2gif"}"#,
+        r#"{"type": "text_exec", "params": "/usr/bin/date"}"#,
+    ] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"setup": {{"1e01": {entry}}}}}}}"#),
+            "cannot assign",
+        );
+    }
+}
+
+/// A setup entry on an encoder that assigns an image is rejected also when the target
+/// device number differs from the (unnamed) reference format; the message names the
+/// control reference.
+#[test]
+fn rejects_image_assignment_to_encoder_names_the_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"2e03": {"type": "image", "params": "/a"}}}}"#,
+        "cannot assign image to encoder 2e03",
+    );
+}
+
+/// A setup entry on an encoder that assigns no image (clear) is still valid config and
+/// is skipped at runtime.
+#[test]
+fn accepts_clear_on_encoder() {
+    let path = write_scenes_config(r#"{"on_start": {"setup": {"1e01": {"type": "clear"}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
 }

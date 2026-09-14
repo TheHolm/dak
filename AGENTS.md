@@ -2,7 +2,7 @@
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.2 (declared as `0.2.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.3.0 (declared as `0.3.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -50,4 +50,6 @@ Work in progress. Current known issues:
 - Every function and every test is documented with a `///` doc comment describing its purpose and any non-obvious behavior
 - All new code must be covered by tests — unit tests for private helpers and integration tests in `tests/` for public behaviour; never add production code without accompanying tests
 - Commits include a detailed description of what changed and why
+- When merging a branch to master, summarise all changes in the code since the branch started (or the last merge to master) and use that summary as the merge description
+- When starting work on each new branch, ask the user whether to bump the version number (and if so, to what value) before writing any code
 - Never commit changes unless the user explicitly asks to commit
