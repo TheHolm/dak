@@ -1,11 +1,12 @@
 use serde_json::{self, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
+use crate::map::Mapping;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -19,8 +20,24 @@ use std::os::unix::process::CommandExt as _;
 /// Parsed and validated config plus any non-fatal warnings collected while validating it.
 #[derive(Debug)]
 pub struct LoadedConfig {
+    /// The validated `scenes` section: a dictionary whose keys are scene names.
     pub scenes: Value,
+    /// The validated `devices` section, keyed by logical device id.
+    pub devices: ConfiguredDevices,
+    /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
+}
+
+/// Device definitions from the config `devices` section, keyed by logical device id.
+///
+/// The ids are the digits control references use (`1b01` addresses device `1`). Each
+/// definition describes one physical device in exactly the shape `dak --map` prints it;
+/// the runtime matches these definitions against the discovered hardware and drives every
+/// matched device.
+#[derive(Debug, Default)]
+pub struct ConfiguredDevices {
+    /// The device definitions, keyed by logical device id in ascending order.
+    pub by_id: BTreeMap<u8, Mapping>,
 }
 
 /// Loads and validates `config.json` from the current working directory.
@@ -106,31 +123,134 @@ fn format_json_error(path: &str, content: &str, error: &serde_json::Error) -> St
     )
 }
 
-/// Validates the whole scene tree, returning all errors at once or warnings with the parsed config.
-fn validate(scenes: &Value) -> Result<LoadedConfig, Vec<String>> {
+/// Validates the whole config (the `scenes` and `devices` sections), returning all errors at
+/// once or warnings with the parsed config.
+fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
-    let map = match scenes.as_object() {
+    let map = match config.as_object() {
         Some(map) => map,
         None => {
             return Err(vec![
-                "Config must be a JSON object whose keys are scene names".to_string(),
+                "Config must be a JSON object with \"scenes\" and \"devices\" keys".to_string(),
             ]);
         }
     };
 
-    for (scene_name, scene) in map {
-        check_scene(scenes, scene_name, scene, &mut warnings, &mut errors);
+    for key in map.keys() {
+        if key != "scenes" && key != "devices" {
+            errors.push(format!(
+                "unknown top-level key \"{key}\", expected \"scenes\" and \"devices\""
+            ));
+        }
     }
+
+    let missing_scenes = !map.contains_key("scenes");
+    let missing_devices = !map.contains_key("devices");
+    if missing_scenes {
+        errors.push("the config is missing the \"scenes\" section".to_string());
+    }
+    if missing_devices {
+        errors.push("the config is missing the \"devices\" section".to_string());
+    }
+    if missing_scenes || missing_devices {
+        return Err(errors);
+    }
+
+    let scenes = map.get("scenes").expect("checked above");
+    check_scenes(scenes, &mut warnings, &mut errors);
+    let devices = map.get("devices").expect("checked above");
+    let by_id = check_devices(devices, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(LoadedConfig {
         scenes: scenes.clone(),
+        devices: ConfiguredDevices { by_id },
         warnings,
     })
+}
+
+/// Validates the `scenes` section: an object whose keys are scene names.
+fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+    let map = match scenes.as_object() {
+        Some(map) => map,
+        None => {
+            errors
+                .push("config \"scenes\" must be an object whose keys are scene names".to_string());
+            return;
+        }
+    };
+
+    for (scene_name, scene) in map {
+        check_scene(scenes, scene_name, scene, warnings, errors);
+    }
+}
+
+/// Validates the `devices` section: a dictionary keyed by logical device id, each value a
+/// device mapping in the shape `dak --map` prints out.
+///
+/// Invalid ids and mappings are reported; the valid definitions are collected into a map
+/// keyed by device id, which holds the definitions that parsed even when other entries
+/// failed (the caller only accepts the result when there were no errors at all).
+fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapping> {
+    let mut by_id = BTreeMap::new();
+    let map = match devices.as_object() {
+        Some(map) => map,
+        None => {
+            errors.push("config \"devices\" must be an object of logical device ids".to_string());
+            return by_id;
+        }
+    };
+
+    for (id, value) in map {
+        let Some(number) = parse_device_id(id) else {
+            errors.push(format!(
+                "device id \"{id}\" is not a valid logical device id, expected a single digit from 1 to 9"
+            ));
+            continue;
+        };
+        match serde_json::from_value::<Mapping>(value.clone()) {
+            Ok(mapping) => {
+                by_id.insert(number, mapping);
+            }
+            Err(error) => errors.push(format!(
+                "device \"{id}\" is not a valid device mapping: {error}"
+            )),
+        }
+    }
+    by_id
+}
+
+/// Parses one logical device id from a `devices` dictionary key.
+///
+/// Device ids are the digits control references use: exactly one digit from `1` to 9.
+fn parse_device_id(id: &str) -> Option<u8> {
+    let bytes = id.as_bytes();
+    if bytes.len() != 1 || !(b'1'..=b'9').contains(&bytes[0]) {
+        return None;
+    }
+    Some(bytes[0] - b'0')
+}
+
+/// Whether a discovered device matches a config device definition.
+///
+/// A definition whose serial is anything but the "unknown" placeholder only matches a
+/// discovered device reporting that exact serial, so identical devices are told apart. A
+/// definition whose serial is "unknown" falls back to comparing the VID:PID string, so
+/// devices without serials still work as long as only one of their kind is connected.
+pub fn discovered_device_matches(
+    definition: &Mapping,
+    serial: &Option<String>,
+    vendor_id: u16,
+    product_id: u16,
+) -> bool {
+    if definition.serial != "unknown" {
+        return serial.as_deref() == Some(definition.serial.as_str());
+    }
+    definition.device_id == format!("{vendor_id:04X}:{product_id:04X}")
 }
 
 /// Validates a scene: the reserved `setup` key holds numbered button operations
@@ -1610,6 +1730,86 @@ mod tests {
             let error = super::parse_command_line(params).unwrap_err();
             assert!(error.contains("empty command"), "{error}");
         }
+    }
+
+    /// `parse_device_id` accepts exactly the single digits 1..=9 used in references.
+    #[test]
+    fn parse_device_id_accepts_single_digits() {
+        assert_eq!(super::parse_device_id("1"), Some(1));
+        assert_eq!(super::parse_device_id("9"), Some(9));
+        assert_eq!(super::parse_device_id("0"), None);
+        assert_eq!(super::parse_device_id("10"), None);
+        assert_eq!(super::parse_device_id("a"), None);
+        assert_eq!(super::parse_device_id(""), None);
+    }
+
+    /// A definition with a real serial matches only a discovered device reporting that
+    /// exact serial, telling identical devices apart.
+    #[test]
+    fn discovered_device_matches_by_serial() {
+        let definition = super::Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "keypad".to_string(),
+            serial: "ABC123".to_string(),
+            key_count: 9,
+            encoder_count: 3,
+            screens: 6,
+            buttons: vec![],
+            encoders: vec![],
+        };
+        assert!(super::discovered_device_matches(
+            &definition,
+            &Some("ABC123".to_string()),
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &Some("OTHER".to_string()),
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3002
+        ));
+    }
+
+    /// A definition whose serial is "unknown" falls back to the VID:PID string, so
+    /// devices without serials still match as long as only one of their kind is present.
+    #[test]
+    fn discovered_device_matches_falls_back_to_vid_pid() {
+        let definition = super::Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "keypad".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 9,
+            encoder_count: 3,
+            screens: 6,
+            buttons: vec![],
+            encoders: vec![],
+        };
+        assert!(super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3002
+        ));
+        assert!(!super::discovered_device_matches(
+            &definition,
+            &None,
+            0x0300,
+            0x3003
+        ));
+        // A reported serial never overrides the VID:PID fallback.
+        assert!(super::discovered_device_matches(
+            &definition,
+            &Some("ANY".to_string()),
+            0x0300,
+            0x3002
+        ));
     }
 
     /// `operation_reference` reports the reference an operation targets, or `None` only

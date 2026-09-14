@@ -4,12 +4,12 @@ mod common;
 
 use dak::actions::{load_config, load_config_from_path};
 
-use crate::common::{assert_validation_error, error_texts, write_temp_config};
+use crate::common::{assert_validation_error, error_texts, write_scenes_config, write_temp_config};
 
 /// A minimal valid config loads successfully.
 #[test]
 fn loads_valid_config() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     assert!(config.is_ok());
@@ -40,7 +40,7 @@ fn rejects_missing_file() {
     assert!(load_config_from_path("/nonexistent/config.json").is_err());
 }
 
-/// A config whose root is not an object of scene names is rejected.
+/// A config whose root is not an object of scenes and devices is rejected.
 #[test]
 fn rejects_non_object_config() {
     let path = write_temp_config(r#"[1, 2, 3]"#);
@@ -48,7 +48,61 @@ fn rejects_non_object_config() {
     let _ = std::fs::remove_file(path);
     let errors = error_texts(config.unwrap_err());
     assert!(
-        errors.contains("object whose keys are scene names"),
+        errors.contains("object with \"scenes\" and \"devices\" keys"),
+        "{errors}"
+    );
+}
+
+/// The new top level requires both "scenes" and "devices"; a missing "scenes" section
+/// is reported.
+#[test]
+fn rejects_config_without_scenes_section() {
+    let path = write_temp_config(r#"{"devices": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("missing the \"scenes\" section"),
+        "{errors}"
+    );
+}
+
+/// The new top level requires both "scenes" and "devices"; a missing "devices" section
+/// is reported.
+#[test]
+fn rejects_config_without_devices_section() {
+    let path = write_temp_config(r#"{"scenes": {"on_start": {"actions": {}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("missing the \"devices\" section"),
+        "{errors}"
+    );
+}
+
+/// Top-level keys other than "scenes" and "devices" are rejected.
+#[test]
+fn rejects_unknown_top_level_key() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "players": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("unknown top-level key \"players\""),
+        "{errors}"
+    );
+}
+
+/// A scenes section that is not an object of scene names is rejected.
+#[test]
+fn rejects_scenes_section_not_an_object() {
+    let path = write_temp_config(r#"{"scenes": [1, 2], "devices": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("config \"scenes\" must be an object whose keys are scene names"),
         "{errors}"
     );
 }
@@ -56,7 +110,7 @@ fn rejects_non_object_config() {
 /// The README-documented config structure loads and preserves scene, button and timer values.
 #[test]
 fn parses_documented_config_structure() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -190,7 +244,7 @@ fn rejects_exec_with_unbalanced_quotes() {
 /// `clear` needs no params and is accepted as a bare type entry.
 #[test]
 fn accepts_clear_without_params() {
-    let path = write_temp_config(r#"{"on_start": {"setup": {"1b03": {"type": "clear"}}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"setup": {"1b03": {"type": "clear"}}}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     assert!(config.is_ok(), "{:?}", config.err());
@@ -199,7 +253,7 @@ fn accepts_clear_without_params() {
 /// `launch` is accepted like the `*_exec` commands: params hold the program command line.
 #[test]
 fn accepts_launch_with_command_line() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -235,7 +289,7 @@ fn rejects_launch_with_unbalanced_quotes() {
 /// A missing `launch` program is reported as a non-fatal warning like the exec commands.
 #[test]
 fn warns_on_missing_launch_program() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -256,7 +310,7 @@ fn warns_on_missing_launch_program() {
 /// A missing image file is a non-fatal warning rooted at the button key.
 #[test]
 fn warns_on_missing_image_file() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -275,7 +329,7 @@ fn warns_on_missing_image_file() {
 /// A missing text file is reported as a non-fatal warning.
 #[test]
 fn warns_on_missing_text_file() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -294,7 +348,7 @@ fn warns_on_missing_text_file() {
 /// A missing program referenced by a button entry or an action is a non-fatal warning.
 #[test]
 fn warns_on_missing_executable() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -324,7 +378,7 @@ fn warns_on_non_executable_program() {
     perms.set_mode(0o644);
     std::fs::set_permissions(exe, perms).unwrap();
 
-    let path = write_temp_config(&format!(
+    let path = write_scenes_config(&format!(
         r#"{{
         "on_start": {{
             "setup": {{
@@ -409,7 +463,7 @@ fn rejects_event_value_object() {
 /// A `@scene` action referencing a scene that does not exist is rejected with its location.
 #[test]
 fn rejects_undefined_scene_reference() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -444,7 +498,7 @@ fn rejects_empty_scene_reference() {
 /// The `timer` entry must be a single-entry object; more entries are rejected.
 #[test]
 fn rejects_timer_with_multiple_entries() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -465,7 +519,7 @@ fn rejects_timer_with_multiple_entries() {
 /// A non-numeric timer seconds value is rejected.
 #[test]
 fn rejects_invalid_timer_seconds() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -501,7 +555,7 @@ fn rejects_timer_value_not_a_string() {
 /// A timer action referencing an undefined scene is rejected with the timer location.
 #[test]
 fn rejects_timer_referencing_undefined_scene() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "actions": {
@@ -526,7 +580,7 @@ fn rejects_timer_referencing_undefined_scene() {
 /// Validation reports every invalid scene in one go instead of stopping at the first.
 #[test]
 fn reports_errors_from_all_scenes() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "one": { "bogus": 1 },
             "two": {
@@ -601,7 +655,7 @@ fn rejects_bad_control_numbers() {
 /// config: absent devices and encoders are skipped at runtime, not rejected at load.
 #[test]
 fn accepts_other_device_and_encoder_references() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {

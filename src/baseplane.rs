@@ -5,10 +5,9 @@
 //! A [Reference] is the single addressing unit the scene setup/actions keys use.
 //!
 //! [Baseplane] is the registry of which logical device numbers are actually present.
-//! Multiple devices are not implemented yet: exactly one device — the first one
-//! discovered — is always present, and it is assigned the config number 1. The registry
-//! itself is generic, so when real per-device numbering lands (a config section mapping
-//! serials to numbers) only the number assignment changes, not the config format.
+//! The config's `devices` section declares the devices by keying each definition with its
+//! logical number; the runtime matches those definitions against the discovered hardware
+//! (by serial, falling back to VID:PID) and registers the numbers of the matches here.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -50,8 +49,8 @@ impl Kind {
 /// e.g. `1b01` for device 1 button 1, `2e01` for device 2 encoder 1.
 ///
 /// The device number is 1..=`MAX_DEVICES`, the control number 1..=`MAX_NUMBER` and
-/// is always written with two digits. Devices are numbered logically: the first
-/// discovered device is device 1; later a config section will map serials to numbers.
+/// is always written with two digits. Devices are numbered logically: each number names
+/// one device definition from the config's `devices` section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Reference {
     /// Logical device number (`1..=MAX_DEVICES`).
@@ -139,21 +138,25 @@ impl fmt::Display for Reference {
 
 /// The set of devices the program talks to, keyed by their config numbers.
 ///
-/// Only a single device is supported for now: the first one discovered, which is
-/// always present as device 1. The present-set is stored generically so sparse,
-/// non-sequential numberings (e.g. only devices 2, 5 and 9) work unchanged once
-/// real device numbering is implemented.
+/// A number is present when the device definition it names in the config `devices`
+/// section was matched to discovered hardware at startup. The present-set is stored
+/// generically so sparse, non-sequential numberings (e.g. only devices 2, 5 and 9)
+/// work unchanged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Baseplane {
     present: BTreeSet<u8>,
 }
 
 impl Baseplane {
-    /// A baseplane holding the single first-discovered device as device 1.
-    pub fn single_first_device() -> Baseplane {
-        let mut present = BTreeSet::new();
-        present.insert(1);
-        Baseplane { present }
+    /// A baseplane holding the given numbers as the present devices, e.g. the config
+    /// device ids whose definitions matched the discovered hardware.
+    pub fn from_present<I>(numbers: I) -> Baseplane
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        Baseplane {
+            present: numbers.into_iter().collect(),
+        }
     }
 
     /// Whether a device with this config number is currently connected.
@@ -250,15 +253,26 @@ mod tests {
         assert_eq!(Reference::button(9, 99).to_string(), "9b99");
     }
 
-    /// The single-device baseplane reports device 1 present and nothing else.
+    /// A baseplane built from a set of numbers reports exactly those present.
     #[test]
-    fn single_first_device_presents_only_device_one() {
-        let baseplane = Baseplane::single_first_device();
+    fn from_present_presents_only_given_numbers() {
+        let baseplane = Baseplane::from_present([1]);
         assert!(baseplane.is_present(1));
         assert!(!baseplane.is_present(2));
         assert!(!baseplane.is_present(9));
         assert_eq!(baseplane.present_numbers(), vec![1]);
         assert_eq!(baseplane.first_present_number(), Some(1));
+    }
+
+    /// Sparse, non-sequential numberings keep only the given devices present.
+    #[test]
+    fn from_present_keeps_sparse_numbering() {
+        let baseplane = Baseplane::from_present([9, 2]);
+        assert!(baseplane.is_present(2));
+        assert!(baseplane.is_present(9));
+        assert!(!baseplane.is_present(1));
+        assert_eq!(baseplane.present_numbers(), vec![2, 9]);
+        assert_eq!(baseplane.first_present_number(), Some(2));
     }
 
     /// A default baseplane is empty: no device is present.

@@ -20,9 +20,16 @@ pub fn write_temp_config(contents: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Loads `config_json` and asserts the returned errors contain `expected`.
-pub fn assert_validation_error(config_json: &str, expected: &str) {
-    let path = write_temp_config(config_json);
+/// Wraps `scenes_json` (a scenes object) in the top-level config structure and writes it
+/// to a unique temp file, returning its path. The `devices` section is left empty.
+pub fn write_scenes_config(scenes_json: &str) -> PathBuf {
+    write_temp_config(&format!("{{\"scenes\": {scenes_json}, \"devices\": {{}}}}"))
+}
+
+/// Loads `scenes_json` (wrapped into the top-level config structure) and asserts the
+/// returned errors contain `expected`.
+pub fn assert_validation_error(scenes_json: &str, expected: &str) {
+    let path = write_scenes_config(scenes_json);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = fs::remove_file(&path);
     let errors = error_texts(config.unwrap_err());

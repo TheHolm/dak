@@ -1,35 +1,63 @@
 {
-  "on_start": {
-    "setup": {
-      "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
+        "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
+        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+        "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
+      },
+      "actions": {
+        "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "timer": { "1": "@Main" }
+      }
     },
-    "actions": {
-      "1b01": { "pressed": "~", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "1b02": { "pressed": "@Test", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "timer": { "1": "@Main" }
+    "Main": {
+      "setup": {
+        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+        "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
+      },
+      "actions": {
+        "timer": { "1": "~" }
+      }
+    },
+    "Test": {
+      "setup": {
+        "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+        "1b03": { "type": "clear" }
+      },
+      "actions": {
+        "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "timer": { "1": "~" }
+      }
     }
   },
-  "Main": {
-    "setup": {
-      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
-    },
-    "actions": {
-      "timer": { "1": "~" }
-    }
-  },
-  "Test": {
-    "setup": {
-      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
-      "1b03": { "type": "clear" }
-    },
-    "actions": {
-      "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-      "timer": { "1": "~" }
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 7, "release": 7, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 8, "release": 8, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 9, "release": 9, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 144, "ccw": 145 },
+        { "number": 2, "cw": 146, "ccw": 147 },
+        { "number": 3, "cw": 148, "ccw": 149 }
+      ]
     }
   }
 }

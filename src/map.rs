@@ -20,7 +20,7 @@ use mirajazz::{
     state::DeviceStateReader,
     types::{DeviceInput, HidDevice, ImageFormat, ImageMirroring, ImageMode, ImageRotation},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::log::{Log, Subsystem};
 
@@ -49,7 +49,10 @@ const IMAGE_FORMAT: ImageFormat = ImageFormat {
 };
 
 /// Everything the wizard learned about one device.
-#[derive(Debug, PartialEq, Serialize)]
+///
+/// [`Deserialize`] is derived so the same structure can be pasted into the config's
+/// `devices` section to declare a device.
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Mapping {
     /// VID:PID as an "XXXX:XXXX" string.
     pub device_id: String,
@@ -70,7 +73,7 @@ pub struct Mapping {
 }
 
 /// Mapping of one physical button.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ButtonMapping {
     /// Logical button number (1-based), the order the user pressed them in.
     pub number: u8,
@@ -86,7 +89,7 @@ pub struct ButtonMapping {
 }
 
 /// Mapping of one encoder's twist codes.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct EncoderMapping {
     /// Logical encoder number (1-based), the order the user turned them in.
     pub number: u8,

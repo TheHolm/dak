@@ -71,9 +71,14 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 
 ## Config structure
 
-`config.json` drives all runtime behavior. Keys in the top-level object denote **scenes**, and a scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
+`config.json` drives all runtime behavior. The top level of the config is a dictionary with exactly two keys:
 
-### Control references
+- `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
+- `"devices"` — the individual device definitions (see [Devices](#devices))
+
+### Scenes
+
+A scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
 
 Buttons and encoders in `setup` and `actions` are addressed by **control references** of the form
 
@@ -81,15 +86,15 @@ Buttons and encoders in `setup` and `actions` are addressed by **control referen
 <device><b|e><number>
 ```
 
-- `<device>` is a single digit `1`–`9` naming the logical device. Only one device is supported so far: the first one found, which is always device `1`. The numbering exists so multi-device setups can come later without changing the config format.
+- `<device>` is a single digit `1`–`9` naming a logical device. Each digit names one device definition from the `devices` section; at startup every definition matched to discovered hardware is driven, so a reference names a specific physical device by its id.
 - `b` addresses a button, `e` an encoder.
 - `<number>` is the control number, always written with two digits, `01`–`99` (the AKP03E has 9 buttons and 3 encoders).
 
 For example `1b01` is button 1 on device 1, and `2e01` is encoder 1 on device 2.
 
-Rules for the program (and its future multi-device self):
+Rules for the program:
 
-- References to devices `2`–`9` are valid config but are skipped at runtime with a warning (`device N is referenced but not present`).
+- References to devices that are **not present** — whose definition was not matched to any discovered device — are skipped at runtime with a warning (`device N is referenced but not present`).
 - Encoder references (`1e01`) are reserved: they validate, and are skipped at runtime with a warning until encoder handling is implemented.
 - Out-of-range button references (e.g. `1b99` on a 9-button device) are skipped with a warning.
 - The old plain numeric keys (`"1"`, `"3"`, ...) are no longer accepted; update them to `"1b01"`, `"1b03"`, ...
@@ -112,7 +117,7 @@ Action values have three forms:
 
 Commands are executed asynchronously, so a running command does not block button input or the timer.
 
-Example:
+Example scenes:
 
 ```json
 {
@@ -147,6 +152,72 @@ Example:
       "1b01": { "pressed": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "1b03": { "pressed": "@on_start", "released": "", "short_press": "", "long_press": "", "double_click": "" },
       "timer": { "1": "~" }
+    }
+  }
+}
+```
+
+### Devices
+
+The `devices` section declares the individual devices the config drives. Its keys are **logical device ids** (single digits `1`–`9`, the same digits the control references use), and each value is a device definition — the exact JSON that `dak --map` prints when it has walked you through picking a device and capturing its buttons and encoders:
+
+```
+dak --map
+```
+
+A device definition looks like this:
+
+```json
+{
+  "device_id": "0300:3002",
+  "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+  "serial": "unknown",
+  "key_count": 9,
+  "encoder_count": 3,
+  "screens": 6,
+  "buttons": [
+    { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+    { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 }
+  ],
+  "encoders": [
+    { "number": 1, "cw": 144, "ccw": 145 }
+  ]
+}
+```
+
+At startup each definition is matched against the discovered hardware:
+
+- A definition whose serial is anything but `"unknown"` matches only the device reporting that exact serial, which tells identical devices apart.
+- A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
+
+Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with an error.
+
+A complete config combining both sections looks like:
+
+```json
+{
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "image", "params": "/path/reader.ico" }
+      },
+      "actions": {
+        "timer": { "1": "@Main" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 }
+      ],
+      "encoders": []
     }
   }
 }

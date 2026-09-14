@@ -6,12 +6,12 @@ use dak::actions::{scene_operations, CommandSpec, SceneOp};
 use dak::baseplane::Reference;
 use serde_json::json;
 
-use crate::common::write_temp_config;
+use crate::common::write_scenes_config;
 
 /// Static image buttons become ordered SetImage operations.
 #[test]
 fn scene_operations_extract_static_images() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -66,7 +66,7 @@ fn scene_operations_mark_unsupported_commands() {
 /// from its collapsed params command line.
 #[test]
 fn scene_operations_extract_image_exec() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -94,7 +94,7 @@ fn scene_operations_extract_image_exec() {
 /// Text buttons become Text operations.
 #[test]
 fn scene_operations_extract_text() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -120,7 +120,7 @@ fn scene_operations_extract_text() {
 /// from its collapsed params command line.
 #[test]
 fn scene_operations_extract_text_exec() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -312,7 +312,7 @@ fn scene_operations_reject_setup_not_an_object() {
 /// Clear buttons become Clear operations with the given reference, params optional.
 #[test]
 fn scene_operations_extract_clear() {
-    let path = write_temp_config(
+    let path = write_scenes_config(
         r#"{
             "on_start": {
                 "setup": {
@@ -336,7 +336,7 @@ fn scene_operations_extract_clear() {
 /// A scene with no numbered buttons yields no operations.
 #[test]
 fn scene_operations_return_empty_for_scene_without_buttons() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(path);
 
@@ -347,7 +347,7 @@ fn scene_operations_return_empty_for_scene_without_buttons() {
 /// Building operations for an undefined scene returns an error.
 #[test]
 fn scene_operations_reject_undefined_scene() {
-    let path = write_temp_config(r#"{"on_start": {"actions": {}}}"#);
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
     let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
     let _ = std::fs::remove_file(path);
 

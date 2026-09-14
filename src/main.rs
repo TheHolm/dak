@@ -5,7 +5,10 @@ use clap::Parser;
 use mirajazz::{
     device::{list_devices, Device, DeviceQuery},
     error::MirajazzError,
-    types::{DeviceInput, ImageFormat, ImageMirroring, ImageMode, ImageRotation},
+    types::{
+        DeviceInput, HidDevice, HidDeviceInfo, ImageFormat, ImageMirroring, ImageMode,
+        ImageRotation,
+    },
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -13,6 +16,7 @@ use tokio::sync::mpsc;
 use dak::actions::{self, Action};
 use dak::baseplane::{Baseplane, Reference};
 use dak::log::{Log, Subsystem};
+use dak::map::Mapping;
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
 #[derive(Debug, Parser)]
@@ -39,6 +43,9 @@ struct Cli {
 
 const QUERY: DeviceQuery = DeviceQuery::new(65440, 1, 0x0300, 0x3002);
 
+/// Protocol version used to connect to every device.
+const PROTOCOL_VERSION: usize = 2;
+
 const IMAGE_FORMAT: ImageFormat = ImageFormat {
     mode: ImageMode::JPEG,
     size: (60, 60),
@@ -47,13 +54,16 @@ const IMAGE_FORMAT: ImageFormat = ImageFormat {
     mirror: ImageMirroring::None,
 };
 
-/// Connects to the first found Ajazz keypad, applies the `on_start` scene and reacts to
-/// keys, encoder events and scene timers: scene-switch actions enter the target scene,
-/// command actions run their program asynchronously.
+/// Loads the config, matches the config's `devices` definitions against the discovered
+/// hardware, and drives every present device: each connects with its own key/encoder
+/// counts, applies the `on_start` scene, and reacts to keys, encoder events and scene
+/// timers.
 ///
-/// Only a single device is driven for now — the first one discovered, addressed in the
-/// config as device 1. When multiple devices arrive, the baseplane will map serials to
-/// device numbers and the loop will drive every present device.
+/// A device definition is matched to a discovered device by its serial number, falling
+/// back to the VID:PID string when the definition's serial is "unknown". Definitions with
+/// no matching hardware and discovered devices without a config definition are reported
+/// and skipped; when no configured device is found the program exits with
+/// `DeviceNotFoundError`.
 #[tokio::main]
 async fn main() -> Result<(), MirajazzError> {
     let cli = Cli::parse();
@@ -86,186 +96,284 @@ async fn main() -> Result<(), MirajazzError> {
         }
     };
 
-    // Discovered devices come back from an unordered set, so pick "the first" by
-    // iterating order. Only that first device is driven; later versions will address
-    // each device by its serial-backed config number.
-    let devices: Vec<_> = list_devices(&[QUERY]).await?.into_iter().collect();
-    let baseplane = Baseplane::single_first_device();
-    let device_number = baseplane.first_present_number().unwrap_or(1);
-    for dev in devices.iter().take(1) {
-        log.debug(Subsystem::Device, "Connecting to device");
-        for line in device_info_lines(
-            &dev.id,
-            &dev.serial_number,
-            dev.vendor_id,
-            dev.product_id,
-            &dev.name,
-        ) {
-            log.debug(Subsystem::Device, line);
+    // Discovered devices come back from an unordered set. Each config device definition
+    // (keyed by a logical device id) is matched against this set: serial numbers tell
+    // identical devices apart, a VID:PID fallback covers devices without serials.
+    let devices: Vec<HidDevice> = list_devices(&[QUERY]).await?.into_iter().collect();
+    let mut assignments: Vec<(u8, Mapping, HidDeviceInfo)> = Vec::new();
+    for (device_id, definition) in &config.devices.by_id {
+        match devices.iter().position(|dev| {
+            actions::discovered_device_matches(
+                definition,
+                &dev.serial_number,
+                dev.vendor_id,
+                dev.product_id,
+            )
+        }) {
+            Some(index) => {
+                log.debug(
+                    Subsystem::Device,
+                    format!("device {device_id}: matched config definition to discovered hardware"),
+                );
+                assignments.push((*device_id, definition.clone(), devices[index].clone()));
+            }
+            None => log.warn(format!(
+                "device {device_id} defined in config was not found"
+            )),
         }
+    }
 
-        // Connect to the device
-        let device = Device::connect(dev, 2, 9, 3).await?;
-        let device = device.with_supports_both_keypress_states(true);
-        let device = device.with_supports_both_encoder_states(true);
-
-        // Print out some info from the device
-        log.debug(
-            Subsystem::Device,
-            format!("Connected to '{}'", device.serial_number()),
-        );
-
-        device.set_brightness(50).await?;
-        device.clear_all_button_images().await?;
-
-        log.debug(
-            Subsystem::Device,
-            format!("Key count: {}", device.key_count()),
-        );
-        log.debug(
-            Subsystem::Device,
-            format!("Encoder count: {}", device.encoder_count()),
-        );
-        log.debug(
-            Subsystem::Device,
-            format!(
-                "Supports_both_encoder_states: {}",
-                device.supports_both_encoder_states()
-            ),
-        );
-        // log.debug(Subsystem::Device, format!("Firmware version: {:?}", Device::read_firmware_version(&dev).await.unwrap()));
-
-        // async image_exec/text_exec results land on buttons through this runner and its channel
-        let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
-        let mut runner =
-            actions::SceneRunner::new(device_number, &device, IMAGE_FORMAT, exec_tx, log);
-
-        if let Err(error) = runner.enter_scene("on_start", &config.scenes).await {
-            log.warn(format!("failed to apply on_start scene: {error}"));
+    for dev in &devices {
+        if !assignments.iter().any(|(_, _, info)| info.id == dev.id) {
+            log.warn(format!(
+                "device found but not defined in config; ignoring: {}",
+                device_summary_line(
+                    &dev.id,
+                    &dev.serial_number,
+                    dev.vendor_id,
+                    dev.product_id,
+                    &dev.name
+                )
+            ));
         }
+    }
 
-        // Flush
-        device.flush().await?;
+    if assignments.is_empty() {
+        log.error("no device defined in config was found");
+        return Err(MirajazzError::DeviceNotFoundError);
+    }
 
-        let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
-        let mut current_scene = String::from("on_start");
-        let mut buttons_down = vec![false; device.key_count()];
+    let baseplane = Baseplane::from_present(assignments.iter().map(|(id, _, _)| *id));
+    log.info(format!(
+        "{} device(s) present: {}",
+        baseplane.present_numbers().len(),
+        baseplane
+            .present_numbers()
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
 
-        // Timer events are delivered through a channel so the input loop can react to
-        // them without blocking on the device reader.
-        let (timer_tx, mut timer_rx) = mpsc::channel::<String>(1);
-        let mut timer_handle =
-            arm_scene_timer(&current_scene, &config.scenes, &timer_tx, log).await;
+    // Drive every present device, each on its own task with its own input loop, scene
+    // state and timer. Ctrl-C reaches every loop, so every device runs its cleanup.
+    let mut handles = Vec::new();
+    for (device_number, definition, device_info) in assignments {
+        let scenes = config.scenes.clone();
+        handles.push(tokio::spawn(run_device(
+            device_number,
+            definition,
+            device_info,
+            scenes,
+            log,
+        )));
+    }
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                log.error(format!("device task failed unexpectedly: {error}"));
+                return Err(MirajazzError::BadData);
+            }
+        }
+    }
 
-        // Actions are inherited from the previously active scene (see `action_for_key`),
-        // so the scene we came from is remembered across scene switches.
-        let mut previous_scene: Option<String> = None;
+    Ok(())
+}
 
-        loop {
-            tokio::select! {
-                data_result = reader.raw_read_data(512) => {
-                    let data = match data_result {
-                        Ok(data) => data,
-                        Err(_) => break,
-                    };
-                    if !data.starts_with(&[65, 67, 75]) {
-                        continue;
-                    }
-                    let key = data[9] as usize;
-                    let pressed = data[10] != 0;
-                    log.debug(
-                        Subsystem::Device,
-                        format!(
-                            "Key {}, state {}",
-                            data[9], data[10]
-                        ),
-                    );
+/// Runs one present device: connects with the key/encoder counts from its config
+/// definition, applies the `on_start` scene, and reacts to keys, encoder events and scene
+/// timers until the reader closes or Ctrl-C is pressed, then restores the buttons this
+/// session changed and shuts the device down.
+///
+/// `device_number` is the id the definition is keyed under in the config; the runner
+/// drives references naming this number and skips references to other devices with a
+/// warning, so the same scenes address every device by its own number.
+async fn run_device(
+    device_number: u8,
+    definition: Mapping,
+    device_info: HidDeviceInfo,
+    scenes: Value,
+    log: Log,
+) -> Result<(), MirajazzError> {
+    log.debug(
+        Subsystem::Device,
+        format!("Connecting to device {device_number}"),
+    );
+    for line in device_info_lines(
+        &device_info.id,
+        &device_info.serial_number,
+        device_info.vendor_id,
+        device_info.product_id,
+        &device_info.name,
+    ) {
+        log.debug(Subsystem::Device, line);
+    }
 
-                    if key >= buttons_down.len() {
-                        continue;
-                    }
+    // Connect to the device using the counts its config definition declares.
+    let device = Device::connect(
+        &device_info,
+        PROTOCOL_VERSION,
+        definition.key_count as usize,
+        definition.encoder_count as usize,
+    )
+    .await?;
+    let device = device.with_supports_both_keypress_states(true);
+    let device = device.with_supports_both_encoder_states(true);
 
-                    if pressed && !buttons_down[key] {
-                        buttons_down[key] = true;
+    // Print out some info from the device
+    log.debug(
+        Subsystem::Device,
+        format!("Connected to '{}'", device.serial_number()),
+    );
 
-                        // raw key codes are physical button numbers (1-based), so the
-                        // event addresses the button of the number on this device
-                        let reference = Reference::button(device_number, key as u8);
+    device.set_brightness(50).await?;
+    device.clear_all_button_images().await?;
 
-                        let Some(action) = actions::action_for_key(
-                            &current_scene,
-                            previous_scene.as_deref(),
-                            &reference,
-                            &config.scenes,
-                        ) else {
-                            continue;
-                        };
+    log.debug(
+        Subsystem::Device,
+        format!("Key count: {}", device.key_count()),
+    );
+    log.debug(
+        Subsystem::Device,
+        format!("Encoder count: {}", device.encoder_count()),
+    );
+    log.debug(
+        Subsystem::Device,
+        format!(
+            "Supports_both_encoder_states: {}",
+            device.supports_both_encoder_states()
+        ),
+    );
 
-                        log.debug(
-                            Subsystem::Actions,
-                            format!("key {key} pressed -> \"{action}\""),
-                        );
+    // async image_exec/text_exec results land on buttons through this runner and its channel
+    let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
+    let mut runner = actions::SceneRunner::new(device_number, &device, IMAGE_FORMAT, exec_tx, log);
 
-                        run_action(
-                            log,
-                            &mut runner,
-                            &mut current_scene,
-                            &mut previous_scene,
-                            &config.scenes,
-                            action,
-                            &mut timer_handle,
-                            &timer_tx,
-                        )
-                        .await;
-                    } else if !pressed && buttons_down[key] {
-                        buttons_down[key] = false;
-                    }
+    if let Err(error) = runner.enter_scene("on_start", &scenes).await {
+        log.warn(format!("failed to apply on_start scene: {error}"));
+    }
+
+    // Flush
+    device.flush().await?;
+
+    let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
+    let mut current_scene = String::from("on_start");
+    let mut buttons_down = vec![false; device.key_count()];
+
+    // Timer events are delivered through a channel so the input loop can react to
+    // them without blocking on the device reader.
+    let (timer_tx, mut timer_rx) = mpsc::channel::<String>(1);
+    let mut timer_handle = arm_scene_timer(&current_scene, &scenes, &timer_tx, log).await;
+
+    // Actions are inherited from the previously active scene (see `action_for_key`),
+    // so the scene we came from is remembered across scene switches.
+    let mut previous_scene: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            data_result = reader.raw_read_data(512) => {
+                let data = match data_result {
+                    Ok(data) => data,
+                    Err(_) => break,
+                };
+                if !data.starts_with(&[65, 67, 75]) {
+                    continue;
                 }
-                action = timer_rx.recv() => {
-                    let Some(action) = action else {
-                        break;
+                let key = data[9] as usize;
+                let pressed = data[10] != 0;
+                log.debug(
+                    Subsystem::Device,
+                    format!(
+                        "Key {}, state {}",
+                        data[9], data[10]
+                    ),
+                );
+
+                if key >= buttons_down.len() {
+                    continue;
+                }
+
+                if pressed && !buttons_down[key] {
+                    buttons_down[key] = true;
+
+                    // raw key codes are physical button numbers (1-based), so the
+                    // event addresses the button of the number on this device
+                    let reference = Reference::button(device_number, key as u8);
+
+                    let Some(action) = actions::action_for_key(
+                        &current_scene,
+                        previous_scene.as_deref(),
+                        &reference,
+                        &scenes,
+                    ) else {
+                        continue;
                     };
+
                     log.debug(
                         Subsystem::Actions,
-                        format!("timer for scene \"{current_scene}\" -> \"{action}\""),
+                        format!("key {key} pressed -> \"{action}\""),
                     );
+
                     run_action(
                         log,
                         &mut runner,
                         &mut current_scene,
                         &mut previous_scene,
-                        &config.scenes,
-                        &action,
+                        &scenes,
+                        action,
                         &mut timer_handle,
                         &timer_tx,
                     )
                     .await;
-                }
-                event = exec_rx.recv() => {
-                    let Some(event) = event else {
-                        break;
-                    };
-                    runner.handle_exec_event(event).await;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    // Ctrl-C (SIGINT) normally kills the process instantly; route it
-                    // through the same break so the cleanup + shutdown below run.
-                    break;
+                } else if !pressed && buttons_down[key] {
+                    buttons_down[key] = false;
                 }
             }
+            action = timer_rx.recv() => {
+                let Some(action) = action else {
+                    break;
+                };
+                log.debug(
+                    Subsystem::Actions,
+                    format!("timer for scene \"{current_scene}\" -> \"{action}\""),
+                );
+                run_action(
+                    log,
+                    &mut runner,
+                    &mut current_scene,
+                    &mut previous_scene,
+                    &scenes,
+                    &action,
+                    &mut timer_handle,
+                    &timer_tx,
+                )
+                .await;
+            }
+            event = exec_rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                runner.handle_exec_event(event).await;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                // Ctrl-C (SIGINT) normally kills the process instantly; route it
+                // through the same break so the cleanup + shutdown below run.
+                break;
+            }
         }
-
-        drop(reader);
-
-        // Restore the buttons this program touched: clear the image on every button whose
-        // image the session changed, then flush. Buttons never changed are left alone.
-        if let Err(error) = runner.clear_changed_button_images().await {
-            log.warn(format!("failed to restore changed buttons: {error}"));
-        }
-
-        device.shutdown().await?;
     }
 
+    drop(reader);
+
+    // Restore the buttons this program touched: clear the image on every button whose
+    // image the session changed, then flush. Buttons never changed are left alone.
+    if let Err(error) = runner.clear_changed_button_images().await {
+        log.warn(format!("failed to restore changed buttons: {error}"));
+    }
+
+    device.shutdown().await?;
     Ok(())
 }
 
@@ -278,7 +386,7 @@ async fn main() -> Result<(), MirajazzError> {
 /// refreshing. Scene changes run through `runner`, which also owns the device.
 ///
 /// The parameter list is deliberately kept flat over bundling the shared state into one
-/// struct: this program has exactly one input loop, so a context type adds indirection
+/// struct: each device has exactly one input loop, so a context type adds indirection
 /// without removing any call sites.
 #[allow(clippy::too_many_arguments)]
 async fn run_action(
@@ -408,6 +516,22 @@ fn device_info_lines(
     ]
 }
 
+/// One-line summary of a detected device, used e.g. when a discovered device has no
+/// matching config definition.
+///
+/// Like [`device_info_lines`], the id is passed as a `Debug` value because its concrete
+/// type is platform-specific and not re-exported by mirajazz.
+fn device_summary_line(
+    id: &dyn std::fmt::Debug,
+    serial: &Option<String>,
+    vid: u16,
+    pid: u16,
+    name: &str,
+) -> String {
+    let serial = serial.as_deref().unwrap_or("unknown");
+    format!("{vid:04X}:{pid:04X} path {id:?} serial {serial} \"{name}\"")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -525,5 +649,26 @@ mod tests {
         );
         assert_eq!(lines[3], "device serial: unknown");
         assert_eq!(lines[1], "device path: DevPath(\"/dev/hidraw0\")");
+    }
+
+    /// The one-line device summary carries VID:PID, path, serial and name so an
+    /// unconfigured device can be told apart from the configured ones.
+    #[test]
+    fn device_summary_line_identifies_a_device() {
+        let line = super::device_summary_line(
+            &FakeDeviceId("/dev/hidraw3"),
+            &Some("ABC123".to_string()),
+            0x0300,
+            0x3002,
+            "Ajazz HOTSPOTEKUSB HID DEMO",
+        );
+        assert_eq!(
+            line,
+            r#"0300:3002 path DevPath("/dev/hidraw3") serial ABC123 "Ajazz HOTSPOTEKUSB HID DEMO""#
+        );
+        assert_eq!(
+            super::device_summary_line(&FakeDeviceId("/dev/hidraw0"), &None, 0x0300, 0x3002, "k"),
+            r#"0300:3002 path DevPath("/dev/hidraw0") serial unknown "k""#
+        );
     }
 }
