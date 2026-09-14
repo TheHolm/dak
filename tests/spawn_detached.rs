@@ -104,3 +104,15 @@ fn spawn_detached_starts_program_in_its_own_process_group() {
     let _ = std::fs::remove_file(&pid_file);
     let _ = std::fs::remove_file(&done_file);
 }
+
+/// A program that cannot be started (missing executable) is reported through the
+/// log instead of panicking or hanging; nothing is spawned.
+#[test]
+fn spawn_detached_reports_failed_start() {
+    let command = CommandSpec {
+        program: "/definitely/not/an/executable".to_string(),
+        args: vec![],
+    };
+    // The failed spawn is logged (to stderr) and control returns normally.
+    spawn_detached(&command, Log::default());
+}

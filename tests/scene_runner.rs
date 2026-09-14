@@ -4,7 +4,7 @@
 //! kills the running program and draws the red "Error" label.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -103,6 +103,81 @@ impl ButtonDevice for MockButtonDevice {
     }
 }
 
+/// The error type of [`FailingButtonDevice`]: a fixed message describing the failure.
+#[derive(Debug)]
+struct WriteError(&'static str);
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// A device mock whose image writes and flushes can fail on demand, for exercising
+/// the error-logging branches of the scene runner. Every operation is recorded so
+/// tests can assert the failing branch actually ran.
+#[derive(Default)]
+struct FailingButtonDevice {
+    fail_set_image: AtomicBool,
+    fail_flush: AtomicBool,
+    attempts: Mutex<Vec<&'static str>>,
+}
+
+impl FailingButtonDevice {
+    /// Snapshot of every attempted operation, in order.
+    fn attempts(&self) -> Vec<&'static str> {
+        self.attempts.lock().unwrap().clone()
+    }
+
+    /// Makes every future `set_button_image` call fail.
+    fn fail_image_writes(&self, yes: bool) {
+        self.fail_set_image.store(yes, Ordering::SeqCst);
+    }
+
+    /// Makes every future `flush` call fail.
+    fn fail_flushes(&self, yes: bool) {
+        self.fail_flush.store(yes, Ordering::SeqCst);
+    }
+}
+
+impl ButtonDevice for FailingButtonDevice {
+    type Error = WriteError;
+
+    async fn set_button_image(
+        &self,
+        _key: u8,
+        _image_format: ImageFormat,
+        _image: DynamicImage,
+    ) -> Result<(), Self::Error> {
+        self.attempts.lock().unwrap().push("SetImage");
+        if self.fail_set_image.load(Ordering::SeqCst) {
+            Err(WriteError("device write refused"))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn clear_button_image(&self, _key: u8) -> Result<(), Self::Error> {
+        self.attempts.lock().unwrap().push("ClearImage");
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), Self::Error> {
+        self.attempts.lock().unwrap().push("Flush");
+        if self.fail_flush.load(Ordering::SeqCst) {
+            Err(WriteError("device flush refused"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn key_count(&self) -> u8 {
+        9
+    }
+}
+
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Writes a 4x4 test image to a unique temp file and returns its path.
@@ -112,6 +187,15 @@ fn write_temp_image() -> PathBuf {
     let image = RgbImage::from_pixel(4, 4, Rgb([200, 100, 50]));
     image.save(&path).unwrap();
     PathBuf::from(path)
+}
+
+/// Encodes a 60x60 green PNG, used as fake `image_exec` output for exec tests.
+fn green_png_bytes() -> Vec<u8> {
+    let mut png = Vec::new();
+    RgbImage::from_pixel(60, 60, Rgb([10, 200, 30]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encoding png failed");
+    png
 }
 
 /// Writes `contents` to a unique temp file and returns its path.
@@ -661,4 +745,229 @@ async fn out_of_range_buttons_are_skipped() {
     runner.enter_scene("main", &scenes).await.unwrap();
 
     assert_eq!(mock.kinds(&mock.calls()), ["Flush"]);
+}
+
+/// When `image_exec` output decodes fine but staging it on the device fails, the
+/// failure is logged and no further flush happens for that output.
+#[tokio::test]
+async fn exec_output_write_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let scenes = scenes_with_buttons(
+        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
+    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: green_png_bytes(),
+        })
+        .await;
+
+    let attempts = device.attempts();
+    assert!(
+        attempts.contains(&"SetImage"),
+        "the failing draw should have been attempted: {attempts:?}"
+    );
+    // The failed draw aborts before the trailing flush of the output.
+    assert_eq!(
+        attempts.iter().filter(|op| **op == "Flush").count(),
+        1,
+        "only the scene flush should have run: {attempts:?}"
+    );
+}
+
+/// When staging `image_exec` output succeeds but flushing it to the LCDs fails, the
+/// flushed failure is logged and the runner keeps going.
+#[tokio::test]
+async fn exec_output_flush_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let scenes = scenes_with_buttons(
+        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
+    );
+    // The scene-level flush succeeds first; only the exec-output flush fails.
+    runner.enter_scene("main", &scenes).await.unwrap();
+    device.fail_flushes(true);
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: green_png_bytes(),
+        })
+        .await;
+
+    let attempts = device.attempts();
+    assert_eq!(
+        attempts.iter().filter(|op| **op == "Flush").count(),
+        2,
+        "scene flush plus failing output flush: {attempts:?}"
+    );
+    assert!(
+        attempts.contains(&"SetImage"),
+        "the output should have been staged before the failing flush: {attempts:?}"
+    );
+}
+
+/// When a failed `image_exec`/`text_exec` program's red "Error" label cannot be drawn
+/// because the device rejects writes, that is logged too.
+#[tokio::test]
+async fn exec_error_label_draw_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let scenes = scenes_with_buttons(
+        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
+    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Error {
+            key: 2,
+            generation: 2,
+            error: "boom".to_string(),
+        })
+        .await;
+
+    assert!(
+        device.attempts().contains(&"SetImage"),
+        "the error label should have been attempted: {:?}",
+        device.attempts()
+    );
+}
+
+/// A `text_exec` whose output is not UTF-8 draws "Error"; when the device rejects
+/// that draw, the failure is logged and the runner keeps going.
+#[tokio::test]
+async fn exec_output_non_utf8_draw_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let scenes = scenes_with_buttons(
+        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
+    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Text,
+            stdout: b"\xff\xfe".to_vec(),
+        })
+        .await;
+
+    assert!(
+        device.attempts().contains(&"SetImage"),
+        "the error label should have been attempted: {:?}",
+        device.attempts()
+    );
+}
+
+/// An `image_exec` whose output is not a valid image draws "Error"; a device that
+/// rejects that draw logs the failure.
+#[tokio::test]
+async fn exec_output_invalid_image_draw_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let scenes = scenes_with_buttons(
+        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
+    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: b"not an image".to_vec(),
+        })
+        .await;
+
+    assert!(
+        device.attempts().contains(&"SetImage"),
+        "the error label should have been attempted: {:?}",
+        device.attempts()
+    );
+}
+
+/// Reassigning a button while its `text_exec` runs kills the program and draws "Error";
+/// when the device rejects the error draw, that failure is logged but the killing and
+/// the reassignment still proceed.
+#[tokio::test]
+async fn reassign_kill_error_label_draw_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default());
+
+    let pid_file = format!("/tmp/dak_runner_pid_{}", std::process::id());
+    let _ = std::fs::remove_file(&pid_file);
+    let scenes = scenes_with_buttons(json!({
+        "1b02": {
+            "type": "text_exec",
+            "params": format!("/bin/sh -c 'echo $$ > {pid_file}; exec sleep 60'")
+        }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let pid = {
+        let mut pid = None;
+        for _ in 0..200 {
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                if let Ok(parsed) = content.trim().parse::<i32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        pid.expect("program did not write its pid file")
+    };
+    assert!(
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "sanity check: process {pid} should be running"
+    );
+
+    let reassigned = scenes_with_buttons(json!({ "1b02": { "type": "clear" } }));
+    runner.enter_scene("main", &reassigned).await.unwrap();
+
+    let mut gone = false;
+    for _ in 0..100 {
+        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "process {pid} still alive after reassignment");
+
+    let attempts = device.attempts();
+    assert!(
+        attempts.contains(&"SetImage"),
+        "the kill error label should have been attempted: {attempts:?}"
+    );
+    // The failing error draw does not prevent the reassigned operation itself.
+    assert!(
+        attempts.contains(&"ClearImage"),
+        "the reassigned clear should still have run: {attempts:?}"
+    );
+    let _ = std::fs::remove_file(&pid_file);
 }

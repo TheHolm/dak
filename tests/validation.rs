@@ -245,6 +245,25 @@ fn rejects_unknown_button_type() {
     );
 }
 
+/// A scene's `setup` section must be an object of numbered buttons.
+#[test]
+fn rejects_setup_not_an_object() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": [1, 2]}}"#,
+        "setup must be an object of numbered buttons",
+    );
+}
+
+/// A scene's `setup` section must be an object of numbered buttons; the error also
+/// covers a bare string value.
+#[test]
+fn rejects_setup_not_an_object_when_string() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": "1b01"}}"#,
+        "setup must be an object of numbered buttons",
+    );
+}
+
 /// "params" must be a string when present.
 #[test]
 fn rejects_button_params_not_a_string() {

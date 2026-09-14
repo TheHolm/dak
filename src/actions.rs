@@ -1788,6 +1788,25 @@ mod tests {
         }
     }
 
+    /// A backslash escapes the following character, so a space-separated command can
+    /// pass arguments containing spaces without quoting.
+    #[test]
+    fn parse_command_line_backslash_escapes_next_character() {
+        let spec = super::parse_command_line("/bin/echo one\\ two\\ three").unwrap();
+        assert_eq!(spec.program, "/bin/echo");
+        assert_eq!(spec.args, vec!["one two three"]);
+    }
+
+    /// A trailing backslash has no following character to escape; the command
+    /// parses fine and the trailing backslash contributes nothing.
+    #[test]
+    fn parse_command_line_backslash_at_end_is_fine() {
+        let params = "/bin/echo one \\";
+        let spec = super::parse_command_line(params).unwrap();
+        assert_eq!(spec.program, "/bin/echo");
+        assert_eq!(spec.args, vec!["one"]);
+    }
+
     /// `parse_device_id` accepts exactly the single digits 1..=9 used in references.
     #[test]
     fn parse_device_id_accepts_single_digits() {

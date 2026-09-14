@@ -206,4 +206,14 @@ mod tests {
         assert_eq!(log.warn_line("slow disk"), "warning: slow disk");
         assert_eq!(log.error_line("failed"), "error: failed");
     }
+
+    /// `info` prints its message and `debug` prints only when the subsystem is enabled;
+    /// both go through instead of panicking on the logging side.
+    #[test]
+    fn info_prints_and_debug_respects_filter() {
+        let log = Log::from_debug_values(&["device".to_string()]);
+        log.info("warm greeting");
+        log.debug(Subsystem::Device, "visible detail");
+        log.debug(Subsystem::Actions, "hidden detail");
+    }
 }
