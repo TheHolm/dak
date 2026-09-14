@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.4.0**.
+The current version is **v0.5.0**.
 
 ## Usage
 
