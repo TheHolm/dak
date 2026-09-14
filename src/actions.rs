@@ -106,7 +106,7 @@ pub fn load_config_from_path(path: &str) -> Result<LoadedConfig, Vec<String>> {
     let content =
         fs::read_to_string(path).map_err(|e| vec![format!("Couldn't open {path}: {e}")])?;
 
-    let json: Value = serde_json::from_str(&content)
+    let json: Value = serde_json::from_str(&strip_comments(&content))
         .map_err(|error| vec![format_json_error(path, &content, &error)])?;
 
     validate(&json)
@@ -121,6 +121,62 @@ fn format_json_error(path: &str, content: &str, error: &serde_json::Error) -> St
     format!(
         "{path}: invalid JSON at line {line}, column {column}:\n  {context}\n  {caret}\n  {error}"
     )
+}
+
+/// Removes `//` line and `/* */` block comments from a JSON config so it can carry
+/// comments, while leaving string contents and other JSON text untouched.
+///
+/// The comment text is replaced with an equal number of spaces, keeping `\n` newlines
+/// in place. The output therefore has the same length and the same line starts as the
+/// input, so a later JSON parse error still reports line and column numbers relative
+/// to the original file. An unterminated `/*` comments out the rest of the file.
+pub fn strip_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let c = chars[index];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+                index += 1;
+            }
+            '/' if index + 1 < chars.len() && chars[index + 1] == '/' => {
+                while index < chars.len() && chars[index] != '\n' {
+                    out.push(' ');
+                    index += 1;
+                }
+            }
+            '/' if index + 1 < chars.len() && chars[index + 1] == '*' => {
+                index += 2;
+                while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    out.push(if chars[index] == '\n' { '\n' } else { ' ' });
+                    index += 1;
+                }
+                index = (index + 2).min(chars.len());
+            }
+            _ => {
+                out.push(c);
+                index += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Validates the whole config (the `scenes` and `devices` sections), returning all errors at
@@ -1741,6 +1797,55 @@ mod tests {
         assert_eq!(super::parse_device_id("10"), None);
         assert_eq!(super::parse_device_id("a"), None);
         assert_eq!(super::parse_device_id(""), None);
+    }
+
+    /// `strip_comments` removes both line and block comments outside strings, keeping
+    /// non-comment text (and the newline layout) intact.
+    #[test]
+    fn strip_comments_removes_line_and_block_comments() {
+        let input = r#"// leading comment
+{
+  "scenes": /* inline */ {},
+  "devices": {
+    // picked device
+    "1": { }
+  } // trailing
+}"#;
+        let stripped = super::strip_comments(input);
+        assert!(!stripped.contains("//"));
+        assert!(!stripped.contains("/*"));
+        let json: Value = serde_json::from_str(&stripped).unwrap();
+        assert!(json["devices"]["1"].is_object());
+        // Line starts are preserved so error positions stay useful.
+        assert_eq!(stripped.lines().count(), input.lines().count());
+    }
+
+    /// `strip_comments` treats `//` and `/* ... */` inside a string as literal text,
+    /// since they are part of the string value and not comments.
+    #[test]
+    fn strip_comments_leaves_strings_untouched() {
+        let input = r#"{ "actions": "@//not/a/comment", "setup": "/* also not */" }"#;
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert_eq!(json["actions"], "@//not/a/comment");
+        assert_eq!(json["setup"], "/* also not */");
+    }
+
+    /// `strip_comments` honours escaped quotes, so `\"` inside a string does not end
+    /// the string early and comment-like text after it stays inside the string.
+    #[test]
+    fn strip_comments_honours_escaped_quotes() {
+        let input = r#"{ "text": "say \"//hi\"" }"#;
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert_eq!(json["text"], "say \"//hi\"");
+    }
+
+    /// An unterminated `/*` comment comments out the rest of the file, so a config
+    /// may leave a trailing comment open at the end.
+    #[test]
+    fn strip_comments_handles_unterminated_block_comment() {
+        let input = "{ \"scenes\": {} }\n/* never closed";
+        let json: Value = serde_json::from_str(&super::strip_comments(input)).unwrap();
+        assert!(json["scenes"].is_object());
     }
 
     /// A definition with a real serial matches only a discovered device reporting that

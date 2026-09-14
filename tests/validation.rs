@@ -15,6 +15,46 @@ fn loads_valid_config() {
     assert!(config.is_ok());
 }
 
+/// A config carrying `//` and `/* */` comments loads; comments are allowed anywhere
+/// outside string values.
+#[test]
+fn loads_config_with_comments() {
+    let path = write_temp_config(
+        r#"// file-global comment
+{
+  "scenes": { /* scenes section */ "on_start": { "actions": { "1b01": { "pressed": "~" } } } },
+  "devices": {
+    "1": { // picked by hand
+      "device_id": "0300:3002",
+      "device_name": "keypad",
+      "serial": "unknown", // fall back to VID:PID
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [ { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 } ],
+      "encoders": []
+    }
+  }
+} // trailing comment
+"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap_or_else(|errors| panic!("commented config failed: {errors:?}"));
+    assert!(config.devices.by_id.contains_key(&1));
+}
+
+/// A comment is not allowed inside a string, so `//` at the start of an action value
+/// stays part of the value and must be a valid action reference.
+#[test]
+fn comment_markers_inside_strings_are_not_comments() {
+    let path =
+        write_scenes_config(r#"{"on_start": { "actions": { "1b01": { "pressed": "~" } } } }"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok());
+}
+
 /// `load_config` reads the repository's `config.json`; also guards that the shipped sample stays valid.
 #[test]
 fn load_config_reads_repo_config_json() {

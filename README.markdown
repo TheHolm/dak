@@ -76,6 +76,30 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
 
+### Comments
+
+JSON itself has no comment syntax, so `dak` strips comments before parsing: both `//` line comments and `/* ... */` block comments may appear anywhere the JSON grammar allows whitespace, including at the very top or bottom of the file. Comment markers inside a string are part of the string value, not comments. Example:
+
+```json
+{
+  // which scene starts the program
+  "scenes": { "on_start": { "actions": {} } },
+  /* one keypad, wired by serial */
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "ABC123", // fall back to "unknown" if your pad has no serial
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "buttons": [],
+      "encoders": []
+    }
+  }
+}
+```
+
 ### Scenes
 
 A scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
