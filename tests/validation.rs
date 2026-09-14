@@ -728,3 +728,41 @@ fn accepts_other_device_and_encoder_references() {
     let _ = std::fs::remove_file(path);
     assert!(config.is_ok(), "{:?}", config.err());
 }
+
+/// A setup entry that assigns an image to an encoder is a config error: encoders have
+/// no display, so the program refuses to load the config.
+#[test]
+fn rejects_image_assignment_to_encoder() {
+    for entry in [
+        r#"{"type": "image", "params": "/a"}"#,
+        r#"{"type": "text", "params": "/a"}"#,
+        r#"{"type": "image_exec", "params": "/usr/bin/text2gif"}"#,
+        r#"{"type": "text_exec", "params": "/usr/bin/date"}"#,
+    ] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"setup": {{"1e01": {entry}}}}}}}"#),
+            "cannot assign",
+        );
+    }
+}
+
+/// A setup entry on an encoder that assigns an image is rejected also when the target
+/// device number differs from the (unnamed) reference format; the message names the
+/// control reference.
+#[test]
+fn rejects_image_assignment_to_encoder_names_the_reference() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"2e03": {"type": "image", "params": "/a"}}}}"#,
+        "cannot assign image to encoder 2e03",
+    );
+}
+
+/// A setup entry on an encoder that assigns no image (clear) is still valid config and
+/// is skipped at runtime.
+#[test]
+fn accepts_clear_on_encoder() {
+    let path = write_scenes_config(r#"{"on_start": {"setup": {"1e01": {"type": "clear"}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}

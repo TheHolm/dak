@@ -370,10 +370,13 @@ fn check_button_op(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) {
-    if let Err(error) = Reference::parse(key) {
-        errors.push(format!("scene \"{scene_name}\": key \"{key}\" {error}"));
-        return;
-    }
+    let reference = match Reference::parse(key) {
+        Ok(reference) => reference,
+        Err(error) => {
+            errors.push(format!("scene \"{scene_name}\": key \"{key}\" {error}"));
+            return;
+        }
+    };
 
     let location = format!("key \"{key}\"");
     let object = match value.as_object() {
@@ -402,6 +405,17 @@ fn check_button_op(
             return;
         }
     };
+
+    // Encoders have no display, so assigning an image to one is a config error; the
+    // program must not start with it.
+    if reference.kind == Kind::Encoder
+        && matches!(kind, "image" | "text" | "image_exec" | "text_exec")
+    {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} cannot assign {kind} to encoder {reference}"
+        ));
+        return;
+    }
 
     let params = match object.get("params") {
         Some(value) => match value.as_str() {
@@ -945,17 +959,24 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// during the session. Termination cleanup clears exactly these buttons, so buttons the
     /// program never touched are left alone.
     changed_keys: std::collections::HashSet<u8>,
+    /// Physical button numbers (1-based) that have no display on this device. Image
+    /// operations targetting them are skipped with a warning: the hardware ignores them.
+    screenless_buttons: std::collections::HashSet<u8>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// Creates a runner driving the config device `device_number` bound to `device`,
     /// sending `exec` results through `exec_tx`, reporting scene/device events through `log`.
+    ///
+    /// `screenless_buttons` lists the device buttons that have no display; image
+    /// assignment to them is skipped with a warning (see [`SceneRunner`]).
     pub fn new(
         device_number: u8,
         device: &'a D,
         image_format: ImageFormat,
         exec_tx: mpsc::Sender<ExecEvent>,
         log: Log,
+        screenless_buttons: &std::collections::HashSet<u8>,
     ) -> Self {
         Self {
             device,
@@ -964,6 +985,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             log,
             device_number,
             changed_keys: std::collections::HashSet::new(),
+            screenless_buttons: screenless_buttons.clone(),
         }
     }
 
@@ -982,10 +1004,11 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// Applies scene operations to the device; unsupported operations are skipped with a notice.
     ///
     /// Operations targeting another device's number, encoder references (not implemented
-    /// yet) or buttons beyond the device's physical count are reported and skipped.
-    /// Before touching a button, any still-running `exec` task for that button is cancelled:
-    /// its process is killed, a red "Error" is drawn, and the failure is logged. Async
-    /// results arriving later for the old generation are discarded.
+    /// yet), buttons beyond the device's physical count, or buttons without a display are
+    /// reported and skipped. Before touching a button, any still-running `exec` task for
+    /// that button is cancelled: its process is killed, a red "Error" is drawn, and the
+    /// failure is logged. Async results arriving later for the old generation are
+    /// discarded.
     pub async fn apply_scene_operations(
         &mut self,
         operations: &[SceneOp],
@@ -1031,6 +1054,23 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 self.log.warn(format!(
                     "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
                     self.device.key_count()
+                ));
+                continue;
+            }
+
+            // A button without a display cannot show any image: assignment is pointless
+            // and the hardware ignores the transfer, so warn and skip the work.
+            if self.screenless_buttons.contains(&key)
+                && matches!(
+                    operation,
+                    SceneOp::SetImage { .. }
+                        | SceneOp::Text { .. }
+                        | SceneOp::TextExec { .. }
+                        | SceneOp::ImageExec { .. }
+                )
+            {
+                self.log.warn(format!(
+                    "button {reference} has no display; skipping operation: {operation:?}"
                 ));
                 continue;
             }

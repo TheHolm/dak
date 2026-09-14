@@ -249,7 +249,23 @@ async fn run_device(
 
     // async image_exec/text_exec results land on buttons through this runner and its channel
     let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
-    let mut runner = actions::SceneRunner::new(device_number, &device, IMAGE_FORMAT, exec_tx, log);
+
+    // Buttons this device model has no display on; assigning an image to them is
+    // pointless, so the runner warns, skips the work and the transfer.
+    let screenless_buttons: std::collections::HashSet<u8> = definition
+        .buttons
+        .iter()
+        .filter(|button| !button.screen)
+        .map(|button| button.number)
+        .collect();
+    let mut runner = actions::SceneRunner::new(
+        device_number,
+        &device,
+        IMAGE_FORMAT,
+        exec_tx,
+        log,
+        &screenless_buttons,
+    );
 
     if let Err(error) = runner.enter_scene("on_start", &scenes).await {
         log.warn(format!("failed to apply on_start scene: {error}"));

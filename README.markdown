@@ -119,7 +119,8 @@ For example `1b01` is button 1 on device 1, and `2e01` is encoder 1 on device 2.
 Rules for the program:
 
 - References to devices that are **not present** — whose definition was not matched to any discovered device — are skipped at runtime with a warning (`device N is referenced but not present`).
-- Encoder references (`1e01`) are reserved: they validate, and are skipped at runtime with a warning until encoder handling is implemented.
+- Encoder references (`1e01`) are reserved: encoder setup/actions are skipped at runtime with a warning. Assigning an image to an encoder — a `setup` entry with `type` `image`, `text`, `image_exec` or `text_exec` on an `e` key — is a config error and the program refuses to start.
+- Assigning an image to a button that has no display (`"screen": false` in its device definition) is skipped at runtime with a warning; the file is not even read and nothing is transferred to the device.
 - Out-of-range button references (e.g. `1b99` on a 9-button device) are skipped with a warning.
 - The old plain numeric keys (`"1"`, `"3"`, ...) are no longer accepted; update them to `"1b01"`, `"1b03"`, ...
 
