@@ -15,7 +15,6 @@ use mirajazz::types::ImageFormat;
 use std::process::Command as StdCommand;
 use tokio::sync::mpsc;
 
-#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 
 /// Parsed and validated config plus any non-fatal warnings collected while validating it.
@@ -672,18 +671,14 @@ fn check_file_exists(scene_name: &str, path: &str, file: &str, warnings: &mut Ve
 }
 
 /// Whether the file exists and has at least one execute permission bit set.
-#[cfg(unix)]
+///
+/// Only implemented for unix (the project's only supported platform family, Linux and
+/// FreeBSD): there is no portable execute-permission check to fall back to otherwise.
 fn is_executable(path: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|meta| meta.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
-}
-
-/// Non-unix fallback: treat any existing file as executable.
-#[cfg(not(unix))]
-fn is_executable(path: &str) -> bool {
-    std::fs::metadata(path).is_ok()
 }
 
 /// Human-readable type name of a JSON value, for error messages.
@@ -821,41 +816,34 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
     Ok(operations)
 }
 
-/// Parses a collapsed `params` command line into a [`CommandSpec`] for `image_exec`/
-/// `text_exec`, reporting the error rooted at the failing scene entry.
 /// Spawns `command` fully detached from this program: its own process group (so terminal
 /// Ctrl-C / SIGHUP never reach it), null stdio, and the child handle is dropped without
 /// waiting or killing — the child keeps running and gets re-parented to the OS init when
 /// this program terminates, so it outlives us.
+///
+/// Only implemented for unix (the project's only supported platform family, Linux and
+/// FreeBSD): `process_group` is a unix-only `Command` extension.
 pub fn spawn_detached(command: &CommandSpec, log: Log) {
-    #[cfg(unix)]
-    {
-        let display = command.display();
-        let result = StdCommand::new(&command.program)
-            .args(&command.args)
-            .process_group(0)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        match result {
-            Ok(child) => {
-                // Dropping the handle detaches the child from us: it runs on its own,
-                // reparented to init, and is never killed when this program exits.
-                let pid = child.id();
-                drop(child);
-                log.debug(
-                    Subsystem::Actions,
-                    format!("launched detached \"{display}\" (pid {pid})"),
-                );
-            }
-            Err(error) => log.error(format!("\"{display}\" failed to start detached: {error}")),
+    let display = command.display();
+    let result = StdCommand::new(&command.program)
+        .args(&command.args)
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match result {
+        Ok(child) => {
+            // Dropping the handle detaches the child from us: it runs on its own,
+            // reparented to init, and is never killed when this program exits.
+            let pid = child.id();
+            drop(child);
+            log.debug(
+                Subsystem::Actions,
+                format!("launched detached \"{display}\" (pid {pid})"),
+            );
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-        log.error("detaching a process is only supported on unix (child not started)");
+        Err(error) => log.error(format!("\"{display}\" failed to start detached: {error}")),
     }
 }
 
