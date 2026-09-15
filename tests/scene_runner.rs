@@ -490,7 +490,10 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let pid_file = format!("/tmp/dak_runner_pid_{}", std::process::id());
+    // Unique per test (not just per process): two tests sharing one hardcoded pid
+    // file path race on the same file when the test binary runs them concurrently.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid_file = format!("/tmp/dak_runner_pid_{}_{n}", std::process::id());
     let _ = std::fs::remove_file(&pid_file);
     let scenes = scenes_with_buttons(json!({
         "1b02": {
@@ -697,6 +700,64 @@ async fn image_op_missing_file_fails_scene() {
     assert!(
         !error.to_string().is_empty(),
         "expected a descriptive error"
+    );
+}
+
+/// Render failures besides a missing file also fail the scene: with a zero-size
+/// image format, a `text` operation whose file reads fine still cannot be rendered.
+#[tokio::test]
+async fn text_op_unrenderable_text_fails_scene() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let zero_format = ImageFormat {
+        size: (0, 0),
+        ..FORMAT
+    };
+    let mut runner = SceneRunner::new(1, &mock, zero_format, tx, Log::default(), &HashSet::new());
+
+    let path = write_temp_text("hello");
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text", "params": path.to_str().unwrap() }
+    }));
+
+    let error = runner.enter_scene("main", &scenes).await.unwrap_err();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        error.to_string().contains("render_text"),
+        "expected the render failure, got: {error}"
+    );
+}
+
+/// A `text_exec` whose output cannot be rendered is logged and dropped: the error
+/// path is exercised without drawing anything new on the button.
+#[tokio::test]
+async fn text_exec_unrenderable_output_is_logged_and_skipped() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let zero_format = ImageFormat {
+        size: (0, 0),
+        ..FORMAT
+    };
+    let mut runner = SceneRunner::new(1, &mock, zero_format, tx, Log::default(), &HashSet::new());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Text,
+            stdout: b"hello".to_vec(),
+        })
+        .await;
+
+    assert_eq!(
+        mock.kinds(&mock.calls()),
+        ["Flush"],
+        "nothing may be drawn when the output cannot be rendered"
     );
 }
 
@@ -964,7 +1025,10 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let pid_file = format!("/tmp/dak_runner_pid_{}", std::process::id());
+    // Unique per test (not just per process): two tests sharing one hardcoded pid
+    // file path race on the same file when the test binary runs them concurrently.
+    let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid_file = format!("/tmp/dak_runner_pid_{}_{n}", std::process::id());
     let _ = std::fs::remove_file(&pid_file);
     let scenes = scenes_with_buttons(json!({
         "1b02": {

@@ -440,3 +440,118 @@ fn timer_for_scene_returns_none_with_empty_actions() {
 
     assert_eq!(timer_for_scene("on_start", &config.scenes), None);
 }
+
+/// `action_for_event` resolves the per-notch twist events of an encoder reference
+/// (`turn_cw` / `turn_ccw`) on their own keys.
+#[test]
+fn action_for_event_reads_encoder_turn_actions() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1e01": { "turn_cw": "~", "turn_ccw": "@Test" }
+                }
+            },
+            "Test": {
+                "actions": {}
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 1),
+            "turn_cw",
+            &config.scenes
+        ),
+        Some("~")
+    );
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 1),
+            "turn_ccw",
+            &config.scenes
+        ),
+        Some("@Test")
+    );
+    // Unbound twist events resolve to nothing.
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 2),
+            "turn_cw",
+            &config.scenes
+        ),
+        None
+    );
+    // Twist actions never leak from a button's press binding.
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::button(1, 1),
+            "turn_cw",
+            &config.scenes
+        ),
+        None
+    );
+}
+
+/// `action_for_event` resolves an encoder push exactly like a button press: the same
+/// `pressed` / `released` events on the encoder reference.
+#[test]
+fn action_for_event_reads_encoder_push_actions() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "actions": {
+                    "1e01": { "pressed": "~", "released": "@Test" },
+                    "1e02": { "short_press": "/usr/bin/aplay beep.wav" }
+                }
+            },
+            "Test": {
+                "actions": {}
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 1),
+            "pressed",
+            &config.scenes
+        ),
+        Some("~")
+    );
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 1),
+            "released",
+            &config.scenes
+        ),
+        Some("@Test")
+    );
+    assert_eq!(
+        action_for_event(
+            "on_start",
+            None,
+            &Reference::encoder(1, 2),
+            "short_press",
+            &config.scenes
+        ),
+        Some("/usr/bin/aplay beep.wav")
+    );
+}
