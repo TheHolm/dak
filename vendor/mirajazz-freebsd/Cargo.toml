@@ -1,0 +1,37 @@
+# Vendored copy of mirajazz 0.16.0, unmodified except for this Cargo.toml pointing
+# `async-hid` at the local FreeBSD-patched fork instead of crates.io. Added locally
+# for dak's FreeBSD port; only used on FreeBSD - see the top-level dak Cargo.toml,
+# which depends on the real crates.io mirajazz for every other platform (including
+# Linux) via a target-conditional dependency table, so this fork changes nothing
+# about non-FreeBSD builds. None of mirajazz's own .rs source files are modified.
+#
+# Kept as its own workspace (see [workspace] below) so it isn't absorbed into dak's
+# workspace.
+
+[package]
+name = "mirajazz"
+version = "0.16.0"
+edition = "2021"
+authors = ["Andrey Viktorov <loonks@disroot.org>"]
+description = "A library for interfacing with Mirabox and Ajazz stream controller devices (vendored for FreeBSD)"
+license = "MPL-2.0"
+
+[workspace]
+
+[lib]
+name = "mirajazz"
+path = "src/lib.rs"
+
+[dependencies]
+futures-lite = "2.6.0"
+tokio = { version = "1.45.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
+
+[dependencies.image]
+version = "0.25.6"
+features = ["bmp", "jpeg"]
+default-features = false
+
+[dependencies.async-hid]
+path = "../async-hid-freebsd"
+features = ["tokio", "win32"]
+default-features = false

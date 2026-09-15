@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
+// See src/lib.rs for why this is needed on FreeBSD only: each integration test file
+// compiles as its own crate, so it needs its own copy of the rename.
+#[cfg(target_os = "freebsd")]
+extern crate mirajazz_freebsd as mirajazz;
+
 use dak::actions::{set_image_from_file, ButtonDevice, ExecEvent, ExecOutputKind, SceneRunner};
 use dak::log::Log;
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
@@ -207,6 +212,20 @@ fn write_temp_text(contents: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Whether a process with the given pid is still running, checked the portable POSIX
+/// way (`kill -0`, which every unix delivers no signal for but still reports ESRCH if
+/// the pid is gone) rather than via `/proc`, which Linux mounts by default but
+/// FreeBSD does not. Stdio is silenced: a gone pid is the expected, common case while
+/// polling below, not something `kill`'s own "No such process" message should narrate.
+fn is_process_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// A config whose `main` scene carries the given numbered button operations.
 fn scenes_with_buttons(buttons: Value) -> Value {
     json!({ "main": { "setup": buttons } })
@@ -302,9 +321,8 @@ async fn text_exec_output_drawn_on_button() {
 
     // Spawn a slow program so its own result cannot race our explicit event; the
     // first apply on key 2 reserves cancel-bump 1, then the task runs at generation 2.
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -330,9 +348,8 @@ async fn text_exec_stale_output_dropped() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -354,9 +371,8 @@ async fn image_exec_output_drawn_on_button() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     let mut png = Vec::new();
@@ -387,9 +403,8 @@ async fn image_exec_non_image_output_draws_error_label() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -414,9 +429,8 @@ async fn text_exec_non_utf8_output_draws_error_label() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -441,9 +455,8 @@ async fn text_exec_error_draws_red_label() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -467,9 +480,8 @@ async fn text_exec_stale_error_dropped() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -517,7 +529,7 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
         pid.expect("program did not write its pid file")
     };
     assert!(
-        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        is_process_alive(pid),
         "sanity check: process {pid} should be running"
     );
 
@@ -526,7 +538,7 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
 
     let mut gone = false;
     for _ in 0..100 {
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if !is_process_alive(pid) {
             gone = true;
             break;
         }
@@ -552,8 +564,7 @@ async fn reassigning_key_after_finished_text_exec_draws_no_error() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes =
-        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "/bin/true" } }));
+    let scenes = scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "true" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
     // The task's last action is sending its output; after it is received the task
     // finishes, so the subsequent reassignment sees a completed handle.
@@ -741,7 +752,7 @@ async fn text_exec_unrenderable_output_is_logged_and_skipped() {
     let mut runner = SceneRunner::new(1, &mock, zero_format, tx, Log::default(), &HashSet::new());
 
     let scenes = scenes_with_buttons(json!({
-        "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" }
+        "1b02": { "type": "text_exec", "params": "sleep 10" }
     }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
@@ -863,9 +874,8 @@ async fn exec_output_write_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -898,9 +908,8 @@ async fn exec_output_flush_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
     // The scene-level flush succeeds first; only the exec-output flush fails.
     runner.enter_scene("main", &scenes).await.unwrap();
     device.fail_flushes(true);
@@ -935,9 +944,8 @@ async fn exec_error_label_draw_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -964,9 +972,8 @@ async fn exec_output_non_utf8_draw_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "text_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -994,9 +1001,8 @@ async fn exec_output_invalid_image_draw_failure_is_logged() {
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
 
-    let scenes = scenes_with_buttons(
-        json!({ "1b02": { "type": "image_exec", "params": "/usr/bin/sleep 10" } }),
-    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
 
     runner
@@ -1052,7 +1058,7 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
         pid.expect("program did not write its pid file")
     };
     assert!(
-        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        is_process_alive(pid),
         "sanity check: process {pid} should be running"
     );
 
@@ -1061,7 +1067,7 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
 
     let mut gone = false;
     for _ in 0..100 {
-        if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        if !is_process_alive(pid) {
             gone = true;
             break;
         }

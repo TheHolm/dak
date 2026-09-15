@@ -19,7 +19,7 @@ async fn run_action_command_runs_program() {
 #[tokio::test]
 async fn run_action_command_reports_nonzero_exit() {
     let command = CommandSpec {
-        program: "/bin/false".to_string(),
+        program: "false".to_string(),
         args: vec![],
     };
     let error = run_action_command(command)
@@ -49,7 +49,7 @@ async fn run_action_command_reports_missing_program() {
 #[tokio::test]
 async fn run_action_command_allows_slow_program() {
     let command = CommandSpec {
-        program: "/usr/bin/sleep".to_string(),
+        program: "sleep".to_string(),
         args: vec!["1".to_string()],
     };
     let result = tokio::time::timeout(Duration::from_secs(5), run_action_command(command)).await;

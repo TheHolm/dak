@@ -2,7 +2,7 @@
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.5.1 (declared as `0.5.1` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.6.0 (declared as `0.6.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -24,6 +24,7 @@ Generic Linux and FreeBSD. No effort is made (to be made) to make the code compi
 - `config.json` — runtime config: scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — udev rules and docker build/run commands
+- `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
 
 ## Device notes
 

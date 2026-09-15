@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.5.1**.
+The current version is **v0.6.0**.
 
 ## Usage
 
@@ -298,6 +298,61 @@ sudo chown root:root /etc/udev/rules.d/ajazz_akp03e.conf
 ```
 
 Device list is imported from https://github.com/4ndv/opendeck-akp03/
+
+### FreeBSD
+
+FreeBSD needs its `hidraw(4)` driver (Linux-`hidraw`-compatible, FreeBSD 13+), which
+is not enabled by default - `uhid(4)` claims the device instead otherwise, and `dak`
+does not work against `uhid(4)` (see `vendor/README.md` for why). One-time setup:
+
+```
+# Load the hidraw module now, and on every boot:
+kldload hidraw
+echo 'hidraw_load="YES"' | sudo tee -a /boot/loader.conf
+
+# Prefer hidraw over uhid for HID interfaces, now and on every boot:
+sudo sysctl hw.usb.usbhid.enable=1
+echo 'hw.usb.usbhid.enable=1' | sudo tee -a /etc/sysctl.conf
+```
+
+`/dev/hidrawN` nodes default to `0600 root:operator` (root-only, even for group
+members) - add a `devfs.rules(5)` entry granting your user's group read/write
+access, analogous to the udev rule above, e.g.:
+
+```
+# /etc/devfs.rules
+[dakrules=10]
+add path 'hidraw*' mode 0660 group operator
+```
+
+Activate it and add your user to that group:
+
+```
+sudo sysrc devfs_system_ruleset=dakrules
+sudo pw groupmod operator -m yourusername
+```
+
+Then either reboot, or apply immediately without one:
+
+```
+sudo service devfs restart
+sudo usbconfig -d ugenX.Y reset   # replug the device, or reset it like this,
+                                   # so it re-attaches under /dev/hidrawN
+                                   # instead of /dev/uhidN
+```
+(log out and back in too, so your shell picks up the new group membership).
+
+## TODO
+
+- The FreeBSD build vendors its own copies of `mirajazz` and `async-hid` under
+  `vendor/` (see `vendor/README.md` for why), pinned to specific upstream versions
+  (`mirajazz` 0.16.0, `async-hid` 0.5.3) rather than tracking crates.io like every
+  other platform's dependencies do. Nothing currently checks whether newer upstream
+  releases of either crate exist. Add a CI job that periodically checks
+  crates.io for newer `mirajazz`/`async-hid` versions than the ones vendored, so a
+  security fix or bugfix upstream doesn't silently sit unnoticed for the FreeBSD
+  build - see `vendor/README.md`'s "Updating" section for the manual re-vendoring
+  steps such a check would need to prompt for.
 
 ## License
 
