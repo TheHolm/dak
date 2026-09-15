@@ -5,8 +5,6 @@ edition = "2021"
 
 [dependencies]
 chrono = { version = "0.4" }
-mirajazz = { version = "0.16" }
-async-hid = { version = "0.5.3", default-features = false, features = ["tokio"] }
 image = { version = "0.25" }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
 
@@ -14,3 +12,26 @@ serde_json = { version = "1.0.150"}
 serde = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 clap = { version = "4", features = ["derive"] }
+
+# HID device access. Every platform but FreeBSD uses the real, unmodified crates.io
+# releases. FreeBSD gets a local fork (vendor/) that adds a `hidraw(4)`-based backend
+# to async-hid, which has no FreeBSD support upstream (see AGENTS.md); mirajazz itself
+# is vendored byte-for-byte unmodified, just pointed at the local async-hid fork,
+# since mirajazz has no platform-specific code of its own beyond what it already gets
+# from async-hid.
+#
+# Cargo requires a single dependency *name* to resolve to one source kind (registry vs
+# path) across all targets, so the two platform cases use different manifest keys
+# (`mirajazz` vs `mirajazz-freebsd`); `package =` tells Cargo which crate each key
+# actually refers to, but the *local* Rust name still follows the key, not `package =`
+# - so a small `extern crate mirajazz_freebsd as mirajazz;` bridge (src/lib.rs,
+# src/main.rs, FreeBSD-only) re-exposes both under the plain names
+# (`mirajazz`/`async_hid`) the rest of the crate uses unconditionally. See
+# vendor/README.md for the full picture.
+[target.'cfg(not(target_os = "freebsd"))'.dependencies]
+mirajazz = { version = "0.16" }
+async-hid = { version = "0.5.3", default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+mirajazz-freebsd = { path = "vendor/mirajazz-freebsd", package = "mirajazz" }
+async-hid-freebsd = { path = "vendor/async-hid-freebsd", package = "async-hid", default-features = false, features = ["tokio"] }

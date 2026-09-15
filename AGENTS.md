@@ -24,6 +24,7 @@ Generic Linux and FreeBSD. No effort is made (to be made) to make the code compi
 - `config.json` — runtime config: scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — udev rules and docker build/run commands
+- `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
 
 ## Device notes
 

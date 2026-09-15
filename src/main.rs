@@ -4,6 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// See src/lib.rs for why this is needed on FreeBSD only: the binary crate compiles
+// separately from the library crate, so it needs its own copy of the rename.
+#[cfg(target_os = "freebsd")]
+extern crate mirajazz_freebsd as mirajazz;
+
 use clap::Parser;
 use mirajazz::{
     device::{list_devices, Device, DeviceQuery},
@@ -1279,7 +1284,7 @@ mod tests {
         );
     }
 
-    /// A command action spawns (a valid /bin/true runs) while an unparseable command
+    /// A command action spawns (a valid `true` runs) while an unparseable command
     /// is reported and skipped; both leave the scene untouched.
     #[tokio::test]
     async fn run_action_runs_valid_command_and_skips_bad_one() {
@@ -1296,7 +1301,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "/bin/true",
+            "true",
             &mut state.timer_handle,
             &state.timer_tx,
         )
@@ -1485,7 +1490,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "/bin/true",
+            "true",
             &mut state.timer_handle,
             &state.timer_tx,
         )
@@ -1496,7 +1501,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "/bin/false",
+            "false",
             &mut state.timer_handle,
             &state.timer_tx,
         )

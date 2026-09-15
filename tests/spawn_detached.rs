@@ -11,22 +11,32 @@ use dak::log::Log;
 
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// Parses the process group id (field 5) of `pid` from `/proc/<pid>/stat`.
-///
-/// The parenthesised comm in field 2 may contain spaces, so the stat line is split
-/// at the *last* closing parenthesis; after that the whitespace-separated fields
-/// restart at field 3 (state), making field 5 the third token.
+/// Whether a process with the given pid is still running, checked the portable POSIX
+/// way (`kill -0`) rather than via `/proc`, which Linux mounts by default but FreeBSD
+/// does not. Stdio is silenced: a gone pid isn't an error worth narrating here.
+fn is_process_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The process group id of `pid`, via the portable `ps -o pgid=` (supported by both
+/// Linux's and FreeBSD's `ps`), rather than parsing Linux-only `/proc/<pid>/stat`.
 fn read_pgrp(pid: i32) -> i32 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|error| panic!("failed reading stat for pid {pid}: {error}"));
-    let rest = stat
-        .rsplit_once(')')
-        .expect("malformed stat line, no closing paren")
-        .1;
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    fields[2].parse().unwrap_or_else(|error| {
-        panic!("could not parse process group from stat of pid {pid}: {error}")
-    })
+    let output = std::process::Command::new("ps")
+        .args(["-o", "pgid=", "-p", &pid.to_string()])
+        .output()
+        .unwrap_or_else(|error| panic!("failed running ps for pid {pid}: {error}"));
+    assert!(output.status.success(), "ps -p {pid} failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|error| {
+            panic!("could not parse process group from `ps` for pid {pid}: {error}")
+        })
 }
 
 /// A detached program starts running immediately, gets its own process group
@@ -72,7 +82,7 @@ fn spawn_detached_starts_program_in_its_own_process_group() {
     );
 
     assert!(
-        Path::new(&format!("/proc/{pid}")).exists(),
+        is_process_alive(pid),
         "program {pid} should be running after the handle was dropped"
     );
 

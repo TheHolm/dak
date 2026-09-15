@@ -1,10 +1,21 @@
 //! Tests for the asynchronous `exec` machinery: running programs with a timeout,
 //! reporting their raw stdout through a channel, and killing them when cancelled.
 
-use std::path::Path;
 use std::time::Duration;
 
 use dak::actions::{run_command_with_timeout, spawn_exec, CommandSpec, ExecEvent, ExecOutputKind};
+
+/// Whether a process with the given pid is still running, checked the portable POSIX
+/// way (`kill -0`) rather than via `/proc`, which Linux mounts by default but FreeBSD
+/// does not. Stdio is silenced: a gone pid isn't an error worth narrating here.
+fn is_process_alive(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
 /// A program that prints to stdout and exits immediately yields its full output.
 #[tokio::test]
@@ -23,7 +34,7 @@ async fn run_command_with_timeout_captures_output() {
 #[tokio::test]
 async fn run_command_with_timeout_reports_nonzero_exit() {
     let command = CommandSpec {
-        program: "/bin/false".to_string(),
+        program: "false".to_string(),
         args: vec![],
     };
     let error = run_command_with_timeout(&command, Duration::from_secs(5))
@@ -36,7 +47,7 @@ async fn run_command_with_timeout_reports_nonzero_exit() {
 #[tokio::test]
 async fn run_command_with_timeout_kills_slow_program() {
     let command = CommandSpec {
-        program: "/usr/bin/sleep".to_string(),
+        program: "sleep".to_string(),
         args: vec!["10".to_string()],
     };
     let error = run_command_with_timeout(&command, Duration::from_millis(200))
@@ -113,7 +124,7 @@ async fn spawn_exec_reports_failure() {
         5,
         ExecOutputKind::Image,
         CommandSpec {
-            program: "/bin/false".to_string(),
+            program: "false".to_string(),
             args: vec![],
         },
         9,
@@ -166,7 +177,7 @@ async fn aborting_spawned_task_kills_the_process() {
         pid.expect("program did not write its pid file")
     };
     assert!(
-        Path::new(&format!("/proc/{pid}")).exists(),
+        is_process_alive(pid),
         "sanity check: process {pid} should be running"
     );
 
@@ -175,7 +186,7 @@ async fn aborting_spawned_task_kills_the_process() {
 
     let mut gone = false;
     for _ in 0..100 {
-        if !Path::new(&format!("/proc/{pid}")).exists() {
+        if !is_process_alive(pid) {
             gone = true;
             break;
         }

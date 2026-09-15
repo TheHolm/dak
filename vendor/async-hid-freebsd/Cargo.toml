@@ -1,0 +1,75 @@
+# Vendored fork of async-hid 0.5.3, with a FreeBSD backend added locally for dak's
+# FreeBSD port (see src/backend/uhid_bsd/). Not part of upstream async-hid; only used
+# on FreeBSD - see the top-level dak Cargo.toml, which depends on the real crates.io
+# async-hid for every other platform (including Linux) via a target-conditional
+# dependency table, so this fork changes nothing about non-FreeBSD builds.
+#
+# Kept as its own workspace (see [workspace] below) so it isn't absorbed into dak's
+# workspace and can carry its own Cargo.lock-free, minimal dependency set.
+
+[package]
+name = "async-hid"
+version = "0.5.3"
+edition = "2021"
+authors = ["sidit77"]
+description = "A async library for interacting with HID devices (vendored, +FreeBSD backend)"
+license = "MIT"
+
+[workspace]
+
+[lib]
+name = "async_hid"
+path = "src/lib.rs"
+
+[features]
+default = ["async-io", "win32"]
+async-io = ["dep:async-io"]
+tokio = ["dep:tokio"]
+win32 = ["dep:atomic-waker", "dep:crossbeam-queue"]
+winrt = ["dep:windows-future", "dep:once_cell", "dep:async-channel"]
+
+[dependencies]
+futures-lite = "2.5"
+log = "0.4"
+static_assertions = "1.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29.0", features = ["fs", "ioctl", "socket"] }
+async-io = { version = "2", optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+nix = { version = "0.29.0", features = ["fs", "ioctl"] }
+async-io = { version = "2", optional = true }
+tokio = { version = "1", features = ["net"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+atomic-waker = "1.1.2"
+block2 = "0.6.1"
+crossbeam-queue = "0.3.12"
+dispatch2 = "0.3.0"
+objc2-core-foundation = "0.3.2"
+objc2-io-kit = "0.3.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61.1", features = [
+    "Devices_Enumeration",
+    "Devices_HumanInterfaceDevice",
+    "Foundation",
+    "Foundation_Collections",
+    "Storage",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation",
+] }
+windows-future = { version = "0.2.0", optional = true }
+async-channel = { version = "2.3.1", optional = true }
+atomic-waker = { version = "1.1.2", optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
+once_cell = { version = "1.21.3", optional = true }
