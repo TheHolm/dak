@@ -519,9 +519,9 @@ struct PendingShortPress {
 /// The parameter list mirrors `run_action`: each device has exactly one input loop and
 /// the shared state it needs is passed flat rather than bundled into a context type.
 #[allow(clippy::too_many_arguments)]
-async fn run_bound_action(
+async fn run_bound_action<D: actions::ButtonDevice>(
     log: Log,
-    runner: &mut actions::SceneRunner<'_, Device>,
+    runner: &mut actions::SceneRunner<'_, D>,
     current_scene: &mut String,
     previous_scene: &mut Option<String>,
     scenes: &Value,
@@ -570,9 +570,9 @@ async fn run_bound_action(
 /// The parameter list is deliberately kept flat over bundling the shared state into one
 /// struct, mirroring `run_action` and `run_bound_action`.
 #[allow(clippy::too_many_arguments)]
-async fn run_pressable_edge(
+async fn run_pressable_edge<D: actions::ButtonDevice>(
     log: Log,
-    runner: &mut actions::SceneRunner<'_, Device>,
+    runner: &mut actions::SceneRunner<'_, D>,
     current_scene: &mut String,
     previous_scene: &mut Option<String>,
     scenes: &Value,
@@ -698,9 +698,9 @@ async fn run_pressable_edge(
 /// struct: each device has exactly one input loop, so a context type adds indirection
 /// without removing any call sites.
 #[allow(clippy::too_many_arguments)]
-async fn run_action(
+async fn run_action<D: actions::ButtonDevice>(
     log: Log,
-    runner: &mut actions::SceneRunner<'_, Device>,
+    runner: &mut actions::SceneRunner<'_, D>,
     current_scene: &mut String,
     previous_scene: &mut Option<String>,
     scenes: &Value,
@@ -843,11 +843,220 @@ fn device_summary_line(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     use clap::Parser;
+    use image::{DynamicImage, Rgb, RgbImage};
+    use mirajazz::types::ImageFormat;
+    use serde_json::{json, Value};
+    use tokio::sync::mpsc;
 
-    use super::Cli;
+    use dak::actions::{ButtonDevice, SceneRunner};
+    use dak::log::Log;
+
+    use super::{Cli, ClickDetector, ClickEvent, PressDefaults, Reference};
+
+    /// A tiny recording keypad for the dispatch-layer tests: scene `setup` operations
+    /// that reach the device are recorded so a test can see which scene was applied.
+    #[derive(Default)]
+    struct MockButtonDevice {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl MockButtonDevice {
+        /// Every `clear`/`flush`/`set` the runner attempted, in order.
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ButtonDevice for MockButtonDevice {
+        type Error = std::convert::Infallible;
+
+        async fn set_button_image(
+            &self,
+            _key: u8,
+            _image_format: ImageFormat,
+            _image: DynamicImage,
+        ) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("set");
+            Ok(())
+        }
+
+        async fn clear_button_image(&self, _key: u8) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("clear");
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("flush");
+            Ok(())
+        }
+
+        fn key_count(&self) -> u8 {
+            9
+        }
+    }
+
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// Writes a 2x2 test image to a unique temp file and returns its path, so a `type:
+    /// "image"` setup entry has a real file to load in the dispatch-layer tests.
+    fn write_temp_image() -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = format!("/tmp/dak_main_img_{}_{n}.png", std::process::id());
+        let image = RgbImage::from_pixel(2, 2, Rgb([10, 20, 30]));
+        image.save(&path).unwrap();
+        PathBuf::from(path)
+    }
+
+    /// Builds a scene runner over a mock device, dropping the exec channel: none of
+    /// these tests run `image_exec`/`text_exec`.
+    fn make_runner(mock: &MockButtonDevice) -> SceneRunner<'_, MockButtonDevice> {
+        let (exec_tx, _exec_rx) = mpsc::channel(8);
+        SceneRunner::new(
+            1,
+            mock,
+            super::IMAGE_FORMAT,
+            exec_tx,
+            Log::default(),
+            &HashSet::new(),
+        )
+    }
+
+    /// The shared state one device's input loop owns between events: the down-control
+    /// set, the shared click detector and its pending short-press confirmations, and
+    /// the timer plumbing. Mirrors the locals of `run_device`.
+    struct EdgeState {
+        down_controls: HashSet<Reference>,
+        click_detector: ClickDetector,
+        click_tx: mpsc::Sender<(Reference, ClickEvent)>,
+        click_rx: mpsc::Receiver<(Reference, ClickEvent)>,
+        pending_shorts: HashMap<Reference, super::PendingShortPress>,
+        timer_handle: Option<tokio::task::JoinHandle<()>>,
+        timer_tx: mpsc::Sender<String>,
+        defaults: PressDefaults,
+    }
+
+    impl EdgeState {
+        /// A fresh loop state with the given press-detection knobs.
+        fn new(defaults: PressDefaults) -> EdgeState {
+            let (click_tx, click_rx) = mpsc::channel(8);
+            let (timer_tx, _timer_rx) = mpsc::channel(1);
+            EdgeState {
+                down_controls: HashSet::new(),
+                click_detector: ClickDetector::new(defaults),
+                click_tx,
+                click_rx,
+                pending_shorts: HashMap::new(),
+                timer_handle: None,
+                timer_tx,
+                defaults,
+            }
+        }
+
+        /// Waits (up to a second) for the delayed short-press confirmation the loop's
+        /// release branch spawned, asserting it really arrives.
+        async fn receive_click(&mut self) -> (Reference, ClickEvent) {
+            tokio::time::timeout(Duration::from_millis(1000), self.click_rx.recv())
+                .await
+                .expect("a short-press confirmation should arrive")
+                .expect("the click channel must not close")
+        }
+
+        /// Asserts no short-press confirmation arrives within `window`: used to prove
+        /// a pending short was cancelled or never armed.
+        async fn assert_no_click(&mut self, window: Duration) {
+            let result = tokio::time::timeout(window, self.click_rx.recv()).await;
+            assert!(
+                result.is_err(),
+                "expected no short-press confirmation: {result:?}"
+            );
+        }
+    }
+
+    /// Feeds one press/release edge through `run_pressable_edge` with the loop state,
+    /// exactly like the `data` branch of `run_device` does.
+    async fn press_edge<D: ButtonDevice>(
+        runner: &mut SceneRunner<'_, D>,
+        scenes: &Value,
+        current_scene: &mut String,
+        previous_scene: &mut Option<String>,
+        reference: Reference,
+        pressed: bool,
+        state: &mut EdgeState,
+    ) {
+        super::run_pressable_edge(
+            Log::default(),
+            runner,
+            current_scene,
+            previous_scene,
+            scenes,
+            &reference,
+            pressed,
+            &mut state.down_controls,
+            &mut state.click_detector,
+            &state.click_tx,
+            &mut state.pending_shorts,
+            state.defaults,
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+    }
+
+    /// The five event bindings per pressable reference, each pointing at its own scene
+    /// so a test can tell which event fired by which scene became current.
+    fn pressable_bindings() -> Value {
+        json!({
+            "pressed": "@P",
+            "released": "@R",
+            "short_press": "@S",
+            "long_press": "@L",
+            "double_click": "@D"
+        })
+    }
+
+    /// Scenes where `reference` (`"1b01"` or `"1e01"`) binds all five press events in
+    /// `on_start` and to the two scenes that can be current or previous mid-sequence,
+    /// so every lookup resolves within the two-scene chain.
+    fn pressable_scenes(reference: &str) -> Value {
+        let mut scenes = serde_json::Map::new();
+        for name in ["on_start", "P", "R"] {
+            let mut key = serde_json::Map::new();
+            key.insert(reference.to_string(), pressable_bindings());
+            let mut scene = serde_json::Map::new();
+            scene.insert("actions".to_string(), Value::Object(key));
+            scenes.insert(name.to_string(), Value::Object(scene));
+        }
+        for name in ["S", "L", "D"] {
+            let mut scene = serde_json::Map::new();
+            scene.insert("actions".to_string(), Value::Object(serde_json::Map::new()));
+            scenes.insert(name.to_string(), Value::Object(scene));
+        }
+        Value::Object(scenes)
+    }
+
+    /// A quick press/release: the double-click gap is short but the short-press
+    /// threshold is high, so quick presses are single clicks.
+    fn quickly_clicking_defaults() -> PressDefaults {
+        PressDefaults {
+            short_press_duration: Duration::from_millis(700),
+            double_click_gap: Duration::from_millis(80),
+        }
+    }
+
+    /// A short press threshold, for turning a held press into a long press quickly.
+    fn long_press_defaults() -> PressDefaults {
+        PressDefaults {
+            short_press_duration: Duration::from_millis(60),
+            double_click_gap: Duration::from_millis(600),
+        }
+    }
 
     /// With no arguments the config path is left unset (so the search order applies)
     /// and no debug subsystems are requested.
@@ -979,5 +1188,712 @@ mod tests {
             super::device_summary_line(&FakeDeviceId("/dev/hidraw0"), &None, 0x0300, 0x3002, "k"),
             r#"0300:3002 path DevPath("/dev/hidraw0") serial unknown "k""#
         );
+    }
+
+    /// A scene without a timer arms no timer task; a scene with one returns a handle.
+    #[tokio::test]
+    async fn arm_scene_timer_returns_none_without_timer() {
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Main": { "actions": { "timer": { "1": "@Main" } } }
+        });
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(
+            super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
+                .await
+                .is_none()
+        );
+        assert!(super::arm_scene_timer("Main", &scenes, &tx, Log::default())
+            .await
+            .is_some());
+    }
+
+    /// An armed timer fires after its configured seconds and delivers the action
+    /// through the channel, like a scene timer running during normal operation.
+    #[tokio::test]
+    async fn timer_fires_after_its_seconds_and_delivers_the_action() {
+        let scenes = json!({
+            "on_start": { "actions": { "timer": { "1": "@Main" } } }
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
+            .await
+            .expect("scene has a timer");
+        handle.await.unwrap();
+        assert_eq!(rx.recv().await, Some("@Main".to_string()));
+    }
+
+    /// Re-arming for a scene without a timer aborts the running timer and clears the
+    /// handle; the aborted timer never delivers its action.
+    #[tokio::test]
+    async fn rearm_scene_timer_aborts_the_old_timer() {
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Main": { "actions": { "timer": { "1": "@Main" } } }
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut handle = super::arm_scene_timer("Main", &scenes, &tx, Log::default()).await;
+        assert!(handle.is_some());
+
+        super::rearm_scene_timer("on_start", &scenes, &mut handle, &tx, Log::default()).await;
+        assert!(handle.is_none(), "a scene without a timer arms nothing");
+
+        let late = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await;
+        assert!(late.is_err(), "the aborted timer must not fire: {late:?}");
+    }
+
+    /// A `~` action re-applies the current scene: its setup runs on the device again
+    /// and the scene name is untouched, with no previous scene recorded.
+    #[tokio::test]
+    async fn run_action_stay_reapplies_the_current_scene() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": {
+                "setup": { "1b01": { "type": "clear" } },
+                "actions": {}
+            }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "~",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+        assert_eq!(
+            mock.calls(),
+            vec!["clear", "flush"],
+            "re-applying on_start redraws its setup"
+        );
+    }
+
+    /// A command action spawns (a valid /bin/true runs) while an unparseable command
+    /// is reported and skipped; both leave the scene untouched.
+    #[tokio::test]
+    async fn run_action_runs_valid_command_and_skips_bad_one() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "/bin/true",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "/bin/echo 'unbalanced",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// An `@scene` action switches scenes: the old scene is remembered as previous and
+    /// the target scene's setup is applied.
+    #[tokio::test]
+    async fn run_action_switch_scene_remembers_and_enters() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Test": {
+                "setup": { "1b02": { "type": "clear" } },
+                "actions": {}
+            }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@Test",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(current_scene, "Test");
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+        assert_eq!(mock.calls(), vec!["clear", "flush"]);
+    }
+
+    /// A `type: "image"` setup entry loads a real file and stages it on the device:
+    /// the dispatch-layer mock's `set_button_image` is exercised, not just `clear`.
+    #[tokio::test]
+    async fn run_action_stay_applies_an_image_setup_entry() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let path = write_temp_image();
+        let scenes = json!({
+            "on_start": {
+                "setup": { "1b01": { "type": "image", "params": path.to_str().unwrap() } },
+                "actions": {}
+            }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "~",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(mock.calls(), vec!["set", "flush"]);
+    }
+
+    /// A `~` action whose scene fails to re-apply (here, an `image` setup entry
+    /// pointing at a missing file) logs a warning and leaves the scene name and
+    /// `previous_scene` untouched: staying never counts as leaving.
+    #[tokio::test]
+    async fn run_action_stay_keeps_scene_when_reapply_fails() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": {
+                "setup": { "1b01": { "type": "image", "params": "/no/such/image.png" } },
+                "actions": {}
+            }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "~",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "on_start",
+            "a failed reapply must not change the scene name"
+        );
+        assert!(previous_scene.is_none());
+        assert_eq!(
+            mock.calls(),
+            Vec::<&str>::new(),
+            "the failing operation must not stage anything on the device"
+        );
+    }
+
+    /// An `@scene` action whose target scene fails to enter still switches: the scene
+    /// name and `previous_scene` update before the setup runs, and the failure is only
+    /// logged, mirroring `run_action_stay_keeps_scene_when_reapply_fails`.
+    #[tokio::test]
+    async fn run_action_switch_scene_still_switches_when_enter_fails() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Test": {
+                "setup": { "1b02": { "type": "image", "params": "/no/such/image.png" } },
+                "actions": {}
+            }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@Test",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "Test",
+            "the scene name updates even though its setup failed to apply"
+        );
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+        assert_eq!(
+            mock.calls(),
+            Vec::<&str>::new(),
+            "the failing operation must not stage anything on the device"
+        );
+    }
+
+    /// A spawned command action's completion is logged on both outcomes: this drives
+    /// the background task to completion so `run_action_command`'s success and
+    /// failure branches both run, not just the `tokio::spawn` call itself.
+    #[tokio::test]
+    async fn run_action_command_completion_runs_for_success_and_failure() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "/bin/true",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "/bin/false",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // `run_action` spawns the command and returns immediately; yield long enough
+        // for both background tasks to run to completion (and hit their log lines)
+        // before the test ends and the runtime drops any task still in flight.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(current_scene, "on_start", "commands never change the scene");
+    }
+
+    /// `run_bound_action` runs the action a reference bound to an event, switching
+    /// scenes; a reference without a binding does nothing.
+    #[tokio::test]
+    async fn run_bound_action_runs_bound_and_ignores_unbound() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1b01": { "pressed": "@Test" } } },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::button(1, 1),
+            "pressed",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        assert_eq!(current_scene, "Test");
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::button(1, 9),
+            "pressed",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        assert_eq!(current_scene, "Test", "an unbound reference must not act");
+    }
+
+    /// `run_bound_action` dispatches the encoder turn events (`turn_cw` / `turn_ccw`)
+    /// exactly like any other bound event on the encoder reference.
+    #[tokio::test]
+    async fn run_bound_action_dispatching_turn_events() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1e01": { "turn_cw": "@CW", "turn_ccw": "@CCW" } } },
+            "CW": { "actions": {} },
+            "CCW": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::encoder(1, 1),
+            "turn_cw",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        assert_eq!(current_scene, "CW");
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::encoder(1, 1),
+            "turn_ccw",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        assert_eq!(current_scene, "CCW");
+    }
+
+    /// A full click of a button flows through the edge handler: `pressed` fires on the
+    /// down edge, `released` on the up edge, and a quick release schedules the
+    /// short-press confirmation that a test can drain like the input loop does.
+    #[tokio::test]
+    async fn pressable_edge_runs_press_release_then_confirms_short_press() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+        assert!(
+            state.pending_shorts.contains_key(&reference),
+            "a short press waits for the double-click gap"
+        );
+
+        let (confirmed, event) = state.receive_click().await;
+        assert_eq!(confirmed, reference);
+        assert_eq!(event, ClickEvent::ShortPress);
+
+        state.pending_shorts.remove(&reference);
+        state.click_detector.confirm_single();
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &reference,
+            "short_press",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+        assert_eq!(current_scene, "S");
+    }
+
+    /// Pushing an encoder knob flows through the same edge handler as a button: the
+    /// remembered push code resolves to an encoder reference that behaves like any
+    /// pressable control.
+    #[tokio::test]
+    async fn pressable_edge_handles_encoder_pushes_like_buttons() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1e01");
+        let reference = Reference::encoder(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+        assert!(state.pending_shorts.contains_key(&reference));
+
+        let (confirmed, event) = state.receive_click().await;
+        assert_eq!(confirmed, reference);
+        assert_eq!(event, ClickEvent::ShortPress);
+    }
+
+    /// Duplicate press reports while a control is already down, and releases of a
+    /// control that was never pressed, are ignored: each event runs at most once.
+    #[tokio::test]
+    async fn pressable_edge_ignores_duplicate_and_unmatched_edges() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "P",
+            "a repeated press while down must not re-fire"
+        );
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "R",
+            "a repeated release while up must not re-fire"
+        );
+
+        let never_pressed = Reference::button(1, 2);
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            never_pressed,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "R",
+            "a release without a press must be ignored"
+        );
+    }
+
+    /// A press held past the short-press threshold fires `long_press` on release, and
+    /// no short-press confirmation is scheduled afterwards.
+    #[tokio::test]
+    async fn pressable_edge_long_press_fires_on_release() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(long_press_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(current_scene, "L", "the long press fired on release");
+        assert!(state.pending_shorts.is_empty());
+        state.assert_no_click(Duration::from_millis(120)).await;
+    }
+
+    /// A second press landing inside the double-click gap cancels the first click's
+    /// pending short-press confirmation, and the pair fires `double_click` on the
+    /// second release.
+    #[tokio::test]
+    async fn pressable_edge_double_click_cancels_pending_short() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert!(state.pending_shorts.contains_key(&reference));
+
+        // Second press arrives within the gap: it cancels the pending confirmation
+        // and its release is a double click instead of a short.
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert!(
+            state.pending_shorts.is_empty(),
+            "the pending short press must be cancelled by the second press"
+        );
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "D",
+            "the double click fired on the second release"
+        );
+        assert!(state.pending_shorts.is_empty());
+        state.assert_no_click(Duration::from_millis(120)).await;
     }
 }

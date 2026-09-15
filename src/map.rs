@@ -979,8 +979,9 @@ mod tests {
         assert_eq!(mapping.button_number(0x61, false), Some(3));
     }
 
-    /// The mapping JSON matches the one-line-per-button example-config form,
-    /// escaping string fields like `serde_json` would.
+    /// The mapping JSON matches the one-line-per-button/encoder example-config form
+    /// (including the comma joining multiple encoder entries), escaping string
+    /// fields like `serde_json` would.
     #[test]
     fn mapping_json_uses_compact_one_line_entries() {
         let mapping = Mapping {
@@ -1006,13 +1007,22 @@ mod tests {
                     draw_id: -1,
                 },
             ],
-            encoders: vec![EncoderMapping {
-                number: 1,
-                cw: 81,
-                ccw: 80,
-                press: 79,
-                release: 79,
-            }],
+            encoders: vec![
+                EncoderMapping {
+                    number: 1,
+                    cw: 81,
+                    ccw: 80,
+                    press: 79,
+                    release: 79,
+                },
+                EncoderMapping {
+                    number: 2,
+                    cw: 83,
+                    ccw: 82,
+                    press: 78,
+                    release: 78,
+                },
+            ],
         };
         assert_eq!(
             mapping_json(&mapping),
@@ -1029,7 +1039,8 @@ mod tests {
                 "    { \"number\": 2, \"press\": 48, \"release\": 48, \"screen\": false, \"draw_id\": -1 }\n",
                 "  ],\n",
                 "  \"encoders\": [\n",
-                "    { \"number\": 1, \"cw\": 81, \"ccw\": 80, \"press\": 79, \"release\": 79 }\n",
+                "    { \"number\": 1, \"cw\": 81, \"ccw\": 80, \"press\": 79, \"release\": 79 },\n",
+                "    { \"number\": 2, \"cw\": 83, \"ccw\": 82, \"press\": 78, \"release\": 78 }\n",
                 "  ]\n",
                 "}"
             )
