@@ -27,6 +27,7 @@ use std::time::Duration;
 #[cfg(target_os = "freebsd")]
 extern crate mirajazz_freebsd as mirajazz;
 
+use dak::actions::ButtonDevice;
 use dak::hardware;
 use mirajazz::device::Device;
 use mirajazz::types::DeviceInput;
@@ -149,6 +150,48 @@ async fn uploads_and_clears_a_button_image() {
         .clear_all_button_images()
         .await
         .expect("clear_all_button_images should succeed");
+
+    device.shutdown().await.expect("shutdown should succeed");
+}
+
+/// Drives a device through the [`ButtonDevice`] trait surface `SceneRunner` uses
+/// in production, generic over the implementor so the call sites below resolve
+/// through the trait rather than `Device`'s own identically-named inherent
+/// methods. Used to exercise `impl ButtonDevice for mirajazz::device::Device`
+/// (`src/actions.rs`), which every other test reaches only through a mock, and
+/// which calling these same-named methods directly on a concrete `Device` value
+/// would silently bypass in favor of its inherent methods.
+async fn drive_through_button_device<D: ButtonDevice>(
+    device: &D,
+    key_count: usize,
+) -> Result<(), D::Error> {
+    assert_eq!(device.key_count(), key_count as u8);
+
+    let image = dak::text::render_text(&["HW".to_string()], hardware::IMAGE_FORMAT)
+        .expect("render_text should succeed");
+    device
+        .set_button_image(0, hardware::IMAGE_FORMAT, image)
+        .await?;
+    device.flush().await?;
+    device.clear_button_image(0).await?;
+    device.flush().await?;
+    Ok(())
+}
+
+/// Exercises `impl ButtonDevice for mirajazz::device::Device` end-to-end against
+/// real hardware: every other test either mocks the trait out entirely
+/// (`tests/scene_runner.rs`) or drives `Device` through its own inherent methods
+/// directly (the other tests in this file), neither of which reaches this impl.
+#[tokio::test(flavor = "multi_thread")]
+async fn button_device_trait_drives_a_real_device() {
+    if skip_without_hardware().await {
+        return;
+    }
+
+    let device = connect().await;
+    drive_through_button_device(&device, hardware::DEFAULT_KEY_COUNT)
+        .await
+        .expect("ButtonDevice methods should succeed against real hardware");
 
     device.shutdown().await.expect("shutdown should succeed");
 }
