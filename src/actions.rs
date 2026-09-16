@@ -443,9 +443,9 @@ fn check_button_op(
         }
     };
     for field in object.keys() {
-        if field != "type" && field != "params" {
+        if field != "type" && field != "params" && field != "refresh" {
             errors.push(format!(
-                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected \"type\" and \"params\""
+                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected \"type\", \"params\" and \"refresh\""
             ));
         }
     }
@@ -483,6 +483,30 @@ fn check_button_op(
         },
         None => "",
     };
+
+    // "refresh" (seconds) is optional and defaults to 0, meaning "apply once on scene
+    // entry, never again". A nonzero value only makes sense for the types that redraw
+    // something: "clear" has nothing left to redraw, and "launch" fires a detached
+    // one-off process rather than drawing anything, so a nonzero refresh on either is
+    // rejected here rather than silently ignored.
+    let refresh = match object.get("refresh") {
+        Some(value) => match value.as_u64() {
+            Some(refresh) => refresh,
+            None => {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {location} refresh must be a positive number of seconds, got {}",
+                    value_type(value)
+                ));
+                0
+            }
+        },
+        None => 0,
+    };
+    if refresh != 0 && matches!(kind, "clear" | "launch") {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} refresh cannot be used with type \"{kind}\""
+        ));
+    }
 
     match kind {
         "image" | "text" => {
@@ -712,21 +736,39 @@ impl CommandSpec {
 }
 
 /// A single operation derived from a scene's numbered button entries.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SceneOp {
     /// Load `path` as the image for a button. References are physical buttons (1-based).
-    SetImage { reference: Reference, path: String },
+    /// `refresh_seconds` (0 = never) re-applies this operation on its own, independent of
+    /// any scene switch.
+    SetImage {
+        reference: Reference,
+        path: String,
+        refresh_seconds: u64,
+    },
     /// Show the first lines of `path` as text on a button. References are physical buttons (1-based).
-    Text { reference: Reference, path: String },
+    /// `refresh_seconds` (0 = never) re-applies this operation on its own, independent of
+    /// any scene switch.
+    Text {
+        reference: Reference,
+        path: String,
+        refresh_seconds: u64,
+    },
     /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
+    /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
+    /// scene switch.
     TextExec {
         reference: Reference,
         command: CommandSpec,
+        refresh_seconds: u64,
     },
     /// Run `command` and set its stdout (an image file) as the button image. References are physical buttons (1-based).
+    /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
+    /// scene switch.
     ImageExec {
         reference: Reference,
         command: CommandSpec,
+        refresh_seconds: u64,
     },
     /// Run `command` detached from this program: own process group, no stdio, and not
     /// killed when the program exits. The decoy reference is only a config slot;
@@ -784,23 +826,36 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         }
         .trim()
         .to_string();
+        // Validated at config-load time only (check_button_op); trusted here, same as
+        // "type"/"params" already are.
+        let refresh_seconds = object.get("refresh").and_then(Value::as_u64).unwrap_or(0);
 
         match kind {
             "image" => operations.push(SceneOp::SetImage {
                 reference,
                 path: params,
+                refresh_seconds,
             }),
             "text" => operations.push(SceneOp::Text {
                 reference,
                 path: params,
+                refresh_seconds,
             }),
             "text_exec" => {
                 let command = params_command(scene_name, key, "text_exec", &params)?;
-                operations.push(SceneOp::TextExec { reference, command });
+                operations.push(SceneOp::TextExec {
+                    reference,
+                    command,
+                    refresh_seconds,
+                });
             }
             "image_exec" => {
                 let command = params_command(scene_name, key, "image_exec", &params)?;
-                operations.push(SceneOp::ImageExec { reference, command });
+                operations.push(SceneOp::ImageExec {
+                    reference,
+                    command,
+                    refresh_seconds,
+                });
             }
             "launch" => {
                 let command = params_command(scene_name, key, "launch", &params)?;
@@ -1005,11 +1060,26 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// Physical button numbers (1-based) that have no display on this device. Image
     /// operations targetting them are skipped with a warning: the hardware ignores them.
     screenless_buttons: std::collections::HashSet<u8>,
+    /// The operation currently active on each physical button (1-based), i.e. whatever
+    /// the most recent explicit scene entry applied there. Consulted by
+    /// [`SceneRunner::refresh_button`] to redraw just that button on its own schedule,
+    /// independent of whichever scene happens to be active - a button not redefined by
+    /// a later scene keeps both its content and its refresh schedule, exactly like an
+    /// inherited action binding.
+    active_setup: std::collections::HashMap<u8, SceneOp>,
+    /// The pending "next tick" task for each physical button (1-based) with a nonzero
+    /// `refresh_seconds`, if any. Replaced (old task aborted) every time that button is
+    /// explicitly re-applied, whether by its own tick or by a scene redefining it.
+    refresh_handles: std::collections::HashMap<u8, tokio::task::JoinHandle<()>>,
+    /// Sender for refresh ticks: a spawned task sleeps for a button's `refresh_seconds`
+    /// then sends its key here; the receiving end drives [`SceneRunner::refresh_button`].
+    refresh_tx: mpsc::Sender<u8>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// Creates a runner driving the config device `device_number` bound to `device`,
-    /// sending `exec` results through `exec_tx`, reporting scene/device events through `log`.
+    /// sending `exec` results through `exec_tx`, refresh ticks through `refresh_tx`,
+    /// reporting scene/device events through `log`.
     ///
     /// `screenless_buttons` lists the device buttons that have no display; image
     /// assignment to them is skipped with a warning (see [`SceneRunner`]).
@@ -1018,6 +1088,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         device: &'a D,
         image_format: ImageFormat,
         exec_tx: mpsc::Sender<ExecEvent>,
+        refresh_tx: mpsc::Sender<u8>,
         log: Log,
         screenless_buttons: &std::collections::HashSet<u8>,
     ) -> Self {
@@ -1029,6 +1100,9 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             device_number,
             changed_keys: std::collections::HashSet::new(),
             screenless_buttons: screenless_buttons.clone(),
+            active_setup: std::collections::HashMap::new(),
+            refresh_handles: std::collections::HashMap::new(),
+            refresh_tx,
         }
     }
 
@@ -1057,146 +1131,224 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         operations: &[SceneOp],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for operation in operations {
-            // Unsupported carries no reference, so it is skipped before any per-reference
-            // filtering can apply.
-            let Some(reference) = operation_reference(operation) else {
-                let SceneOp::Unsupported { kind } = operation else {
-                    unreachable!("operation without a reference must be Unsupported");
-                };
-                self.log.warn(format!(
-                    "scene setup \"{kind}\" on key is not supported and was skipped"
-                ));
-                continue;
-            };
-            let reference = *reference;
-
-            if reference.device != self.device_number {
-                self.log.warn(format!(
-                    "device {} is referenced but not present; skipping operation: {operation:?}",
-                    reference.device
-                ));
-                continue;
-            }
-            if reference.kind == Kind::Encoder {
-                self.log.warn(format!(
-                    "{kind} {reference} is not supported yet; skipping operation: {operation:?}",
-                    kind = reference.kind.label()
-                ));
-                continue;
-            }
-
-            // A launch only runs its command; its reference is a config slot, so no
-            // button is drawn and none is restored on termination.
-            if let SceneOp::Launch { command, .. } = operation {
-                spawn_detached(command, self.log);
-                continue;
-            }
-
-            let key = reference.number;
-            if key > self.device.key_count() {
-                self.log.warn(format!(
-                    "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
-                    self.device.key_count()
-                ));
-                continue;
-            }
-
-            // A button without a display cannot show any image: assignment is pointless
-            // and the hardware ignores the transfer, so warn and skip the work.
-            if self.screenless_buttons.contains(&key)
-                && matches!(
-                    operation,
-                    SceneOp::SetImage { .. }
-                        | SceneOp::Text { .. }
-                        | SceneOp::TextExec { .. }
-                        | SceneOp::ImageExec { .. }
-                )
-            {
-                self.log.warn(format!(
-                    "button {reference} has no display; skipping operation: {operation:?}"
-                ));
-                continue;
-            }
-
-            // record the button as "touched" so termination cleanup can restore exactly
-            // the buttons this session changed (unused buttons are left alone)
-            self.changed_keys.insert(key);
-            self.cancel_exec_if_running(key).await;
-            match operation {
-                // config references are physical buttons numbered from 1; mirajazz keys are 0-based
-                SceneOp::SetImage { reference: _, path } => {
-                    self.log.debug(
-                        Subsystem::Scene,
-                        format!("set image from \"{path}\" on key {key}"),
-                    );
-                    set_image_from_file(
-                        self.device,
-                        key.saturating_sub(1),
-                        self.image_format,
-                        path,
-                    )
-                    .await?;
-                    self.log
-                        .debug(Subsystem::Device, format!("set image on button {key}"));
-                }
-                SceneOp::Text { reference: _, path } => {
-                    self.log.debug(
-                        Subsystem::Scene,
-                        format!("render text from \"{path}\" on key {key}"),
-                    );
-                    let content = std::fs::read_to_string(path)?;
-                    let image = crate::text::render_text(
-                        &crate::text::button_text(&content),
-                        self.image_format,
-                    )?;
-                    self.device
-                        .set_button_image(key.saturating_sub(1), self.image_format, image)
-                        .await?;
-                    self.log.debug(
-                        Subsystem::Device,
-                        format!("set image on button {key} from text"),
-                    );
-                }
-                SceneOp::TextExec {
-                    reference: _,
-                    command,
-                } => {
-                    self.log.debug(
-                        Subsystem::Scene,
-                        format!("start text exec \"{}\" on key {key}", command.display()),
-                    );
-                    self.start_exec_task(key, ExecOutputKind::Text, command);
-                }
-                SceneOp::ImageExec {
-                    reference: _,
-                    command,
-                } => {
-                    self.log.debug(
-                        Subsystem::Scene,
-                        format!("start image exec \"{}\" on key {key}", command.display()),
-                    );
-                    self.start_exec_task(key, ExecOutputKind::Image, command);
-                }
-                SceneOp::Launch { .. } => {
-                    unreachable!("Launch is handled before the per-button match")
-                }
-                SceneOp::Clear { reference: _ } => {
-                    self.log.debug(Subsystem::Scene, format!("clear key {key}"));
-                    self.device
-                        .clear_button_image(key.saturating_sub(1))
-                        .await?;
-                    self.log
-                        .debug(Subsystem::Device, format!("clear image on button {key}"));
-                }
-                SceneOp::Unsupported { .. } => {
-                    unreachable!("Unsupported operations are skipped before the match")
-                }
-            }
+            self.apply_one_operation(operation).await?;
         }
         // set_button_image only stages images in the write cache, so every application
         // of a scene must flush for the staged images to reach the device's LCDs.
         self.device.flush().await?;
         Ok(())
+    }
+
+    /// Re-applies whatever operation is currently active on `key` - i.e. whatever the
+    /// most recent explicit scene entry drew there, tracked in `active_setup` - without
+    /// touching any other button, then flushes so the redraw reaches the LCD.
+    ///
+    /// This is how a nonzero `refresh_seconds` keeps a button updating on its own
+    /// schedule, independent of whichever scene happens to be active:
+    /// [`SceneRunner::apply_one_operation`] re-arms the next tick as a side effect of
+    /// applying the operation, exactly as it does the first time the operation is
+    /// applied, so no special-casing is needed between "just entered the scene" and
+    /// "a scheduled refresh tick fired".
+    ///
+    /// Does nothing if `key` has no active operation - a stale tick arriving after the
+    /// button was reassigned to something without a refresh (or reassigned since the
+    /// tick was scheduled, and the new operation's own tick already superseded it, since
+    /// `apply_one_operation` always cancels the previous handle before scheduling a new
+    /// one).
+    pub async fn refresh_button(&mut self, key: u8) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(operation) = self.active_setup.get(&key).cloned() else {
+            return Ok(());
+        };
+        self.apply_one_operation(&operation).await?;
+        self.device.flush().await?;
+        Ok(())
+    }
+
+    /// Applies one scene operation to the device: the shared per-operation logic behind
+    /// both [`SceneRunner::apply_scene_operations`] (a whole scene's worth, batched, one
+    /// flush at the end) and [`SceneRunner::refresh_button`] (a single button, on its own
+    /// schedule, flushing immediately).
+    ///
+    /// See [`SceneRunner::apply_scene_operations`]'s doc comment for the validity checks
+    /// performed (device/encoder/range/screenless skips). On success, records the
+    /// operation as `key`'s active setup and, for operations with a nonzero
+    /// `refresh_seconds`, schedules the next tick - replacing (aborting) any tick already
+    /// scheduled for that button first, whether or not the operation actually changed.
+    async fn apply_one_operation(
+        &mut self,
+        operation: &SceneOp,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Unsupported carries no reference, so it is skipped before any per-reference
+        // filtering can apply.
+        let Some(reference) = operation_reference(operation) else {
+            let SceneOp::Unsupported { kind } = operation else {
+                unreachable!("operation without a reference must be Unsupported");
+            };
+            self.log.warn(format!(
+                "scene setup \"{kind}\" on key is not supported and was skipped"
+            ));
+            return Ok(());
+        };
+        let reference = *reference;
+
+        if reference.device != self.device_number {
+            self.log.warn(format!(
+                "device {} is referenced but not present; skipping operation: {operation:?}",
+                reference.device
+            ));
+            return Ok(());
+        }
+        if reference.kind == Kind::Encoder {
+            self.log.warn(format!(
+                "{kind} {reference} is not supported yet; skipping operation: {operation:?}",
+                kind = reference.kind.label()
+            ));
+            return Ok(());
+        }
+
+        // A launch only runs its command; its reference is a config slot, so no
+        // button is drawn and none is restored on termination.
+        if let SceneOp::Launch { command, .. } = operation {
+            spawn_detached(command, self.log);
+            return Ok(());
+        }
+
+        let key = reference.number;
+        if key > self.device.key_count() {
+            self.log.warn(format!(
+                "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
+                self.device.key_count()
+            ));
+            return Ok(());
+        }
+
+        // A button without a display cannot show any image: assignment is pointless
+        // and the hardware ignores the transfer, so warn and skip the work.
+        if self.screenless_buttons.contains(&key)
+            && matches!(
+                operation,
+                SceneOp::SetImage { .. }
+                    | SceneOp::Text { .. }
+                    | SceneOp::TextExec { .. }
+                    | SceneOp::ImageExec { .. }
+            )
+        {
+            self.log.warn(format!(
+                "button {reference} has no display; skipping operation: {operation:?}"
+            ));
+            return Ok(());
+        }
+
+        // record the button as "touched" so termination cleanup can restore exactly
+        // the buttons this session changed (unused buttons are left alone)
+        self.changed_keys.insert(key);
+        self.cancel_exec_if_running(key).await;
+        // Any refresh previously scheduled for this button belonged to whatever
+        // operation was active before; it is unconditionally replaced below by whatever
+        // this operation schedules (if anything), even if the operation is unchanged.
+        self.cancel_refresh(key);
+        match operation {
+            // config references are physical buttons numbered from 1; mirajazz keys are 0-based
+            SceneOp::SetImage {
+                reference: _, path, ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("set image from \"{path}\" on key {key}"),
+                );
+                set_image_from_file(self.device, key.saturating_sub(1), self.image_format, path)
+                    .await?;
+                self.log
+                    .debug(Subsystem::Device, format!("set image on button {key}"));
+            }
+            SceneOp::Text {
+                reference: _, path, ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("render text from \"{path}\" on key {key}"),
+                );
+                let content = std::fs::read_to_string(path)?;
+                let image = crate::text::render_text(
+                    &crate::text::button_text(&content),
+                    self.image_format,
+                )?;
+                self.device
+                    .set_button_image(key.saturating_sub(1), self.image_format, image)
+                    .await?;
+                self.log.debug(
+                    Subsystem::Device,
+                    format!("set image on button {key} from text"),
+                );
+            }
+            SceneOp::TextExec {
+                reference: _,
+                command,
+                ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("start text exec \"{}\" on key {key}", command.display()),
+                );
+                self.start_exec_task(key, ExecOutputKind::Text, command);
+            }
+            SceneOp::ImageExec {
+                reference: _,
+                command,
+                ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("start image exec \"{}\" on key {key}", command.display()),
+                );
+                self.start_exec_task(key, ExecOutputKind::Image, command);
+            }
+            SceneOp::Launch { .. } => {
+                unreachable!("Launch is handled before the per-button match")
+            }
+            SceneOp::Clear { reference: _ } => {
+                self.log.debug(Subsystem::Scene, format!("clear key {key}"));
+                self.device
+                    .clear_button_image(key.saturating_sub(1))
+                    .await?;
+                self.log
+                    .debug(Subsystem::Device, format!("clear image on button {key}"));
+            }
+            SceneOp::Unsupported { .. } => {
+                unreachable!("Unsupported operations are skipped before the match")
+            }
+        }
+
+        self.active_setup.insert(key, operation.clone());
+        let refresh_seconds = refresh_seconds_of(operation);
+        if refresh_seconds > 0 {
+            self.schedule_refresh(key, refresh_seconds);
+        }
+        Ok(())
+    }
+
+    /// Aborts and forgets `key`'s pending refresh tick, if any.
+    fn cancel_refresh(&mut self, key: u8) {
+        if let Some(handle) = self.refresh_handles.remove(&key) {
+            handle.abort();
+        }
+    }
+
+    /// Schedules a one-shot tick for `key` after `seconds`, replacing (see
+    /// [`SceneRunner::cancel_refresh`], always called by the only caller,
+    /// [`SceneRunner::apply_one_operation`], before this) any tick already pending for
+    /// it.
+    ///
+    /// Mirrors the scene-level timer's own one-shot-respawn style
+    /// (`arm_scene_timer`/`rearm_scene_timer` in `main.rs`) rather than a repeating
+    /// `tokio::interval`: each tick, once handled, schedules the next one itself.
+    fn schedule_refresh(&mut self, key: u8, seconds: u64) {
+        let tx = self.refresh_tx.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            let _ = tx.send(key).await;
+        });
+        self.refresh_handles.insert(key, handle);
     }
 
     /// Restores every button the runner changed during this session to its original
@@ -1376,6 +1528,27 @@ fn operation_reference(operation: &SceneOp) -> Option<&Reference> {
         | SceneOp::Launch { reference, .. }
         | SceneOp::Clear { reference } => Some(reference),
         SceneOp::Unsupported { .. } => None,
+    }
+}
+
+/// The `refresh_seconds` an operation carries, or 0 for the variants that never have one
+/// (`Launch`/`Clear`/`Unsupported`) - 0 means "never", the same value an absent `refresh`
+/// field defaults to, so callers can treat both cases identically.
+fn refresh_seconds_of(operation: &SceneOp) -> u64 {
+    match operation {
+        SceneOp::SetImage {
+            refresh_seconds, ..
+        }
+        | SceneOp::Text {
+            refresh_seconds, ..
+        }
+        | SceneOp::TextExec {
+            refresh_seconds, ..
+        }
+        | SceneOp::ImageExec {
+            refresh_seconds, ..
+        } => *refresh_seconds,
+        SceneOp::Launch { .. } | SceneOp::Clear { .. } | SceneOp::Unsupported { .. } => 0,
     }
 }
 
@@ -2028,10 +2201,12 @@ mod tests {
         let image = super::SceneOp::SetImage {
             reference: super::Reference::button(1, 3),
             path: "x.png".to_string(),
+            refresh_seconds: 0,
         };
         let text = super::SceneOp::Text {
             reference: super::Reference::button(2, 4),
             path: "x.txt".to_string(),
+            refresh_seconds: 0,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(9, 8),
@@ -2039,6 +2214,7 @@ mod tests {
                 program: "echo".to_string(),
                 args: vec![],
             },
+            refresh_seconds: 0,
         };
         let image_exec = super::SceneOp::ImageExec {
             reference: super::Reference::button(1, 9),
@@ -2046,6 +2222,7 @@ mod tests {
                 program: "convert".to_string(),
                 args: vec![],
             },
+            refresh_seconds: 0,
         };
         let launch = super::SceneOp::Launch {
             reference: super::Reference::button(1, 5),
@@ -2085,6 +2262,58 @@ mod tests {
             Some(&super::Reference::encoder(1, 1))
         );
         assert_eq!(super::operation_reference(&unsupported), None);
+    }
+
+    /// `refresh_seconds_of` reads the field from the four variants that carry one, and
+    /// reports 0 (the same as an absent/zero field) for the three that never do.
+    #[test]
+    fn refresh_seconds_of_reads_the_field_or_reports_zero() {
+        let image = super::SceneOp::SetImage {
+            reference: super::Reference::button(1, 1),
+            path: "x.png".to_string(),
+            refresh_seconds: 5,
+        };
+        let text = super::SceneOp::Text {
+            reference: super::Reference::button(1, 2),
+            path: "x.txt".to_string(),
+            refresh_seconds: 7,
+        };
+        let text_exec = super::SceneOp::TextExec {
+            reference: super::Reference::button(1, 3),
+            command: super::CommandSpec {
+                program: "echo".to_string(),
+                args: vec![],
+            },
+            refresh_seconds: 11,
+        };
+        let image_exec = super::SceneOp::ImageExec {
+            reference: super::Reference::button(1, 4),
+            command: super::CommandSpec {
+                program: "convert".to_string(),
+                args: vec![],
+            },
+            refresh_seconds: 13,
+        };
+        let launch = super::SceneOp::Launch {
+            reference: super::Reference::button(1, 5),
+            command: super::CommandSpec {
+                program: "true".to_string(),
+                args: vec![],
+            },
+        };
+        let clear = super::SceneOp::Clear {
+            reference: super::Reference::button(1, 6),
+        };
+        let unsupported = super::SceneOp::Unsupported {
+            kind: "frobnicate".to_string(),
+        };
+        assert_eq!(super::refresh_seconds_of(&image), 5);
+        assert_eq!(super::refresh_seconds_of(&text), 7);
+        assert_eq!(super::refresh_seconds_of(&text_exec), 11);
+        assert_eq!(super::refresh_seconds_of(&image_exec), 13);
+        assert_eq!(super::refresh_seconds_of(&launch), 0);
+        assert_eq!(super::refresh_seconds_of(&clear), 0);
+        assert_eq!(super::refresh_seconds_of(&unsupported), 0);
     }
 
     /// A fresh tracker accepts its first generation for a button but rejects unknown ones.

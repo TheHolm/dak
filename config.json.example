@@ -15,12 +15,10 @@
     },
     "Main": {
       "setup": {
-        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 },
         "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
       },
-      "actions": {
-        "timer": { "1": "~" }
-      }
+      "actions": {}
     },
     "Test": {
       "setup": {

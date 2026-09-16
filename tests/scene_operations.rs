@@ -30,11 +30,48 @@ fn scene_operations_extract_static_images() {
         vec![
             SceneOp::SetImage {
                 reference: Reference::button(1, 1),
-                path: "/path/one.ico".to_string()
+                path: "/path/one.ico".to_string(),
+                refresh_seconds: 0,
             },
             SceneOp::SetImage {
                 reference: Reference::button(1, 2),
-                path: "/path/two.png".to_string()
+                path: "/path/two.png".to_string(),
+                refresh_seconds: 0,
+            },
+        ]
+    );
+}
+
+/// A "refresh" field on the setup entry is read into the operation's
+/// `refresh_seconds`; an entry without one defaults to 0.
+#[test]
+fn scene_operations_extract_refresh_seconds() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1b01": { "type": "image", "params": "/path/one.ico", "refresh": 5 },
+                    "1b02": { "type": "image", "params": "/path/two.png" }
+                }
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    let operations = scene_operations("on_start", &config.scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![
+            SceneOp::SetImage {
+                reference: Reference::button(1, 1),
+                path: "/path/one.ico".to_string(),
+                refresh_seconds: 5,
+            },
+            SceneOp::SetImage {
+                reference: Reference::button(1, 2),
+                path: "/path/two.png".to_string(),
+                refresh_seconds: 0,
             },
         ]
     );
@@ -86,7 +123,8 @@ fn scene_operations_extract_image_exec() {
             command: CommandSpec {
                 program: "/usr/bin/convert".to_string(),
                 args: vec!["input.png".to_string(), "png:-".to_string()]
-            }
+            },
+            refresh_seconds: 0,
         }]
     );
 }
@@ -111,7 +149,8 @@ fn scene_operations_extract_text() {
         operations,
         vec![SceneOp::Text {
             reference: Reference::button(1, 3),
-            path: "/tmp/notes.txt".to_string()
+            path: "/tmp/notes.txt".to_string(),
+            refresh_seconds: 0,
         }]
     );
 }
@@ -140,7 +179,38 @@ fn scene_operations_extract_text_exec() {
             command: CommandSpec {
                 program: "/usr/bin/date".to_string(),
                 args: vec!["+%H:%M".to_string()]
+            },
+            refresh_seconds: 0,
+        }]
+    );
+}
+
+/// A `text_exec` with "refresh" set keeps re-running the command on its own, so this
+/// is the config that lets a clock button skip the whole-scene `timer` trick.
+#[test]
+fn scene_operations_extract_text_exec_with_refresh() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 }
+                }
             }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    let operations = scene_operations("on_start", &config.scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![SceneOp::TextExec {
+            reference: Reference::button(1, 3),
+            command: CommandSpec {
+                program: "/usr/bin/date".to_string(),
+                args: vec!["+%H:%M".to_string()]
+            },
+            refresh_seconds: 1,
         }]
     );
 }
@@ -163,7 +233,8 @@ fn scene_operations_extract_text_exec_quoted_args() {
             command: CommandSpec {
                 program: "/usr/bin/find".to_string(),
                 args: vec![".".to_string(), "-name".to_string(), "*.rs".to_string(),]
-            }
+            },
+            refresh_seconds: 0,
         }]
     );
 }
@@ -422,7 +493,8 @@ fn scene_operations_accept_encoder_references() {
         operations,
         vec![SceneOp::Text {
             reference: Reference::encoder(2, 1),
-            path: "/tmp/notes.txt".to_string()
+            path: "/tmp/notes.txt".to_string(),
+            refresh_seconds: 0,
         }]
     );
 }

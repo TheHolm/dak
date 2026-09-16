@@ -348,6 +348,66 @@ fn rejects_button_entry_without_type() {
     );
 }
 
+/// "refresh" is accepted on every type that redraws something on its own schedule:
+/// image, text, image_exec and text_exec.
+#[test]
+fn accepts_refresh_on_redrawable_types() {
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1b01": { "type": "image", "params": "/a", "refresh": 5 },
+                    "1b02": { "type": "text", "params": "/b", "refresh": 5 },
+                    "1b03": { "type": "image_exec", "params": "/bin/true", "refresh": 5 },
+                    "1b04": { "type": "text_exec", "params": "/bin/true", "refresh": 5 }
+                }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// "refresh" defaults to 0 (never) when absent, so an entry without it is unaffected.
+#[test]
+fn accepts_setup_entry_without_refresh() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "/bin/true"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// "refresh" must be a number of seconds, not any other JSON type.
+#[test]
+fn rejects_refresh_not_a_number() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_exec", "params": "/bin/true", "refresh": "soon"}}}}"#,
+        "refresh must be a positive number of seconds, got a string",
+    );
+}
+
+/// A nonzero "refresh" on "clear" is rejected: there is nothing left to redraw.
+#[test]
+fn rejects_refresh_on_clear() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1b01": {"type": "clear", "refresh": 5}}}}"#,
+        "refresh cannot be used with type \"clear\"",
+    );
+}
+
+/// A nonzero "refresh" on "launch" is rejected: launch fires a detached one-off process,
+/// not a redraw.
+#[test]
+fn rejects_refresh_on_launch() {
+    assert_validation_error(
+        r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "/bin/true", "refresh": 5}}}}"#,
+        "refresh cannot be used with type \"launch\"",
+    );
+}
+
 /// Unknown types are rejected with the list of known ones.
 #[test]
 fn rejects_unknown_button_type() {

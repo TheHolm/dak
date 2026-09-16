@@ -262,6 +262,10 @@ async fn run_device(
     // async image_exec/text_exec results land on buttons through this runner and its channel
     let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
 
+    // A button with a nonzero `refresh_seconds` sends its own key here once its
+    // interval elapses; the runner redraws just that button and re-arms the next tick.
+    let (refresh_tx, mut refresh_rx) = mpsc::channel::<u8>(8);
+
     // Buttons this device model has no display on; assigning an image to them is
     // pointless, so the runner warns, skips the work and the transfer.
     let screenless_buttons: std::collections::HashSet<u8> = definition
@@ -275,6 +279,7 @@ async fn run_device(
         &device,
         IMAGE_FORMAT,
         exec_tx,
+        refresh_tx,
         log,
         &screenless_buttons,
     );
@@ -477,6 +482,18 @@ async fn run_device(
                     break;
                 };
                 runner.handle_exec_event(event).await;
+            }
+            key = refresh_rx.recv() => {
+                let Some(key) = key else {
+                    break;
+                };
+                log.debug(
+                    Subsystem::Scene,
+                    format!("refresh tick for button {key}"),
+                );
+                if let Err(error) = runner.refresh_button(key).await {
+                    log.warn(format!("failed to refresh button {key}: {error}"));
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 // Ctrl-C (SIGINT) normally kills the process instantly; route it
@@ -919,15 +936,18 @@ mod tests {
         PathBuf::from(path)
     }
 
-    /// Builds a scene runner over a mock device, dropping the exec channel: none of
-    /// these tests run `image_exec`/`text_exec`.
+    /// Builds a scene runner over a mock device, dropping the exec and refresh
+    /// channels: none of these tests run `image_exec`/`text_exec` or rely on a
+    /// scheduled refresh tick actually arriving.
     fn make_runner(mock: &MockButtonDevice) -> SceneRunner<'_, MockButtonDevice> {
         let (exec_tx, _exec_rx) = mpsc::channel(8);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(8);
         SceneRunner::new(
             1,
             mock,
             super::IMAGE_FORMAT,
             exec_tx,
+            refresh_tx,
             Log::default(),
             &HashSet::new(),
         )

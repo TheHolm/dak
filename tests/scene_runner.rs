@@ -245,7 +245,16 @@ async fn set_image_op_stages_zero_based_key_and_flushes() {
     let mock = MockButtonDevice::default();
     let image_path = write_temp_image();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b03": { "type": "image", "params": image_path.to_str().unwrap() }
@@ -267,7 +276,16 @@ async fn text_op_renders_button_text_and_flushes() {
     let mock = MockButtonDevice::default();
     let text_path = write_temp_text("hello\nworld");
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "text", "params": text_path.to_str().unwrap() }
@@ -287,7 +305,16 @@ async fn text_op_renders_button_text_and_flushes() {
 async fn clear_op_calls_zero_based_key_and_flushes() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({ "1b05": { "type": "clear" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
@@ -302,7 +329,16 @@ async fn clear_op_calls_zero_based_key_and_flushes() {
 async fn unsupported_op_only_flushes() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "frobnicate", "params": "/bin/sh" }
@@ -317,7 +353,16 @@ async fn unsupported_op_only_flushes() {
 async fn text_exec_output_drawn_on_button() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     // Spawn a slow program so its own result cannot race our explicit event; the
     // first apply on key 2 reserves cancel-bump 1, then the task runs at generation 2.
@@ -346,7 +391,16 @@ async fn text_exec_output_drawn_on_button() {
 async fn text_exec_stale_output_dropped() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -369,7 +423,16 @@ async fn text_exec_stale_output_dropped() {
 async fn image_exec_output_drawn_on_button() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
@@ -401,7 +464,16 @@ async fn image_exec_output_drawn_on_button() {
 async fn image_exec_non_image_output_draws_error_label() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
@@ -427,7 +499,16 @@ async fn image_exec_non_image_output_draws_error_label() {
 async fn text_exec_non_utf8_output_draws_error_label() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -453,7 +534,16 @@ async fn text_exec_non_utf8_output_draws_error_label() {
 async fn text_exec_error_draws_red_label() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -478,7 +568,16 @@ async fn text_exec_error_draws_red_label() {
 async fn text_exec_stale_error_dropped() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -500,7 +599,16 @@ async fn text_exec_stale_error_dropped() {
 async fn reassigning_key_kills_running_text_exec_and_draws_error() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     // Unique per test (not just per process): two tests sharing one hardcoded pid
     // file path race on the same file when the test binary runs them concurrently.
@@ -562,7 +670,16 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
 async fn reassigning_key_after_finished_text_exec_draws_no_error() {
     let mock = MockButtonDevice::default();
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "true" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
@@ -588,7 +705,16 @@ async fn reassigning_key_after_finished_text_exec_draws_no_error() {
 async fn clear_changed_button_images_restores_only_changed_buttons() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let image_path = write_temp_image();
     let scenes = scenes_with_buttons(json!({
@@ -639,7 +765,16 @@ async fn set_image_from_file_stages_image_without_flushing() {
 async fn launch_op_spawns_program_and_touches_no_button() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid_file = format!("/tmp/dak_runner_launch_{}_{n}.pid", std::process::id());
@@ -685,7 +820,16 @@ async fn launch_op_spawns_program_and_touches_no_button() {
 async fn text_op_missing_file_fails_scene() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "text", "params": "/does/not/exist.txt" }
@@ -702,7 +846,16 @@ async fn text_op_missing_file_fails_scene() {
 async fn image_op_missing_file_fails_scene() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "image", "params": "/does/not/exist.png" }
@@ -720,11 +873,20 @@ async fn image_op_missing_file_fails_scene() {
 async fn text_op_unrenderable_text_fails_scene() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let zero_format = ImageFormat {
         size: (0, 0),
         ..FORMAT
     };
-    let mut runner = SceneRunner::new(1, &mock, zero_format, tx, Log::default(), &HashSet::new());
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        zero_format,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let path = write_temp_text("hello");
     let scenes = scenes_with_buttons(json!({
@@ -745,11 +907,20 @@ async fn text_op_unrenderable_text_fails_scene() {
 async fn text_exec_unrenderable_output_is_logged_and_skipped() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let zero_format = ImageFormat {
         size: (0, 0),
         ..FORMAT
     };
-    let mut runner = SceneRunner::new(1, &mock, zero_format, tx, Log::default(), &HashSet::new());
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        zero_format,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b02": { "type": "text_exec", "params": "sleep 10" }
@@ -778,7 +949,16 @@ async fn text_exec_unrenderable_output_is_logged_and_skipped() {
 async fn ops_for_absent_device_are_skipped() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "2b01": { "type": "clear" }
@@ -794,7 +974,16 @@ async fn ops_for_absent_device_are_skipped() {
 async fn encoder_ops_are_skipped_as_unsupported() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1e01": { "type": "clear" }
@@ -810,7 +999,16 @@ async fn encoder_ops_are_skipped_as_unsupported() {
 async fn out_of_range_buttons_are_skipped() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b99": { "type": "clear" }
@@ -827,8 +1025,17 @@ async fn out_of_range_buttons_are_skipped() {
 async fn screenless_buttons_skip_image_ops() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let screenless = HashSet::from([7, 8]);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &screenless,
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b07": { "type": "image", "params": "/no/such/image.png" },
@@ -850,8 +1057,17 @@ async fn screenless_buttons_skip_image_ops() {
 async fn screenless_buttons_skip_exec_ops() {
     let mock = MockButtonDevice::default();
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let screenless = HashSet::from([7, 8]);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &screenless,
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b07": { "type": "text_exec", "params": "sleep 10" },
@@ -877,8 +1093,17 @@ async fn drawable_buttons_are_not_skipped() {
     let mock = MockButtonDevice::default();
     let image_path = write_temp_image();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let screenless = HashSet::from([7, 8]);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &screenless,
+    );
 
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "image", "params": image_path.to_str().unwrap() },
@@ -900,8 +1125,17 @@ async fn drawable_buttons_are_not_skipped() {
 async fn screenless_buttons_are_not_skipped_for_clear() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
     let screenless = HashSet::from([7, 8]);
-    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &screenless,
+    );
 
     let scenes = scenes_with_buttons(json!({ "1b07": { "type": "clear" } }));
     runner.enter_scene("main", &scenes).await.unwrap();
@@ -918,7 +1152,16 @@ async fn exec_output_write_failure_is_logged() {
     let device = FailingButtonDevice::default();
     device.fail_image_writes(true);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
@@ -952,7 +1195,16 @@ async fn exec_output_write_failure_is_logged() {
 async fn exec_output_flush_failure_is_logged() {
     let device = FailingButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
@@ -988,7 +1240,16 @@ async fn exec_error_label_draw_failure_is_logged() {
     let device = FailingButtonDevice::default();
     device.fail_image_writes(true);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -1016,7 +1277,16 @@ async fn exec_output_non_utf8_draw_failure_is_logged() {
     let device = FailingButtonDevice::default();
     device.fail_image_writes(true);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
@@ -1045,7 +1315,16 @@ async fn exec_output_invalid_image_draw_failure_is_logged() {
     let device = FailingButtonDevice::default();
     device.fail_image_writes(true);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     let scenes =
         scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
@@ -1075,7 +1354,16 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
     let device = FailingButtonDevice::default();
     device.fail_image_writes(true);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
-    let mut runner = SceneRunner::new(1, &device, FORMAT, tx, Log::default(), &HashSet::new());
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
 
     // Unique per test (not just per process): two tests sharing one hardcoded pid
     // file path race on the same file when the test binary runs them concurrently.
@@ -1132,4 +1420,164 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
         "the reassigned clear should still have run: {attempts:?}"
     );
     let _ = std::fs::remove_file(&pid_file);
+}
+
+/// A button with no "refresh" (or 0) never gets a tick: `apply_one_operation` only
+/// schedules one when `refresh_seconds` is nonzero.
+#[tokio::test]
+async fn refresh_absent_never_sends_a_tick() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let arrived = tokio::time::timeout(Duration::from_millis(200), refresh_rx.recv()).await;
+    assert!(
+        arrived.is_err(),
+        "no tick should ever be scheduled: {arrived:?}"
+    );
+
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A button with a nonzero "refresh" sends its own key through the refresh channel
+/// once the interval elapses; applying the resulting tick redraws just that button.
+#[tokio::test]
+async fn refresh_redraws_the_button_on_its_own_after_the_interval() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap(), "refresh": 1 }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert_eq!(mock.kinds(&mock.calls()), ["SetImage", "Flush"]);
+
+    let key = tokio::time::timeout(Duration::from_millis(1500), refresh_rx.recv())
+        .await
+        .expect("refresh tick should arrive within the interval")
+        .expect("channel should not be closed");
+    assert_eq!(key, 1);
+
+    runner.refresh_button(key).await.unwrap();
+    let calls = mock.calls();
+    assert_eq!(
+        mock.kinds(&calls),
+        ["SetImage", "Flush", "SetImage", "Flush"]
+    );
+    assert_eq!(mock.keys(&calls), [0, 0]);
+
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A button's refresh survives a scene switch that does not redefine it: it is tied to
+/// the button's active setup operation (tracked in `active_setup`), not to whichever
+/// scene happens to be current, exactly like action inheritance.
+#[tokio::test]
+async fn refresh_survives_a_scene_switch_that_does_not_redefine_the_button() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = json!({
+        "A": {
+            "setup": {
+                "1b01": {
+                    "type": "image",
+                    "params": image_path.to_str().unwrap(),
+                    "refresh": 1
+                }
+            }
+        },
+        "B": { "setup": {} }
+    });
+    runner.enter_scene("A", &scenes).await.unwrap();
+    runner.enter_scene("B", &scenes).await.unwrap();
+
+    let key = tokio::time::timeout(Duration::from_millis(1500), refresh_rx.recv())
+        .await
+        .expect("refresh tick should still arrive after switching to a scene that never redefines the button")
+        .expect("channel should not be closed");
+    assert_eq!(key, 1);
+
+    runner.refresh_button(key).await.unwrap();
+    let calls = mock.calls();
+    // Entering A drew once; entering B touched nothing (empty setup) but still flushed;
+    // the tick redrew once more.
+    assert_eq!(
+        mock.kinds(&calls),
+        ["SetImage", "Flush", "Flush", "SetImage", "Flush"]
+    );
+
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// Redefining a button cancels its old pending refresh tick, even if the new operation
+/// has no refresh of its own: the cancelled tick must never arrive.
+#[tokio::test]
+async fn refresh_is_cancelled_when_the_button_is_redefined() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scene_a = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap(), "refresh": 1 }
+    }));
+    runner.enter_scene("main", &scene_a).await.unwrap();
+
+    let scene_b = scenes_with_buttons(json!({ "1b01": { "type": "clear" } }));
+    runner.enter_scene("main", &scene_b).await.unwrap();
+
+    let arrived = tokio::time::timeout(Duration::from_millis(1500), refresh_rx.recv()).await;
+    assert!(
+        arrived.is_err(),
+        "the cancelled tick must never arrive: {arrived:?}"
+    );
+
+    let _ = std::fs::remove_file(&image_path);
 }
