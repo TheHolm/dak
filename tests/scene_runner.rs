@@ -843,6 +843,33 @@ async fn screenless_buttons_skip_image_ops() {
     );
 }
 
+/// The no-display skip also applies to `text_exec`/`image_exec`: the program is
+/// never even spawned on a screenless button, unlike `image`/`text` (covered by
+/// [`screenless_buttons_skip_image_ops`]) where only the file read is skipped.
+#[tokio::test]
+async fn screenless_buttons_skip_exec_ops() {
+    let mock = MockButtonDevice::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let screenless = HashSet::from([7, 8]);
+    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+
+    let scenes = scenes_with_buttons(json!({
+        "1b07": { "type": "text_exec", "params": "sleep 10" },
+        "1b08": { "type": "image_exec", "params": "sleep 10" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    assert_eq!(
+        mock.kinds(&mock.calls()),
+        ["Flush"],
+        "no button should have been touched"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no program should have been spawned, so no exec event should ever arrive"
+    );
+}
+
 /// The no-display skip only applies to the screenless buttons declared; drawable
 /// buttons keep working normally.
 #[tokio::test]
@@ -863,6 +890,25 @@ async fn drawable_buttons_are_not_skipped() {
     assert_eq!(mock.kinds(&calls), ["SetImage", "Flush"]);
     assert_eq!(mock.keys(&calls), [0]);
     let _ = std::fs::remove_file(&image_path);
+}
+
+/// The no-display skip only checks the operation's type, not the button: a `clear`
+/// on a screenless button is not an image assignment, so it is not skipped and
+/// still reaches the device (harmless on a button with no screen to clear, but
+/// exercising the "screenless but not an image op" branch that no other test hits).
+#[tokio::test]
+async fn screenless_buttons_are_not_skipped_for_clear() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let screenless = HashSet::from([7, 8]);
+    let mut runner = SceneRunner::new(1, &mock, FORMAT, tx, Log::default(), &screenless);
+
+    let scenes = scenes_with_buttons(json!({ "1b07": { "type": "clear" } }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let calls = mock.calls();
+    assert_eq!(mock.kinds(&calls), ["ClearImage", "Flush"]);
+    assert_eq!(mock.keys(&calls), [6]);
 }
 
 /// When `image_exec` output decodes fine but staging it on the device fails, the

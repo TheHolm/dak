@@ -1,6 +1,6 @@
 //! Library crate of DAK (Dynamic Ajazz Keyboard), exposing config loading/validation,
-//! scene/action logic, device addressing (baseplane), filterable output and text
-//! rendering for the keypad controller.
+//! scene/action logic, device addressing (baseplane), filterable output, text
+//! rendering, and hardware detection for the keypad controller.
 
 // FreeBSD has no HID backend in the real, published `mirajazz`/`async-hid` crates
 // (see AGENTS.md); `vendor/` carries a small FreeBSD-only fork, kept out of every
@@ -18,6 +18,7 @@ extern crate mirajazz_freebsd as mirajazz;
 
 pub mod actions;
 pub mod baseplane;
+pub mod hardware;
 pub mod log;
 pub mod map;
 pub mod press;
