@@ -1,7 +1,7 @@
 # DAK — Dynamic Ajazz Keyboard
 
-**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)    
-        
+**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
+
 Work in progress. Config structure will probably change in the future, but I will try to make it easy to update to new version.
 
 
@@ -21,6 +21,8 @@ Options:
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
   -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action
+      --map               Run the interactive device-mapping wizard instead of
+                          normal operation (see Devices below) and exit
   -h, --help              Print usage help and exit
 ```
 
@@ -168,7 +170,9 @@ Action values have three forms:
 
 Commands are executed asynchronously, so a running command does not block button input or the timer.
 
-Example scenes:
+Example scenes (paths and commands below are illustrative placeholders - adjust
+them to your own system and OS; `text2gif`/`aplay` are just example commands, not
+tools `dak` ships or requires):
 
 ```json
 {
@@ -177,7 +181,7 @@ Example scenes:
       "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
       "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
       "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "1b04": { "type": "text", "params": "/proc/uptime" }
+      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
       "1b01": { "short_press": "~", "long_press": "", "double_click": "", "pressed": "", "released": "" },
@@ -188,7 +192,7 @@ Example scenes:
   "Main": {
     "setup": {
       "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-      "1b04": { "type": "text", "params": "/proc/uptime" }
+      "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
       "timer": { "1": "~" }
@@ -278,69 +282,8 @@ A complete config combining both sections looks like:
 
 ## Device install
 
-1. Find your device and record ID.
-```
-# lsusb
-Bus 003 Device 020: ID 0300:3002 Ajazz HOTSPOTEKUSB HID DEMO
-```
-2. Create UDEV rule to give regular user access to the device
-change GROUP= to some group appropriate to your system which your user is member of.
-
-```
-#cat /etc/udev/rules.d/ajazz_akp03e.conf
-SUBSYSTEM=="usb", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-```     
-```
-sudo chown root:root /etc/udev/rules.d/ajazz_akp03e.conf
-```
-
-Device list is imported from https://github.com/4ndv/opendeck-akp03/
-
-### FreeBSD
-
-FreeBSD needs its `hidraw(4)` driver (Linux-`hidraw`-compatible, FreeBSD 13+), which
-is not enabled by default - `uhid(4)` claims the device instead otherwise, and `dak`
-does not work against `uhid(4)` (see `vendor/README.md` for why). One-time setup:
-
-```
-# Load the hidraw module now, and on every boot:
-kldload hidraw
-echo 'hidraw_load="YES"' | sudo tee -a /boot/loader.conf
-
-# Prefer hidraw over uhid for HID interfaces, now and on every boot:
-sudo sysctl hw.usb.usbhid.enable=1
-echo 'hw.usb.usbhid.enable=1' | sudo tee -a /etc/sysctl.conf
-```
-
-`/dev/hidrawN` nodes default to `0600 root:operator` (root-only, even for group
-members) - add a `devfs.rules(5)` entry granting your user's group read/write
-access, analogous to the udev rule above, e.g.:
-
-```
-# /etc/devfs.rules
-[dakrules=10]
-add path 'hidraw*' mode 0660 group operator
-```
-
-Activate it and add your user to that group:
-
-```
-sudo sysrc devfs_system_ruleset=dakrules
-sudo pw groupmod operator -m yourusername
-```
-
-Then either reboot, or apply immediately without one:
-
-```
-sudo service devfs restart
-sudo usbconfig -d ugenX.Y reset   # replug the device, or reset it like this,
-                                   # so it re-attaches under /dev/hidrawN
-                                   # instead of /dev/uhidN
-```
-(log out and back in too, so your shell picks up the new group membership).
+See [INSTALL.md](INSTALL.md) for one-time device/permissions setup (Linux udev
+rules, FreeBSD hidraw setup).
 
 ## TODO
 
@@ -353,6 +296,24 @@ sudo usbconfig -d ugenX.Y reset   # replug the device, or reset it like this,
   security fix or bugfix upstream doesn't silently sit unnoticed for the FreeBSD
   build - see `vendor/README.md`'s "Updating" section for the manual re-vendoring
   steps such a check would need to prompt for.
+- Support refreshing individual `setup` entries without re-applying the whole
+  scene: today a scene's `timer`/`~` action can only trigger `enter_scene`,
+  which redraws every button and restarts every exec task in the scene
+  (`apply_scene_operations`, `src/actions.rs`) just to refresh one item (e.g.
+  a clock). Add a way to refresh specific buttons on their own interval(s) -
+  a scene currently supports only one timer total - without touching the
+  rest of the scene.
+- Allow assigning multiple actions to a single event. Every event and the
+  scene `timer` currently accept exactly one action string (`Action` enum
+  has no array/chain variant, see `check_actions`/`parse_action` in
+  `src/actions.rs`); the only workaround today is chaining commands inside
+  one shell string. Add first-class support for a list of ordered actions
+  per event.
+- Improve `-d scene` logging: add a single old->new scene-transition line
+  (with cause: key press, timer, or command), timing info for
+  `enter_scene`/`apply_scene_operations`, and gate scene-application
+  skip/no-op warnings behind the `scene` debug subsystem instead of always
+  printing them via `log.warn`.
 
 ## License
 

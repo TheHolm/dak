@@ -20,7 +20,12 @@ Building for Linux never resolves, downloads, or compiles anything in this direc
   other platforms is untouched; the only shared-code change is that the HID report
   descriptor parser (`src/backend/descriptor.rs`) was promoted from a
   Linux-`hidraw`-private module to a crate-shared one, since its byte-parsing logic
-  is not actually OS-specific and the new FreeBSD backend needs it too.
+  is not actually OS-specific and the new FreeBSD backend needs it too. This
+  backend was inspired by [`ocochard/async-hid`](https://github.com/ocochard/async-hid/tree/freebsd)'s
+  own FreeBSD branch (also forked from upstream `sidit77/async-hid`), though the
+  implementation here differs in several respects - notably no `devd(4)`-based
+  enumeration - and was independently investigated/validated against real hardware
+  as described below.
 - `mirajazz-freebsd/`: an unmodified copy of `mirajazz` 0.16.0. Its `.rs` source is
   byte-for-byte identical to the crates.io release (diff it against the registry copy
   to confirm); only its `Cargo.toml` differs, pointing `async-hid` at
