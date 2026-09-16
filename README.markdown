@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.6.0**.
+The current version is **v0.7.0**.
 
 ## Usage
 
@@ -152,13 +152,14 @@ Rules for the program:
 
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
-- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type` and `params`:
+- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and an optional `refresh`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
+  - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
 - `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
@@ -172,7 +173,11 @@ Commands are executed asynchronously, so a running command does not block button
 
 Example scenes (paths and commands below are illustrative placeholders - adjust
 them to your own system and OS; `text2gif`/`aplay` are just example commands, not
-tools `dak` ships or requires):
+tools `dak` ships or requires). `Main`'s clock button (`1b03`) uses `refresh` to
+keep itself updated every second on its own, instead of the whole-scene
+`"timer": {"1": "~"}` trick older configs needed (still shown on `on_start` and
+`Test`, and still the only option for anything a per-button `refresh` cannot
+express, like switching scenes on a schedule):
 
 ```json
 {
@@ -191,12 +196,10 @@ tools `dak` ships or requires):
   },
   "Main": {
     "setup": {
-      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 },
       "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
-    "actions": {
-      "timer": { "1": "~" }
-    }
+    "actions": {}
   },
   "Test": {
     "setup": {
