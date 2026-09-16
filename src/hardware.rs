@@ -9,7 +9,7 @@
 //! `is_present` check to decide whether hardware-gated tests should run at all,
 //! without needing a fourth private copy of the same constants.
 
-use mirajazz::device::{list_devices, DeviceQuery};
+use mirajazz::device::{list_devices, Device, DeviceQuery};
 use mirajazz::error::MirajazzError;
 use mirajazz::types::{HidDevice, ImageFormat, ImageMirroring, ImageMode, ImageRotation};
 
@@ -48,12 +48,34 @@ pub async fn discover() -> Result<Vec<HidDevice>, MirajazzError> {
     Ok(list_devices(&[QUERY]).await?.into_iter().collect())
 }
 
-/// Whether at least one supported device is currently attached.
+/// Whether at least one supported device is currently attached *and actually
+/// connectable* - not merely visible to enumeration.
 ///
-/// Used by hardware-gated tests to decide whether to run or skip themselves.
-/// Treats an enumeration error the same as "not present": callers only need a
-/// yes/no answer to decide whether to attempt anything hardware-related, not
-/// the failure reason (which, if it matters, `discover` itself still reports).
+/// A device can be listed by [`discover`] without being usable: enumeration on Linux
+/// reads device identity purely from `/sys/class/hidraw/` sysfs metadata, which needs
+/// no access to the matching `/dev/hidrawN` node at all - so it can succeed even in a
+/// sandbox that shares the host's `/sys` (kernel-level, hence visible) but does not
+/// expose that specific device node into `/dev` (e.g. a container that was not started
+/// with it explicitly passed through). Actually opening the device is a separate step
+/// that fails in exactly that case (`HidError::NotConnected`). Treating "enumerable" as
+/// "usable" would make every hardware-gated test panic on that connection error instead
+/// of skipping cleanly, defeating the entire point of gating them on this check - so
+/// this attempts a real connect (side-effect-free: [`Device::connect`] only opens the
+/// handle and reads the firmware version, never writes anything) and treats any
+/// failure, whether enumeration or the connect itself, the same as "not present".
 pub async fn is_present() -> bool {
-    matches!(discover().await, Ok(devices) if !devices.is_empty())
+    let Ok(devices) = discover().await else {
+        return false;
+    };
+    let Some(device) = devices.first() else {
+        return false;
+    };
+    Device::connect(
+        device,
+        PROTOCOL_VERSION,
+        DEFAULT_KEY_COUNT,
+        DEFAULT_ENCODER_COUNT,
+    )
+    .await
+    .is_ok()
 }
