@@ -13,16 +13,18 @@ Bus 003 Device 020: ID 0300:3002 Ajazz HOTSPOTEKUSB HID DEMO
 ```
 2. Create UDEV rule to give regular user access to the device
 change GROUP= to some group appropriate to your system which your user is member of.
+The file must be named with a `.rules` suffix - `udevd` silently ignores any
+other extension (e.g. `.conf`) in `/etc/udev/rules.d/`.
 
 ```
-#cat /etc/udev/rules.d/ajazz_akp03e.conf
+#cat /etc/udev/rules.d/ajazz_akp03e.rules
 SUBSYSTEM=="usb", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
 SUBSYSTEM=="usb", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
 ```
 ```
-sudo chown root:root /etc/udev/rules.d/ajazz_akp03e.conf
+sudo chown root:root /etc/udev/rules.d/ajazz_akp03e.rules
 ```
 
 ### FreeBSD
