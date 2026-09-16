@@ -5,6 +5,72 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.7.0 — Per-button setup refresh interval
+
+### User-facing changes
+- A `setup` entry (`image`, `text`, `image_exec` or `text_exec`) can now
+  set an optional `"refresh"` (seconds) to redraw itself on its own
+  schedule, without re-applying the rest of the scene. A clock button no
+  longer needs the whole-scene `"timer": {"1": "~"}` trick to update
+  every second - see the updated example in README.markdown and
+  `config.json.example`. The refresh keeps running across a scene switch
+  that doesn't redefine that button, just like its content already does;
+  a later scene that does redefine the button replaces both. `refresh`
+  is not allowed on `clear` or `launch` (nothing to redraw there) and
+  defaults to `0` (never), so every existing config keeps working
+  unchanged.
+
+### Details
+Version bump
+- Cargo.toml, README version badge and AGENTS.md now declare 0.7.0.
+
+Add per-button setup refresh interval (closes the second TODO item:
+"Support refreshing individual setup entries without re-applying the
+whole scene")
+- Schema (`src/actions.rs`, `check_button_op`): `"refresh"` is optional
+  on `image`/`text`/`image_exec`/`text_exec` entries; `0` or absent means
+  "apply once on scene entry, never again" (today's behavior,
+  unchanged). A nonzero `refresh` on `"clear"` or `"launch"` is a config
+  error.
+- Data model (`SceneOp`): `SetImage`/`Text`/`TextExec`/`ImageExec` each
+  gained a `refresh_seconds` field (`SceneOp` now derives `Clone`);
+  `scene_operations()` reads the field with the same config-load-time-
+  only validation split every other setup field already has.
+- Runtime (`SceneRunner`): refresh is tied to a button's currently
+  active setup entry, not to whichever scene happens to be current - so
+  it survives a scene switch that doesn't redefine the button, exactly
+  like action inheritance already works. `apply_scene_operations`'s per-
+  operation body was refactored into a shared `apply_one_operation`,
+  used by both the existing batch path and a new `refresh_button(key)`,
+  so a refresh tick reuses the exact same validity checks, drawing
+  logic, and generation-based exec cancellation as a normal scene
+  application - just for one button instead of a whole scene, followed
+  by its own flush. Two new per-runner maps track this: `active_setup`
+  (the operation currently in effect per button, so a tick knows what to
+  redraw) and `refresh_handles` (the pending next-tick task per button,
+  aborted and replaced every time that button is explicitly
+  re-applied). Scheduling mirrors the existing scene-level timer's
+  one-shot-respawn style (`arm_scene_timer`/`rearm_scene_timer` in
+  `main.rs`) rather than a repeating `tokio::interval`: each tick, once
+  handled, reschedules the next one itself as a side effect of re-
+  running `apply_one_operation`.
+- `main.rs`: a new `refresh_tx`/`refresh_rx` channel is wired into
+  `run_device`'s `tokio::select!` loop alongside the existing
+  exec/click/timer channels.
+- Tests (+22): validation (accepted on the 4 redrawable types, rejected
+  on clear/launch, rejected non-numbers, absent defaults to 0);
+  `scene_operations` (field threading into the built operations); four
+  new `SceneRunner`-level tests using real short sleeps (matching the
+  existing 1s-sleep precedent in `main.rs`'s own timer tests): no tick
+  when absent, redraw-after-interval, survival across a scene switch
+  that doesn't redefine the button, and cancellation on redefinition.
+- Docs: README.markdown documents the new field, including the exec-
+  restart caveat (a tick restarts `image_exec`/`text_exec` the same way
+  reassignment does); both README.markdown's and `config.json.example`'s
+  `Main` scene now use `refresh` on the clock button instead of the old
+  whole-scene `"timer": {"1": "~"}` trick, demonstrating the feature's
+  motivating use case directly.
+
 ## v0.6.0 — FreeBSD support via vendored async-hid/mirajazz forks
 
 ### User-facing changes
