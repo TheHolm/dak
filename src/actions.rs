@@ -20,6 +20,11 @@ use std::os::unix::process::CommandExt as _;
 /// Parsed and validated config plus any non-fatal warnings collected while validating it.
 #[derive(Debug)]
 pub struct LoadedConfig {
+    /// The optional top-level `version` string, defaulting to [`DEFAULT_CONFIG_VERSION`]
+    /// when absent. Not currently interpreted (no version-specific parsing exists yet) -
+    /// just carried through and printed on startup, so future config schema changes have
+    /// somewhere to record which shape a file was written for.
+    pub version: String,
     /// The validated `scenes` section: a dictionary whose keys are scene names.
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
@@ -29,6 +34,9 @@ pub struct LoadedConfig {
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
+
+/// The config `version` assumed when the top-level `version` key is absent.
+pub const DEFAULT_CONFIG_VERSION: &str = "1.0";
 
 /// Device definitions from the config `devices` section, keyed by logical device id.
 ///
@@ -197,9 +205,9 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes" && key != "devices" && key != "defaults" {
+        if key != "scenes" && key != "devices" && key != "defaults" && key != "version" {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\" and \"defaults\""
+                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\" and \"version\""
             ));
         }
     }
@@ -216,6 +224,20 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         return Err(errors);
     }
 
+    let version = match map.get("version") {
+        Some(value) => match value.as_str() {
+            Some(version) => version.to_string(),
+            None => {
+                errors.push(format!(
+                    "top-level \"version\" must be a string, got {}",
+                    value_type(value)
+                ));
+                DEFAULT_CONFIG_VERSION.to_string()
+            }
+        },
+        None => DEFAULT_CONFIG_VERSION.to_string(),
+    };
+
     let scenes = map.get("scenes").expect("checked above");
     check_scenes(scenes, &mut warnings, &mut errors);
     let devices = map.get("devices").expect("checked above");
@@ -229,6 +251,7 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         return Err(errors);
     }
     Ok(LoadedConfig {
+        version,
         scenes: scenes.clone(),
         devices: ConfiguredDevices { by_id },
         defaults,
@@ -581,19 +604,15 @@ fn check_actions(
             }
         };
 
+        if events.is_empty() {
+            warnings.push(format!(
+                "scene \"{scene_name}\": actions.\"{key}\" defines no events; the entry has no effect"
+            ));
+        }
+
         for (event, value) in events {
             let path = format!("actions.\"{key}\".{event}");
-            let value = match value.as_str() {
-                Some(value) => value,
-                None => {
-                    errors.push(format!(
-                        "scene \"{scene_name}\": {path} must be a string, got {}",
-                        value_type(value)
-                    ));
-                    continue;
-                }
-            };
-            check_action_value(scenes, scene_name, &path, value, errors, warnings);
+            check_action_values(scenes, scene_name, &path, value, errors, warnings);
         }
     }
 }
@@ -630,12 +649,58 @@ fn check_timer(
             "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
         ));
     }
+    check_action_values(scenes, scene_name, "actions.timer", value, errors, warnings);
+}
+
+/// Validates an action value: either a single string (see [`check_action_value`]) or an
+/// array of them, run without waiting on each other. An array may contain at most one
+/// scene-changing action (`~` or `@scene`, checked here); every other array element is
+/// validated as a command exactly like the single-string form. `[]` is the sole way to
+/// spell "bound but no action" for the array form (matching `""` for the string form);
+/// an empty string *inside* a non-empty array is rejected instead of silently ignored.
+fn check_action_values(
+    scenes: &Value,
+    scene_name: &str,
+    path: &str,
+    value: &Value,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
     if let Some(value) = value.as_str() {
-        check_action_value(scenes, scene_name, "actions.timer", value, errors, warnings);
-    } else {
+        check_action_value(scenes, scene_name, path, value, errors, warnings);
+        return;
+    }
+    let Some(items) = value.as_array() else {
         errors.push(format!(
-            "scene \"{scene_name}\": actions.timer value must be a string, got {}",
+            "scene \"{scene_name}\": {path} must be a string or an array of strings, got {}",
             value_type(value)
+        ));
+        return;
+    };
+
+    let mut scene_changing = 0;
+    for (index, item) in items.iter().enumerate() {
+        let Some(item) = item.as_str() else {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path}[{index}] must be a string, got {}",
+                value_type(item)
+            ));
+            continue;
+        };
+        if item.is_empty() {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path}[{index}] must not be empty; use an empty array for no action"
+            ));
+            continue;
+        }
+        if item == "~" || item.starts_with('@') {
+            scene_changing += 1;
+        }
+        check_action_value(scenes, scene_name, path, item, errors, warnings);
+    }
+    if scene_changing > 1 {
+        errors.push(format!(
+            "scene \"{scene_name}\": {path} has {scene_changing} scene-changing actions (~ or @scene); at most one is allowed per event"
         ));
     }
 }
@@ -1778,19 +1843,45 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
-/// Resolves the action bound to `event` (e.g. `"pressed"` or `"released"`) on `reference`,
-/// falling back to the previously active scene.
+/// Reads an action value - a single string or an array of them, per [`check_action_values`]
+/// - into an ordered list of action strings, run without waiting on each other.
+///
+/// Anything that isn't a non-empty string is filtered out (an absent, malformed, or
+/// explicitly empty value all yield an empty list) - every case means "nothing to run"
+/// to callers, which already treat all of them identically, so there is no need to tell
+/// them apart here.
+fn action_values(value: &Value) -> Vec<&str> {
+    if let Some(value) = value.as_str() {
+        if value.is_empty() {
+            Vec::new()
+        } else {
+            vec![value]
+        }
+    } else if let Some(items) = value.as_array() {
+        items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .filter(|item| !item.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Resolves the actions bound to `event` (e.g. `"pressed"` or `"released"`) on
+/// `reference`, falling back to the previously active scene.
 ///
 /// Button actions are inherited from the previous scene: `scene_name` is consulted first,
 /// then `previous_scene`. A scene that explicitly configures the reference ends the search —
-/// its non-empty value for `event` wins, an empty value means "bound but no action".
+/// its value for `event` wins (an empty string or an empty array both mean "bound but no
+/// action", yielding an empty list, indistinguishable here from "not bound at all").
 pub fn action_for_event<'a>(
     scene_name: &str,
     previous_scene: Option<&str>,
     reference: &Reference,
     event: &str,
     scenes: &'a Value,
-) -> Option<&'a str> {
+) -> Vec<&'a str> {
     for name in std::iter::once(scene_name).chain(previous_scene) {
         let Some(scene) = scenes.get(name) else {
             continue;
@@ -1806,23 +1897,24 @@ pub fn action_for_event<'a>(
         };
         return key_actions
             .get(event)
-            .and_then(|value| value.as_str())
-            .filter(|action| !action.is_empty());
+            .map(action_values)
+            .unwrap_or_default();
     }
-    None
+    Vec::new()
 }
 
-/// Reads the timer action for a scene, returning `(seconds, action_value)` if defined.
+/// Reads the timer actions for a scene, returning `(seconds, action_values)` if defined.
 ///
-/// The timer entry in `actions` is a single-entry object `{ "<seconds>": "<action>" }`.
+/// The timer entry in `actions` is a single-entry object `{ "<seconds>": "<action>" }`,
+/// whose value may be a single string or an array of them, exactly like an event's.
 /// Returns `None` if the scene has no timer.
-pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, &'a str)> {
+pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, Vec<&'a str>)> {
     let scene = scenes.get(scene_name)?.as_object()?;
     let actions = scene.get("actions")?.as_object()?;
     let timer = actions.get("timer")?.as_object()?;
     let (seconds_str, action) = timer.iter().next()?;
     let seconds = seconds_str.parse::<u64>().ok()?;
-    Some((seconds, action.as_str()?))
+    Some((seconds, action_values(action)))
 }
 
 #[cfg(test)]

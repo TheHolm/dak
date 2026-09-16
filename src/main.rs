@@ -92,6 +92,11 @@ async fn main() -> Result<(), MirajazzError> {
     log.info(format!("Using config: {}", config_path.display()));
     let config = match actions::load_config_from_path(&config_path.to_string_lossy()) {
         Ok(config) => {
+            log.info(format!(
+                "Loaded config version {} from {}",
+                config.version,
+                config_path.display()
+            ));
             for warning in &config.warnings {
                 log.warn(warning);
             }
@@ -310,7 +315,7 @@ async fn run_device(
 
     // Timer events are delivered through a channel so the input loop can react to
     // them without blocking on the device reader.
-    let (timer_tx, mut timer_rx) = mpsc::channel::<String>(1);
+    let (timer_tx, mut timer_rx) = mpsc::channel::<Vec<String>>(1);
     let mut timer_handle = arm_scene_timer(&current_scene, &scenes, &timer_tx, log).await;
 
     // Actions are inherited from the previously active scene (see `action_for_event`),
@@ -430,20 +435,21 @@ async fn run_device(
                 }
             }
             action = timer_rx.recv() => {
-                let Some(action) = action else {
+                let Some(actions) = action else {
                     break;
                 };
                 log.debug(
                     Subsystem::Actions,
-                    format!("timer for scene \"{current_scene}\" -> \"{action}\""),
+                    format!("timer for scene \"{current_scene}\" -> {actions:?}"),
                 );
-                run_action(
+                let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+                run_actions(
                     log,
                     &mut runner,
                     &mut current_scene,
                     &mut previous_scene,
                     &scenes,
-                    &action,
+                    &actions,
                     &mut timer_handle,
                     &timer_tx,
                 )
@@ -530,11 +536,11 @@ struct PendingShortPress {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// Resolves the action `reference` has bound to `event` (e.g. `pressed`,
-/// `released` or `turn_cw`) and runs it, logging the dispatch. Unbound
-/// references simply do nothing.
+/// Resolves the actions `reference` has bound to `event` (e.g. `pressed`,
+/// `released` or `turn_cw`) and runs them in order. Unbound references
+/// simply do nothing.
 ///
-/// The action is looked up in the current scene first, then in the previously active
+/// The actions are looked up in the current scene first, then in the previously active
 /// scene (see `actions::action_for_event`), so pushed buttons keep their released
 /// behavior after a scene switch.
 ///
@@ -550,30 +556,31 @@ async fn run_bound_action<D: actions::ButtonDevice>(
     reference: &Reference,
     event: &str,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
-    timer_tx: &mpsc::Sender<String>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
 ) {
-    let Some(action) = actions::action_for_event(
+    let actions = actions::action_for_event(
         current_scene,
         previous_scene.as_deref(),
         reference,
         event,
         scenes,
-    ) else {
+    );
+    if actions.is_empty() {
         return;
-    };
+    }
 
     log.debug(
         Subsystem::Actions,
-        format!("{reference} {event} -> \"{action}\""),
+        format!("{reference} {event} -> {actions:?}"),
     );
 
-    run_action(
+    run_actions(
         log,
         runner,
         current_scene,
         previous_scene,
         scenes,
-        action,
+        &actions,
         timer_handle,
         timer_tx,
     )
@@ -606,7 +613,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
     pending_shorts: &mut HashMap<Reference, PendingShortPress>,
     defaults: PressDefaults,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
-    timer_tx: &mpsc::Sender<String>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
 ) {
     if pressed && !down_controls.contains(reference) {
         down_controls.insert(*reference);
@@ -728,7 +735,7 @@ async fn run_action<D: actions::ButtonDevice>(
     scenes: &Value,
     action_value: &str,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
-    timer_tx: &mpsc::Sender<String>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
 ) {
     match actions::parse_action(action_value) {
         Action::Stay => {
@@ -781,27 +788,62 @@ async fn run_action<D: actions::ButtonDevice>(
     }
 }
 
+/// Runs each action in `actions`, in order, exactly like calling [`run_action`] once per
+/// entry. Shared by [`run_bound_action`] (a resolved event's actions) and the timer
+/// branch of `run_device`'s select loop (a fired timer's actions) - the only two places
+/// an action value ever resolves to more than one action to run.
+///
+/// Commands run without waiting on each other (each is spawned onto its own task by
+/// `run_action` and never awaited inline); at most one entry may be a scene-changing
+/// action (`~`/`@scene`), enforced at config-load time, so there is never a second
+/// `enter_scene` call competing with this loop's own scene-mutating state.
+#[allow(clippy::too_many_arguments)]
+async fn run_actions<D: actions::ButtonDevice>(
+    log: Log,
+    runner: &mut actions::SceneRunner<'_, D>,
+    current_scene: &mut String,
+    previous_scene: &mut Option<String>,
+    scenes: &Value,
+    actions: &[&str],
+    timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
+) {
+    for action in actions {
+        run_action(
+            log,
+            runner,
+            current_scene,
+            previous_scene,
+            scenes,
+            action,
+            timer_handle,
+            timer_tx,
+        )
+        .await;
+    }
+}
+
 /// Starts (or restarts) the current scene's timer, aborting any previous one.
 ///
 /// The timer read from the scene's `actions.timer` fires after its number of seconds
-/// and delivers its action value through `timer_tx`. Returns the new task handle.
+/// and delivers its action values through `timer_tx`. Returns the new task handle.
 async fn arm_scene_timer(
     scene_name: &str,
     scenes: &Value,
-    timer_tx: &mpsc::Sender<String>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
 ) -> Option<tokio::task::JoinHandle<()>> {
     match actions::timer_for_scene(scene_name, scenes) {
-        Some((seconds, action)) => {
+        Some((seconds, actions)) => {
             log.debug(
                 Subsystem::Scene,
-                format!("armed timer for scene \"{scene_name}\": {seconds}s -> \"{action}\""),
+                format!("armed timer for scene \"{scene_name}\": {seconds}s -> {actions:?}"),
             );
             let tx = timer_tx.clone();
-            let action = action.to_string();
+            let actions: Vec<String> = actions.into_iter().map(str::to_string).collect();
             Some(tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(seconds)).await;
-                let _ = tx.send(action).await;
+                let _ = tx.send(actions).await;
             }))
         }
         None => None,
@@ -813,7 +855,7 @@ async fn rearm_scene_timer(
     scene_name: &str,
     scenes: &Value,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
-    timer_tx: &mpsc::Sender<String>,
+    timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
 ) {
     if let Some(handle) = timer_handle.take() {
@@ -963,7 +1005,7 @@ mod tests {
         click_rx: mpsc::Receiver<(Reference, ClickEvent)>,
         pending_shorts: HashMap<Reference, super::PendingShortPress>,
         timer_handle: Option<tokio::task::JoinHandle<()>>,
-        timer_tx: mpsc::Sender<String>,
+        timer_tx: mpsc::Sender<Vec<String>>,
         defaults: PressDefaults,
     }
 
@@ -1245,7 +1287,7 @@ mod tests {
             .await
             .expect("scene has a timer");
         handle.await.unwrap();
-        assert_eq!(rx.recv().await, Some("@Main".to_string()));
+        assert_eq!(rx.recv().await, Some(vec!["@Main".to_string()]));
     }
 
     /// Re-arming for a scene without a timer aborts the running timer and clears the
@@ -1576,6 +1618,51 @@ mod tests {
         )
         .await;
         assert_eq!(current_scene, "Test", "an unbound reference must not act");
+    }
+
+    /// A list of actions runs every entry in order; a slow command in the list does not
+    /// block the scene-changing action that follows it. `Action::Command` spawns and
+    /// never awaits its own completion, so looping over a list (see `run_actions`) is
+    /// exactly as non-blocking as a single `run_action` call already is - "run without
+    /// waiting on each other" falls out of that for free, since validation caps a list
+    /// to at most one scene-changing entry, so there is never a second synchronous
+    /// `enter_scene` competing with this loop's own state mutation.
+    #[tokio::test]
+    async fn run_bound_action_runs_a_list_without_waiting_on_a_slow_command() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1b01": { "pressed": ["sleep 5", "@Test"] } } },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(PressDefaults::default());
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            super::run_bound_action(
+                Log::default(),
+                &mut runner,
+                &mut current_scene,
+                &mut previous_scene,
+                &scenes,
+                &Reference::button(1, 1),
+                "pressed",
+                &mut state.timer_handle,
+                &state.timer_tx,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_bound_action should not block on the slow command"
+        );
+        assert_eq!(
+            current_scene, "Test",
+            "the scene-changing action must still run"
+        );
     }
 
     /// `run_bound_action` dispatches the encoder turn events (`turn_cw` / `turn_ccw`)

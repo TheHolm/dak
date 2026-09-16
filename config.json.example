@@ -1,4 +1,9 @@
 {
+  "version": "1.0",
+  "defaults": {
+    "short_press_duration": 300,
+    "double_click_gap": 300
+  },
   "scenes": {
     "on_start": {
       "setup": {
@@ -26,16 +31,11 @@
         "1b03": { "type": "clear" }
       },
       "actions": {
-        "1b01": { "short_press": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "long_press": "", "double_click": "", "pressed": "", "released": "" },
-        "1b03": { "short_press": "@on_start", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "1e01": { "turn_cw": "~", "turn_ccw": "@Test", "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
         "timer": { "1": "~" }
       }
     }
-  },
-  "defaults": {
-    "short_press_duration": 300,
-    "double_click_gap": 300
   },
   "devices": {
     "1": {
