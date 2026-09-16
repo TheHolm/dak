@@ -2,3 +2,7 @@ target/
 Cargo.lock
 .bash_history
 config.json
+# Local cross-compile linker config (see NOTES.md) - hardcodes a machine-specific
+# sysroot path, so it must not be committed as-is.
+.cargo/
+

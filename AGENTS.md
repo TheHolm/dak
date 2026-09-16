@@ -25,6 +25,7 @@ Generic Linux and FreeBSD. No effort is made (to be made) to make the code compi
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — udev rules and docker build/run commands
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
+- `NOTES.md` — agent-to-agent knowledge base for cross-compiling/packaging/testing `dak` for FreeBSD from Linux (sysroot setup, building a `.pkg`, jail-based dependency testing). Read it before touching CI or cross-compilation; keep it updated as you learn more, don't let it go stale.
 
 ## Device notes
 
