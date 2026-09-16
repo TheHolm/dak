@@ -303,33 +303,32 @@ rules, FreeBSD hidraw setup).
 
 ## TODO
 
-- The FreeBSD build vendors its own copies of `mirajazz` and `async-hid` under
-  `vendor/` (see `vendor/README.md` for why), pinned to specific upstream versions
-  (`mirajazz` 0.16.0, `async-hid` 0.5.3) rather than tracking crates.io like every
-  other platform's dependencies do. Nothing currently checks whether newer upstream
-  releases of either crate exist. Add a CI job that periodically checks
-  crates.io for newer `mirajazz`/`async-hid` versions than the ones vendored, so a
-  security fix or bugfix upstream doesn't silently sit unnoticed for the FreeBSD
-  build - see `vendor/README.md`'s "Updating" section for the manual re-vendoring
-  steps such a check would need to prompt for.
-- Support refreshing individual `setup` entries without re-applying the whole
-  scene: today a scene's `timer`/`~` action can only trigger `enter_scene`,
-  which redraws every button and restarts every exec task in the scene
-  (`apply_scene_operations`, `src/actions.rs`) just to refresh one item (e.g.
-  a clock). Add a way to refresh specific buttons on their own interval(s) -
-  a scene currently supports only one timer total - without touching the
-  rest of the scene.
-- Allow assigning multiple actions to a single event. Every event and the
-  scene `timer` currently accept exactly one action string (`Action` enum
-  has no array/chain variant, see `check_actions`/`parse_action` in
-  `src/actions.rs`); the only workaround today is chaining commands inside
-  one shell string. Add first-class support for a list of ordered actions
-  per event.
-- Improve `-d scene` logging: add a single old->new scene-transition line
-  (with cause: key press, timer, or command), timing info for
-  `enter_scene`/`apply_scene_operations`, and gate scene-application
-  skip/no-op warnings behind the `scene` debug subsystem instead of always
-  printing them via `log.warn`.
+1. The FreeBSD build vendors its own copies of `mirajazz` and `async-hid` under
+   `vendor/` (see `vendor/README.md` for why), pinned to specific upstream versions
+   (`mirajazz` 0.16.0, `async-hid` 0.5.3) rather than tracking crates.io like every
+   other platform's dependencies do. Nothing currently checks whether newer upstream
+   releases of either crate exist. Add a CI job that periodically checks
+   crates.io for newer `mirajazz`/`async-hid` versions than the ones vendored, so a
+   security fix or bugfix upstream doesn't silently sit unnoticed for the FreeBSD
+   build - see `vendor/README.md`'s "Updating" section for the manual re-vendoring
+   steps such a check would need to prompt for.
+2. Improve `-d scene` logging: add a single old->new scene-transition line
+   (with cause: key press, timer, or command), timing info for
+   `enter_scene`/`apply_scene_operations`, and gate scene-application
+   skip/no-op warnings behind the `scene` debug subsystem instead of always
+   printing them via `log.warn`.
+3. Variables: some way to pass data into actions. An external program could set a
+   variable, which is then usable as a parameter (or part of one) in a later action -
+   e.g. a `text_exec` capturing a value that a subsequent command's params
+   interpolates. Needs a way to set a variable (a new action/setup type? a control
+   command dak listens for?) and a substitution syntax for using one in `params`/an
+   action value.
+4. A built-in Lua (or similar) scripting language for advanced control - may be a bad
+   idea: it's a much bigger surface (a whole embedded interpreter, its own error
+   handling, a new config/script relationship to design) than anything else on this
+   list, and might be better served by composing existing primitives (commands,
+   variables once they exist, multiple actions per event) instead of adding a second
+   configuration language alongside JSON.
 
 ## License
 
