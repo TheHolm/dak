@@ -35,6 +35,11 @@ under other platforms.
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
   (`device`/`scene`/`action`) by `-d`/`--debug`
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
+- `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
+  key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,
+  used by `tests/hardware.rs` to detect and drive real hardware; `main.rs` and
+  `map.rs` keep their own private copies of the same constants for their own
+  connection setup rather than depending on this module
 - `src/lib.rs` — library crate exposing config loading/validation and the scene
   runner so both the binary and the integration tests can drive it
 - `config.json` — the user's own runtime config (gitignored, not checked in):
@@ -60,13 +65,19 @@ under other platforms.
 Work in progress. Current known issues:
 
 - `main.rs` config errors are printed, but the program still exits with `MirajazzError::BadData` regardless of the specific failure
-- `main.rs` device/input code has no test coverage (requires physical hardware)
+- `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's
+  interactive I/O still have no test coverage (both need a physical device *and*
+  driving actual button presses/encoder turns/typed answers, which `tests/hardware.rs`
+  deliberately doesn't attempt). `tests/hardware.rs` does cover, against real
+  hardware when attached (skipping itself otherwise): enumeration, connect/identify/
+  shutdown, `set_brightness`, the `set_button_image`/`flush`/`clear_button_image`
+  image path, and opening the raw input reader without erroring
 
 ## Commands
 
 - Build/check: `cargo build`
 - Run: `cargo run` (requires the USB device and udev rules from README)
-- Tests: `cargo test` (integration tests in `tests/` split by topic — validation, scene_operations, action_types — extracting shared helpers into `tests/common/`, plus unit tests for private helpers)
+- Tests: `cargo test` (integration tests in `tests/` split by topic — validation, scene_operations, action_types — extracting shared helpers into `tests/common/`, plus unit tests for private helpers; `tests/hardware.rs` needs a real Ajazz device and skips itself when none is attached, so `cargo test` always succeeds either way)
 
 ## Conventions
 
