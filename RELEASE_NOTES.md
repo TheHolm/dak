@@ -5,6 +5,88 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.8.0 — Multi-action lists and a top-level config version key
+
+### User-facing changes
+- Any action value (`short_press`, `long_press`, `double_click`,
+  `pressed`, `released`, `turn_cw`, `turn_ccw`, and the scene `timer`)
+  can now be either a single string, as before, or an array of them, to
+  trigger more than one action from a single event - e.g.
+  `"short_press": ["/usr/bin/notify-send hi", "@Main"]`. Every entry
+  runs without waiting on the others to finish; an array may contain at
+  most one scene-changing entry (`~` or `@scene`), enforced when the
+  config loads. `[]` is the array form's way to spell "bound but no
+  action" (matching `""` for the plain-string form). A control listed
+  in `actions` with no events at all (e.g. `"1b01": {}`) is now warned
+  about, though it is not an error. Every existing config keeps working
+  unchanged - the plain-string form was not removed.
+- The config gains an optional top-level `"version"` string, defaulting
+  to `"1.0"` when absent and printed on startup
+  (`Loaded config version X from /path/to/config.json`). Not currently
+  interpreted; it exists so future schema changes have somewhere to
+  record which shape a file was written for.
+
+### Details
+Multi-action lists (both string and array forms accepted, per the
+smaller-blast-radius design: a `oneOf [string, array-of-string]` union
+is exactly as rigid/validatable as a single type, and this way every
+existing config, README example, and the large majority of test
+fixtures keep working untouched)
+- `src/actions.rs`: new `check_action_values` validates either a single
+  string (unchanged, via the existing `check_action_value`) or an array
+  of non-empty strings - rejecting non-string/empty elements with their
+  index, and rejecting more than one scene-changing entry (`~` or
+  `@scene`) per array, enforced at config-load time so the runtime
+  never has to guard against two competing scene transitions in one
+  list. New warning when a per-reference `actions` object has zero
+  event keys at all (e.g. `"1b01": {}`) - almost certainly a mistake,
+  but not an error.
+- `action_for_event`'s return type simplifies from `Option<&str>` to a
+  plain `Vec<&str>`: an absent binding and an explicit empty value
+  (`[]` or `""`) already behaved identically to every caller (do
+  nothing), so collapsing them removes a distinction nothing used
+  rather than adding one. `timer_for_scene` mirrors this with
+  `Option<(u64, Vec<&str>)>`.
+- `main.rs`: new `run_actions` helper loops a resolved list through the
+  existing single-action `run_action`, shared by `run_bound_action` and
+  the timer branch of `run_device`'s select loop (the only two places
+  an action value ever resolves to more than one action). The timer
+  channel's item type changed from `String` to `Vec<String>` to carry
+  a fired timer's whole action list through.
+- Verified actions run without waiting on each other: a new test
+  proves a list with a slow command (`sleep 5`) followed by a scene
+  switch completes in well under 500ms via `tokio::time::timeout` - the
+  slow command's own `Action::Command` handling already spawns and
+  never awaits completion, and validation caps a list to at most one
+  scene-changing entry, so there is never a competing synchronous
+  `enter_scene` call to serialize against.
+
+Top-level config version key
+- New optional `"version"` string (default `"1.0"` when absent),
+  validated in `validate()` and carried through in `LoadedConfig`. Not
+  currently interpreted - just printed on startup so future schema
+  changes have somewhere to record which shape a file was written for.
+- `config.json.example` and the real local `config.json` both gained
+  `"version": "1.0"` and were reordered to version, defaults (where
+  present), scenes, devices.
+
+Tests (+30 net): validation (array acceptance, non-string/empty
+element rejection with index, multi-scene-change rejection, empty-
+object warning, version accept/default/reject), updates to every
+existing `tests/action_types.rs` test for the `Vec<&str>` signature
+change, and the new non-blocking multi-action dispatch test in
+`main.rs`.
+
+Docs: README documents the array form (now "four forms") and the
+version key; the `Test` scene's example now demonstrates one
+`short_press` both playing a sound and switching scenes in a single
+list (replacing what previously needed two separate buttons) - applied
+consistently to `README.markdown`, `config.json.example`, and the real
+local `config.json`.
+
+Verified: `cargo build --release` is clean, and the full test suite
+(301 tests) passes identically in both debug and release profiles.
+
 ## v0.7.0 — Per-button setup refresh interval
 
 ### User-facing changes
