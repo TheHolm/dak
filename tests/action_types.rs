@@ -55,7 +55,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        Some("~")
+        vec!["~"]
     );
     assert_eq!(
         action_for_event(
@@ -65,7 +65,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     assert_eq!(
         action_for_event(
@@ -75,7 +75,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        Some("/usr/bin/date +%H:%M")
+        vec!["/usr/bin/date +%H:%M"]
     );
     assert_eq!(
         action_for_event(
@@ -85,7 +85,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
     assert_eq!(
         action_for_event(
@@ -95,7 +95,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -130,7 +130,7 @@ fn action_for_event_inherits_from_previous_scene() {
             "pressed",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     // Without a previous scene the same lookup finds nothing.
     assert_eq!(
@@ -141,7 +141,7 @@ fn action_for_event_inherits_from_previous_scene() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -172,7 +172,7 @@ fn action_for_event_inherits_when_scene_has_no_actions() {
             "pressed",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     assert_eq!(
         action_for_event(
@@ -182,7 +182,7 @@ fn action_for_event_inherits_when_scene_has_no_actions() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -218,7 +218,7 @@ fn action_for_event_explicit_binding_overrides_inheritance() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
     assert_eq!(
         action_for_event(
@@ -228,7 +228,7 @@ fn action_for_event_explicit_binding_overrides_inheritance() {
             "pressed",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -260,7 +260,7 @@ fn action_for_event_reads_released_action() {
             "released",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     // A pressed binding does not leak into the released lookup.
     assert_eq!(
@@ -271,7 +271,7 @@ fn action_for_event_reads_released_action() {
             "pressed",
             &config.scenes
         ),
-        Some("~")
+        vec!["~"]
     );
     assert_eq!(
         action_for_event(
@@ -281,7 +281,7 @@ fn action_for_event_reads_released_action() {
             "released",
             &config.scenes
         ),
-        Some("/usr/bin/date +%H:%M")
+        vec!["/usr/bin/date +%H:%M"]
     );
     // No released binding at all.
     assert_eq!(
@@ -292,7 +292,7 @@ fn action_for_event_reads_released_action() {
             "released",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -325,7 +325,7 @@ fn action_for_event_released_inherits_from_previous_scene() {
             "released",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     // Without a previous scene the same lookup finds nothing.
     assert_eq!(
@@ -336,7 +336,7 @@ fn action_for_event_released_inherits_from_previous_scene() {
             "released",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -372,7 +372,7 @@ fn action_for_event_empty_released_binding_suppresses_inheritance() {
             "released",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -398,9 +398,12 @@ fn timer_for_scene_returns_seconds_and_action() {
 
     assert_eq!(
         timer_for_scene("on_start", &config.scenes),
-        Some((5, "@Main"))
+        Some((5, vec!["@Main"]))
     );
-    assert_eq!(timer_for_scene("Main", &config.scenes), Some((1, "~")));
+    assert_eq!(
+        timer_for_scene("Main", &config.scenes),
+        Some((1, vec!["~"]))
+    );
 }
 
 /// `timer_for_scene` returns None when the scene has no timer.
@@ -468,7 +471,7 @@ fn action_for_event_reads_encoder_turn_actions() {
             "turn_cw",
             &config.scenes
         ),
-        Some("~")
+        vec!["~"]
     );
     assert_eq!(
         action_for_event(
@@ -478,7 +481,7 @@ fn action_for_event_reads_encoder_turn_actions() {
             "turn_ccw",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     // Unbound twist events resolve to nothing.
     assert_eq!(
@@ -489,7 +492,7 @@ fn action_for_event_reads_encoder_turn_actions() {
             "turn_cw",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
     // Twist actions never leak from a button's press binding.
     assert_eq!(
@@ -500,7 +503,7 @@ fn action_for_event_reads_encoder_turn_actions() {
             "turn_cw",
             &config.scenes
         ),
-        None
+        Vec::<&str>::new()
     );
 }
 
@@ -532,7 +535,7 @@ fn action_for_event_reads_encoder_push_actions() {
             "pressed",
             &config.scenes
         ),
-        Some("~")
+        vec!["~"]
     );
     assert_eq!(
         action_for_event(
@@ -542,7 +545,7 @@ fn action_for_event_reads_encoder_push_actions() {
             "released",
             &config.scenes
         ),
-        Some("@Test")
+        vec!["@Test"]
     );
     assert_eq!(
         action_for_event(
@@ -552,6 +555,6 @@ fn action_for_event_reads_encoder_push_actions() {
             "short_press",
             &config.scenes
         ),
-        Some("/usr/bin/aplay beep.wav")
+        vec!["/usr/bin/aplay beep.wav"]
     );
 }

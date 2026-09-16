@@ -137,6 +137,39 @@ fn rejects_unknown_top_level_key() {
     );
 }
 
+/// A missing top-level "version" defaults to "1.0".
+#[test]
+fn version_defaults_to_1_0_when_absent() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let config = config.expect("config without a version should still load");
+    assert_eq!(config.version, "1.0");
+}
+
+/// An explicit top-level "version" is carried through as given.
+#[test]
+fn version_is_read_when_present() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "2.3"}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let config = config.expect("a version string should be accepted");
+    assert_eq!(config.version, "2.3");
+}
+
+/// A non-string top-level "version" is rejected with its type name in the message.
+#[test]
+fn rejects_non_string_version() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": 2}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("top-level \"version\" must be a string, got a number"),
+        "{errors}"
+    );
+}
+
 /// A `defaults` section is optional; when absent the built-in press timings apply.
 #[test]
 fn absent_defaults_uses_builtin_durations() {
@@ -646,12 +679,12 @@ fn rejects_key_action_not_an_object() {
     );
 }
 
-/// Action values must be strings.
+/// Action values must be a string or an array of strings.
 #[test]
-fn rejects_event_value_not_a_string() {
+fn rejects_event_value_not_a_string_or_array() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"1b01": {"pressed": 42}}}}"#,
-        "actions.\"1b01\".pressed must be a string",
+        "actions.\"1b01\".pressed must be a string or an array of strings",
     );
 }
 
@@ -660,7 +693,7 @@ fn rejects_event_value_not_a_string() {
 fn rejects_event_value_null() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"1b01": {"pressed": null}}}}"#,
-        "pressed must be a string, got null",
+        "pressed must be a string or an array of strings, got null",
     );
 }
 
@@ -669,16 +702,74 @@ fn rejects_event_value_null() {
 fn rejects_event_value_bool() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"1b01": {"pressed": true}}}}"#,
-        "pressed must be a string, got bool",
+        "pressed must be a string or an array of strings, got bool",
     );
 }
 
-/// An array action value is rejected with its type name in the message.
+/// An array action value is now accepted; a non-string element inside it is rejected
+/// with its index and type name in the message.
 #[test]
-fn rejects_event_value_array() {
+fn rejects_array_element_not_a_string() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"1b01": {"pressed": [1]}}}}"#,
-        "pressed must be a string, got an array",
+        "pressed[0] must be a string, got a number",
+    );
+}
+
+/// An empty string inside a non-empty array is rejected: `[]` is the only way to spell
+/// "no action" for the array form.
+#[test]
+fn rejects_empty_string_array_element() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": [""]}}}}"#,
+        "pressed[0] must not be empty; use an empty array for no action",
+    );
+}
+
+/// An array with more than one scene-changing action (`~` or `@scene`) is rejected: at
+/// most one scene transition is allowed per event.
+#[test]
+fn rejects_multiple_scene_changing_actions_in_a_list() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": ["~", "@on_start"]}}}}"#,
+        "pressed has 2 scene-changing actions (~ or @scene); at most one is allowed per event",
+    );
+}
+
+/// An array of valid action strings is accepted.
+#[test]
+fn accepts_event_value_as_array_of_strings() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": ["/bin/true", "/bin/false"]}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// An empty array is accepted: it means "bound but no action", like an empty string.
+#[test]
+fn accepts_empty_array_as_no_action() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {"1b01": {"pressed": []}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A per-reference action object with no events at all is a likely mistake: warned,
+/// not rejected.
+#[test]
+fn warns_on_empty_action_object() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {"1b01": {}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap()).expect("should still load");
+    let _ = std::fs::remove_file(path);
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("actions.\"1b01\" defines no events")),
+        "{:?}",
+        config.warnings
     );
 }
 
@@ -687,7 +778,7 @@ fn rejects_event_value_array() {
 fn rejects_event_value_object() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"1b01": {"pressed": {}}}}}"#,
-        "pressed must be a string, got an object",
+        "pressed must be a string or an array of strings, got an object",
     );
 }
 
@@ -779,8 +870,17 @@ fn rejects_timer_not_an_object() {
 fn rejects_timer_value_not_a_string() {
     assert_validation_error(
         r#"{"on_start": {"actions": {"timer": {"1": 42}}}}"#,
-        "actions.timer value must be a string",
+        "actions.timer must be a string or an array of strings",
     );
+}
+
+/// A timer value may also be an array of actions, run in order like an event's.
+#[test]
+fn accepts_timer_value_as_array() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {"timer": {"1": ["@on_start"]}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
 }
 
 /// A timer action referencing an undefined scene is rejected with the timer location.

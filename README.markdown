@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.7.0**.
+The current version is **v0.8.0**.
 
 ## Usage
 
@@ -74,11 +74,12 @@ The target platforms are generic Linux and FreeBSD. No effort is made (or planne
 
 ## Config structure
 
-`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to three keys:
+`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to four keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
 - `"defaults"` — optional press-detection timing knobs (see [Defaults](#defaults))
+- `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
 
@@ -164,12 +165,23 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
-Action values have three forms:
+Action values have four forms:
   - `~` — stay on the same scene
   - `@<scene>` (e.g. `@Main`) — jump to the named scene
   - anything else — the path of a command to execute, followed by its parameters
+  - an array of any of the above, run without waiting on each other - see below
 
 Commands are executed asynchronously, so a running command does not block button input or the timer.
+
+An event's value (and the `timer` value) may be a plain string, as above, or an array
+of them, e.g. `"short_press": ["/usr/bin/notify-send hi", "@Main"]`, to trigger more
+than one action from a single event. Every entry runs without waiting on the others to
+finish - a command never blocks anything else in the list, and there can be at most one
+scene-changing entry (`~` or `@scene`) per list, enforced when the config loads. `[]` is
+the array form's way to spell "bound but no action" (matching `""` for the plain-string
+form); an empty string *inside* a non-empty array is rejected instead of silently
+skipped. A control listed in `actions` with no events at all (e.g. `"1b01": {}`) is
+almost certainly a mistake and is warned about, though it is not an error.
 
 Example scenes (paths and commands below are illustrative placeholders - adjust
 them to your own system and OS; `text2gif`/`aplay` are just example commands, not
@@ -177,7 +189,9 @@ tools `dak` ships or requires). `Main`'s clock button (`1b03`) uses `refresh` to
 keep itself updated every second on its own, instead of the whole-scene
 `"timer": {"1": "~"}` trick older configs needed (still shown on `on_start` and
 `Test`, and still the only option for anything a per-button `refresh` cannot
-express, like switching scenes on a schedule):
+express, like switching scenes on a schedule). `Test`'s `1b01` button demonstrates
+the array form: one `short_press` plays a sound and returns to `on_start`, instead
+of needing two separate buttons:
 
 ```json
 {
@@ -207,8 +221,7 @@ express, like switching scenes on a schedule):
       "1b03": { "type": "clear" }
     },
     "actions": {
-      "1b01": { "short_press": "/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "long_press": "", "double_click": "", "pressed": "", "released": "" },
-      "1b03": { "short_press": "@on_start", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+      "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "timer": { "1": "~" }
     }
   }
