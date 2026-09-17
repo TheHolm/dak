@@ -1,0 +1,102 @@
+# Builds and publishes release artifacts to a GitHub Release. Only ever runs
+# on tag pushes matching v* (this repo's tag convention - see AGENTS.md's
+# release process and `git tag -l`). Never runs on ordinary branch pushes or
+# pull requests.
+#
+# Every build step below uses a prebuilt image maintained by
+# .woodpecker/build-ci-images.yaml (Dockerfiles under docker/ci/), so a
+# release build does no apt-get/cargo-install/rustup/FreeBSD-sysroot
+# downloads of its own - those all happened once, ahead of time, when the
+# images were last (re)built. The only downloads left here are dak's own
+# crates.io dependencies during `cargo build`/`cargo deb`, which are cached
+# across releases via the host-path cargo-registry volume below.
+#
+# Requirements for this to work (see chat history for the full walkthrough):
+#   - .woodpecker/build-ci-images.yaml has run at least once, so
+#     dak-ci-deb-trixie:latest / dak-ci-deb-ubuntu2604:latest /
+#     dak-ci-freebsd-cross:latest / dak-ci-publish:latest already exist in
+#     the (single) Woodpecker agent host's local Docker image store.
+#   - This repo is marked "Trusted" in Woodpecker (Project Settings ->
+#     General -> Trusted) - required for the host-path cargo cache volume.
+#   - A `github_token` secret is set on this repo in Woodpecker (Project
+#     Settings -> Secrets), holding a GitHub PAT scoped to Contents:
+#     read/write on theholm/dak, restricted to the "tag" event.
+#   - The cache path below (/srv/woodpecker-cache/dak/...) exists on the
+#     agent host and is writable by the agent's Docker containers - adjust
+#     the path to whatever this Woodpecker instance actually uses for
+#     per-repo caches before relying on it.
+
+when:
+  - event: tag
+    ref: refs/tags/v*
+
+variables:
+  - &cargo_cache_volumes
+    - /srv/woodpecker-cache/dak/cargo-registry:/usr/local/cargo/registry
+    - /srv/woodpecker-cache/dak/cargo-git:/usr/local/cargo/git
+
+steps:
+  # Tiny, stable, official image - relies on normal Docker image caching on
+  # the single agent host (pulled once, reused after) rather than a custom
+  # baked image; not worth a dedicated Dockerfile for just `git archive`.
+  - name: src-tarball
+    image: alpine/git:latest
+    commands:
+      - VERSION="${CI_COMMIT_TAG#v}"
+      - mkdir -p dist
+      - ./scripts/make-src-tarball.sh "$VERSION" dist
+
+  - name: deb-trixie
+    image: dak-ci-deb-trixie:latest
+    pull: false
+    environment:
+      CARGO_TARGET_DIR: target/deb-trixie
+    volumes: *cargo_cache_volumes
+    commands:
+      - mkdir -p dist
+      - cargo deb
+      - cp target/deb-trixie/debian/*.deb dist/
+
+  - name: deb-ubuntu2604
+    image: dak-ci-deb-ubuntu2604:latest
+    pull: false
+    environment:
+      CARGO_TARGET_DIR: target/deb-ubuntu2604
+    volumes: *cargo_cache_volumes
+    commands:
+      - mkdir -p dist
+      - cargo deb
+      - cp target/deb-ubuntu2604/debian/*.deb dist/
+
+  - name: freebsd-pkg
+    image: dak-ci-freebsd-cross:latest
+    pull: false
+    environment:
+      CARGO_TARGET_DIR: target/freebsd
+    volumes: *cargo_cache_volumes
+    commands:
+      - VERSION="${CI_COMMIT_TAG#v}"
+      - cargo build --release --target x86_64-unknown-freebsd
+      - mkdir -p dist stage-root/usr/local/bin stage-root/usr/local/share/doc/dak
+      - cp target/freebsd/x86_64-unknown-freebsd/release/dak stage-root/usr/local/bin/dak
+      - chmod 555 stage-root/usr/local/bin/dak
+      - cp README.markdown LICENSE stage-root/usr/local/share/doc/dak/
+      - chmod 644 stage-root/usr/local/share/doc/dak/README.markdown stage-root/usr/local/share/doc/dak/LICENSE
+      - >-
+        python3 scripts/build-freebsd-pkg.py
+        --version "$VERSION"
+        --stage-root stage-root
+        --output "dist/dak-${VERSION}-freebsd-amd64.pkg"
+
+  - name: publish-github-release
+    image: dak-ci-publish:latest
+    pull: false
+    secrets: [github_token]
+    commands:
+      - export GH_TOKEN="$GITHUB_TOKEN"
+      - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
+      - >-
+        gh release create "$CI_COMMIT_TAG" dist/*
+        --repo theholm/dak
+        --title "$CI_COMMIT_TAG"
+        --notes-file /tmp/release-notes.md

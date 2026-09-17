@@ -1,0 +1,54 @@
+# (Re)builds the prebuilt CI images consumed by .woodpecker/release.yaml, so
+# release builds never redo apt-get/cargo-install/FreeBSD-sysroot downloads.
+#
+# Runs only when docker/ci/** changes (or is triggered manually from the
+# Woodpecker UI), and builds directly against the *host* Docker daemon (by
+# bind-mounting /var/run/docker.sock, not a nested docker:dind service) so
+# the resulting images land straight in the same image store every other
+# workflow on this agent already uses. Since there is a single Woodpecker
+# agent host (confirmed - see chat with the human, not recorded in-repo),
+# that's enough for every future .woodpecker/release.yaml run to find these
+# images already present locally (`pull: false`) with no registry involved.
+#
+# Requires this repo to be marked "Trusted" in Woodpecker (Project Settings
+# -> General -> Trusted, admin-only toggle): mounting the host's Docker
+# socket is a privileged-adjacent operation and Woodpecker blocks host-path
+# volume mounts for untrusted repos.
+
+when:
+  - event: push
+    branch: master
+    path:
+      include:
+        - docker/ci/**
+        - .woodpecker/build-ci-images.yaml
+  - event: manual
+
+steps:
+  - name: build-deb-trixie
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build -t dak-ci-deb-trixie:latest -f docker/ci/deb-trixie.Dockerfile docker/ci
+
+  - name: build-deb-ubuntu2604
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build -t dak-ci-deb-ubuntu2604:latest -f docker/ci/deb-ubuntu2604.Dockerfile docker/ci
+
+  - name: build-freebsd-cross
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build -t dak-ci-freebsd-cross:latest -f docker/ci/freebsd-cross.Dockerfile docker/ci
+
+  - name: build-publish
+    image: docker:27-cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    commands:
+      - docker build -t dak-ci-publish:latest -f docker/ci/publish.Dockerfile docker/ci
