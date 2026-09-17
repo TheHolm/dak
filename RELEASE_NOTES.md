@@ -5,6 +5,62 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.8.2 — Woodpecker CI: tag-triggered release packaging to GitHub
+
+### User-facing changes
+- No changes to the `dak` binary itself.
+- Tagged releases (`vX.Y.Z`) are now built and published automatically:
+  each release gets a source tarball, a Debian trixie `.deb`, an Ubuntu
+  26.04 LTS `.deb`, and a FreeBSD `.pkg`, all attached to a GitHub Release
+  on the public mirror (github.com/theholm/dak) with that tag's
+  `RELEASE_NOTES.md` section as the release body.
+
+### Details
+The repo is developed on an on-prem Gitea instance (not internet-facing)
+using Woodpecker CI, but releases needed to land on a public GitHub mirror.
+Since Woodpecker can't run inside GitHub Actions and the on-prem host isn't
+reachable from the internet, the release pipeline instead runs entirely on
+the on-prem Woodpecker agent and pushes finished artifacts *out* to GitHub's
+REST API (outbound-only, works even though nothing can reach in) - code
+itself continues reaching GitHub via Gitea's own push-mirror feature,
+independently of CI.
+
+Added:
+- `.woodpecker/release.yaml` - the only tag-triggered workflow
+  (`event: tag`, `ref: refs/tags/v*`, never runs on branch pushes or PRs).
+  Builds all four artifacts above then runs `gh release create`.
+- `.woodpecker/build-ci-images.yaml` - a separate, path-filtered
+  (`docker/ci/**`) maintenance workflow that (re)builds the prebuilt images
+  `release.yaml` depends on, building directly against the Woodpecker
+  agent's host Docker socket (bind-mounted, not a nested `docker:dind`) so
+  the images land in the same local image store `release.yaml` reads from -
+  avoids needing any container registry, at the cost of only working
+  correctly with a single Woodpecker agent host.
+- `docker/ci/deb-trixie.Dockerfile`, `deb-ubuntu2604.Dockerfile`,
+  `freebsd-cross.Dockerfile`, `publish.Dockerfile` - the prebuilt images
+  themselves. Baking in `cargo-deb`/`rustup`/`clang`+`lld`/the GitHub CLI/the
+  FreeBSD cross-compile sysroot ahead of time means an actual tagged release
+  build does none of those downloads itself - only `dak`'s own crates.io
+  dependencies remain, and those are cached across releases via a host-path
+  cargo-registry volume mounted into the `deb-*`/`freebsd-pkg` steps
+  (requires the Woodpecker project be marked "Trusted", since host-path
+  volume mounts are a privileged-adjacent feature).
+  `freebsd-cross.Dockerfile` extracts just the ~28 link-time sysroot files
+  identified in `NOTES.md` section 1.4 from a real FreeBSD 15.x `base.txz`,
+  rather than needing a live FreeBSD host to rsync from.
+- `scripts/build-freebsd-pkg.py` - promotes the throwaway `.pkg`-building
+  recipe from `NOTES.md` section 2.3 into a real, parametrized script (it
+  discovers files by walking a staged install root instead of a hardcoded
+  file list, so it isn't tied to `dak`'s current file set).
+- `scripts/make-src-tarball.sh` - wraps `git archive` for the source tarball
+  asset.
+- `scripts/extract-release-notes.sh` - pulls just one tag's section out of
+  `RELEASE_NOTES.md` (which holds the full history) for use as the GitHub
+  Release body.
+- `Cargo.toml` gained `description`/`license`/`repository` fields, which
+  `cargo-deb` requires to build a package at all (it previously had only
+  `name`/`version`/`edition`).
+
 ## v0.8.1 — Resilient scene setup: one bad operation no longer blocks the rest
 
 ### User-facing changes
