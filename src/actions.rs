@@ -1196,7 +1196,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         operations: &[SceneOp],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for operation in operations {
-            self.apply_one_operation(operation).await?;
+            self.apply_one_operation(operation).await;
         }
         // set_button_image only stages images in the write cache, so every application
         // of a scene must flush for the staged images to reach the device's LCDs.
@@ -1224,7 +1224,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         let Some(operation) = self.active_setup.get(&key).cloned() else {
             return Ok(());
         };
-        self.apply_one_operation(&operation).await?;
+        self.apply_one_operation(&operation).await;
         self.device.flush().await?;
         Ok(())
     }
@@ -1239,10 +1239,15 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// operation as `key`'s active setup and, for operations with a nonzero
     /// `refresh_seconds`, schedules the next tick - replacing (aborting) any tick already
     /// scheduled for that button first, whether or not the operation actually changed.
-    async fn apply_one_operation(
-        &mut self,
-        operation: &SceneOp,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ///
+    /// Never fails: every content-acquisition/processing failure (a missing/unreadable
+    /// file, an undecodable image, unrenderable text) is logged and draws the red
+    /// "Error" label on that button instead of propagating, so one bad operation never
+    /// stops the rest of the batch from being applied and flushed. A failure writing to
+    /// the device itself (as opposed to preparing the content to write) is logged only -
+    /// attempting to also draw an "Error" label would use the same failing device call
+    /// and likely just fail too.
+    async fn apply_one_operation(&mut self, operation: &SceneOp) {
         // Unsupported carries no reference, so it is skipped before any per-reference
         // filtering can apply.
         let Some(reference) = operation_reference(operation) else {
@@ -1252,7 +1257,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             self.log.warn(format!(
                 "scene setup \"{kind}\" on key is not supported and was skipped"
             ));
-            return Ok(());
+            return;
         };
         let reference = *reference;
 
@@ -1261,21 +1266,21 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 "device {} is referenced but not present; skipping operation: {operation:?}",
                 reference.device
             ));
-            return Ok(());
+            return;
         }
         if reference.kind == Kind::Encoder {
             self.log.warn(format!(
                 "{kind} {reference} is not supported yet; skipping operation: {operation:?}",
                 kind = reference.kind.label()
             ));
-            return Ok(());
+            return;
         }
 
         // A launch only runs its command; its reference is a config slot, so no
         // button is drawn and none is restored on termination.
         if let SceneOp::Launch { command, .. } = operation {
             spawn_detached(command, self.log);
-            return Ok(());
+            return;
         }
 
         let key = reference.number;
@@ -1284,7 +1289,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 "button {reference} is out of range (device has {} buttons); skipping operation: {operation:?}",
                 self.device.key_count()
             ));
-            return Ok(());
+            return;
         }
 
         // A button without a display cannot show any image: assignment is pointless
@@ -1301,7 +1306,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             self.log.warn(format!(
                 "button {reference} has no display; skipping operation: {operation:?}"
             ));
-            return Ok(());
+            return;
         }
 
         // record the button as "touched" so termination cleanup can restore exactly
@@ -1321,10 +1326,39 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     Subsystem::Scene,
                     format!("set image from \"{path}\" on key {key}"),
                 );
-                set_image_from_file(self.device, key.saturating_sub(1), self.image_format, path)
-                    .await?;
-                self.log
-                    .debug(Subsystem::Device, format!("set image on button {key}"));
+                // Errors are stringified immediately, before any match/await: the
+                // concrete error types here are not guaranteed `Send`, and
+                // `apply_one_operation`'s future is spawned onto the runtime (via
+                // `run_device` in `main.rs`), which requires it to be. An owned
+                // `String` has no such restriction.
+                match load_image_file(path)
+                    .await
+                    .map_err(|error| error.to_string())
+                {
+                    Ok(image) => {
+                        if let Err(error) = self
+                            .device
+                            .set_button_image(key.saturating_sub(1), self.image_format, image)
+                            .await
+                        {
+                            self.log.error(format!(
+                                "button {key}: failed to draw image from \"{path}\": {error}"
+                            ));
+                        } else {
+                            self.log
+                                .debug(Subsystem::Device, format!("set image on button {key}"));
+                        }
+                    }
+                    Err(message) => {
+                        self.fail_button(
+                            key,
+                            format!(
+                                "button {key}: failed to load image from \"{path}\": {message}"
+                            ),
+                        )
+                        .await;
+                    }
+                }
             }
             SceneOp::Text {
                 reference: _, path, ..
@@ -1333,18 +1367,57 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     Subsystem::Scene,
                     format!("render text from \"{path}\" on key {key}"),
                 );
-                let content = std::fs::read_to_string(path)?;
-                let image = crate::text::render_text(
-                    &crate::text::button_text(&content),
-                    self.image_format,
-                )?;
-                self.device
-                    .set_button_image(key.saturating_sub(1), self.image_format, image)
-                    .await?;
-                self.log.debug(
-                    Subsystem::Device,
-                    format!("set image on button {key} from text"),
-                );
+                // See the `SetImage` branch above: errors are stringified immediately.
+                let text_result = read_text_file_bounded(path)
+                    .await
+                    .map_err(|error| error.to_string());
+                match text_result {
+                    Ok(content) => {
+                        let render_result = crate::text::render_text(
+                            &crate::text::button_text(&content),
+                            self.image_format,
+                        )
+                        .map_err(|error| error.to_string());
+                        match render_result {
+                            Ok(image) => {
+                                if let Err(error) = self
+                                    .device
+                                    .set_button_image(
+                                        key.saturating_sub(1),
+                                        self.image_format,
+                                        image,
+                                    )
+                                    .await
+                                {
+                                    self.log.error(format!(
+                                        "button {key}: failed to draw text from \"{path}\": {error}"
+                                    ));
+                                } else {
+                                    self.log.debug(
+                                        Subsystem::Device,
+                                        format!("set image on button {key} from text"),
+                                    );
+                                }
+                            }
+                            Err(message) => {
+                                self.fail_button(
+                                    key,
+                                    format!(
+                                        "button {key}: failed to render text from \"{path}\": {message}"
+                                    ),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(message) => {
+                        self.fail_button(
+                            key,
+                            format!("button {key}: failed to read text from \"{path}\": {message}"),
+                        )
+                        .await;
+                    }
+                }
             }
             SceneOp::TextExec {
                 reference: _,
@@ -1373,11 +1446,13 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             }
             SceneOp::Clear { reference: _ } => {
                 self.log.debug(Subsystem::Scene, format!("clear key {key}"));
-                self.device
-                    .clear_button_image(key.saturating_sub(1))
-                    .await?;
-                self.log
-                    .debug(Subsystem::Device, format!("clear image on button {key}"));
+                if let Err(error) = self.device.clear_button_image(key.saturating_sub(1)).await {
+                    self.log
+                        .error(format!("button {key}: failed to clear: {error}"));
+                } else {
+                    self.log
+                        .debug(Subsystem::Device, format!("clear image on button {key}"));
+                }
             }
             SceneOp::Unsupported { .. } => {
                 unreachable!("Unsupported operations are skipped before the match")
@@ -1389,7 +1464,6 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         if refresh_seconds > 0 {
             self.schedule_refresh(key, refresh_seconds);
         }
-        Ok(())
     }
 
     /// Aborts and forgets `key`'s pending refresh tick, if any.
@@ -1578,6 +1652,23 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         self.device.flush().await?;
         Ok(())
     }
+
+    /// Logs `message` (a content-acquisition/processing failure already rendered into
+    /// an owned `String`) and draws the red "Error" label on `key`.
+    ///
+    /// Callers must format any foreign error into `message` *before* calling this, not
+    /// hold it across this call's own `await`: most error types this crate deals with
+    /// (`image::ImageError`, `Box<dyn std::error::Error>` from `crate::text`) are not
+    /// `Send`, and `apply_one_operation`'s future is spawned onto the runtime (via
+    /// `run_device` in `main.rs`), which requires it - and does require - to be `Send`.
+    /// An owned `String` has no such restriction.
+    async fn fail_button(&mut self, key: u8, message: String) {
+        self.log.error(message);
+        if let Err(error) = self.draw_error_label(key).await {
+            self.log
+                .error(format!("button {key}: failed to draw error label: {error}"));
+        }
+    }
 }
 
 /// Returns the control reference an operation targets, if any.
@@ -1742,11 +1833,18 @@ pub fn spawn_exec(
     })
 }
 
+/// Maximum bytes captured from a `text_exec`/`image_exec` program's stdout - generous
+/// for a 60x60 button image or a few lines of text, but a hard bound: without one, a
+/// program producing more than the OS pipe buffer's worth of output would block on its
+/// own `write()` for the entire timeout every time (see [`run_command_with_timeout`]).
+pub const MAX_EXEC_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Runs `command` async, killing it if it does not finish within `timeout`.
 ///
 /// Returns the program's raw stdout on success or a description of the failure (spawn
-/// error, non-zero exit, or timeout) otherwise. Callers interpret the bytes: `text_exec`
-/// renders them as text, `image_exec` decodes them as an image file.
+/// error, non-zero exit, timeout, or output past [`MAX_EXEC_OUTPUT_BYTES`]) otherwise.
+/// Callers interpret the bytes: `text_exec` renders them as text, `image_exec` decodes
+/// them as an image file.
 pub async fn run_command_with_timeout(
     command: &CommandSpec,
     timeout: Duration,
@@ -1763,7 +1861,40 @@ pub async fn run_command_with_timeout(
         .map_err(|error| format!("command \"{display}\" failed to start: {error}"))?;
     let mut stdout = child.stdout.take().expect("stdout pipe was requested");
 
-    let status = match tokio::time::timeout(timeout, child.wait()).await {
+    // Drain stdout *before* waiting for exit, not after: a program producing more than
+    // one OS pipe buffer's worth of output blocks on its own `write()` once that buffer
+    // fills, since nothing reads it until later - waiting for exit first would then
+    // never see the child actually exit (it can't, still blocked mid-write) until this
+    // whole function's caller-supplied timeout kills it, even for output that would
+    // otherwise finish in an instant. Reading one byte past the cap (rather than
+    // exactly at it) tells a genuine overflow apart from output that happens to be
+    // exactly the cap size and then legitimately ends.
+    let run = async {
+        let mut bytes = Vec::new();
+        (&mut stdout)
+            .take(MAX_EXEC_OUTPUT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| format!("command \"{display}\" failed to read stdout: {error}"))?;
+        if bytes.len() as u64 > MAX_EXEC_OUTPUT_BYTES {
+            return Err(format!(
+                "command \"{display}\" output exceeded {MAX_EXEC_OUTPUT_BYTES} bytes"
+            ));
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("command \"{display}\" failed to wait: {error}"))?;
+        Ok((status, bytes))
+    };
+
+    let (status, bytes) = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error);
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -1771,16 +1902,7 @@ pub async fn run_command_with_timeout(
                 "command \"{display}\" was killed after running longer than {timeout:?}"
             ));
         }
-        Ok(status) => {
-            status.map_err(|error| format!("command \"{display}\" failed to wait: {error}"))?
-        }
     };
-
-    let mut bytes = Vec::new();
-    stdout
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| format!("command \"{display}\" failed to read stdout: {error}"))?;
 
     if !status.success() {
         return Err(format!("command \"{display}\" exited with {status}"));
@@ -1807,6 +1929,40 @@ pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Maximum bytes read from a `text` setup entry's file - far more than the 3x6
+/// characters ever shown on a button, but a hard bound: without one, a huge or
+/// infinite source (e.g. `/dev/zero`) would be read until EOF, which such a source
+/// never reaches, growing memory without limit instead of ever finishing.
+pub const MAX_TEXT_FILE_BYTES: u64 = 64 * 1024;
+
+/// Loads the image at `path` off the async runtime's worker thread: `image::open` does
+/// blocking file I/O and (for a large or complex image) CPU-bound decoding, neither of
+/// which should run directly on a tokio worker thread.
+async fn load_image_file(
+    path: &str,
+) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
+    let path = path.to_string();
+    let result = tokio::task::spawn_blocking(move || image::open(path))
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+    result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+}
+
+/// Reads at most [`MAX_TEXT_FILE_BYTES`] from `path`, using `tokio::fs` so a large or
+/// slow read never blocks a worker thread; a source with more data than the cap (e.g.
+/// `/dev/zero`) simply stops there instead of reading forever. Bytes are decoded
+/// lossily, since a `text` entry only ever shows the first few lines, so invalid UTF-8
+/// anywhere in a large file is not worth failing the whole read over.
+async fn read_text_file_bounded(
+    path: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let mut buf = Vec::new();
+    file.take(MAX_TEXT_FILE_BYTES).read_to_end(&mut buf).await?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Loads the image at `path` and sets it on the given device key (mirajazz 0-based).
 pub async fn set_image_from_file<D: ButtonDevice>(
     device: &D,
@@ -1814,7 +1970,9 @@ pub async fn set_image_from_file<D: ButtonDevice>(
     image_format: ImageFormat,
     path: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let image: DynamicImage = image::open(path)?;
+    let image = load_image_file(path)
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error> { error })?;
     device.set_button_image(key, image_format, image).await?;
     Ok(())
 }

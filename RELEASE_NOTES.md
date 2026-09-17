@@ -5,6 +5,89 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.8.1 — Resilient scene setup: one bad operation no longer blocks the rest
+
+### User-facing changes
+- A scene with several buttons no longer stops applying entirely just
+  because one `image`/`text` setup entry's file is missing or bad -
+  every other button in the scene still draws and reaches the display.
+  The failing button now shows the red "Error" label instead, matching
+  how `text_exec`/`image_exec` failures already behaved.
+- A `text` setup entry reading from an unusually large or infinite
+  source (e.g. `/dev/zero`) no longer hangs the program or grows memory
+  without bound - the read is capped.
+- `text_exec`/`image_exec` programs producing more output than fits in
+  one OS pipe buffer now actually complete instead of always being
+  killed after the timeout - this was a real, previously silent bug
+  affecting any moderately large `image_exec` output.
+
+### Details
+Closes three issues found while investigating why a missing image file
+blocked an entire scene from applying:
+- One failing setup operation no longer blocks its siblings.
+  `apply_one_operation` now returns `()` instead of `Result`, catching
+  every content-acquisition/processing failure internally
+  (missing/unreadable file, undecodable image, unrenderable text)
+  instead of propagating it via `?`. Previously the for loop in
+  `apply_scene_operations`/`refresh_button` bailed on the first error,
+  skipping every operation after it in that scene's setup (processed
+  in ascending key order, since `serde_json`'s default `Map` has no
+  `preserve_order` feature enabled) and even skipping the batch's own
+  trailing flush, so operations that succeeded *before* the failure
+  never reached the LCD either.
+- Failed image/text draws now consistently show the red "Error" label,
+  matching `text_exec`/`image_exec` failures (which already did, via
+  `handle_exec_event`). A new `fail_button` helper logs and calls the
+  existing `draw_error_label`. The rule is consistent throughout:
+  content-acquisition/processing failures (missing file, bad decode,
+  bad render) draw "Error"; device-I/O failures (the write/clear call
+  itself) are logged only, since attempting to also draw an "Error"
+  label would hit the same failing device call and likely just fail
+  too - this applies to `Clear` (its only operation is a device write)
+  and to the device-write step of `SetImage`/`Text`.
+- A `text` setup entry reading from an infinite or huge source (e.g.
+  `/dev/zero`) no longer hangs and grows memory without bound. A new
+  `read_text_file_bounded` uses `tokio::fs` with a hard
+  `MAX_TEXT_FILE_BYTES` (64 KiB) cap instead of unbounded
+  `std::fs::read_to_string`; `image::open` also moved into
+  `spawn_blocking` (`load_image_file`) for the same "don't block a
+  tokio worker thread with sync I/O/decoding" reasoning (`Cargo.toml`
+  gains tokio's `"fs"` feature for this).
+- A related bug in `text_exec`/`image_exec`'s output capture was fixed
+  alongside: `run_command_with_timeout` previously waited for the
+  child to exit *before* draining stdout, so any program producing
+  more than one OS pipe buffer's worth of output would block on its
+  own `write()` (nothing reads it until later) and never exit until
+  the timeout killed it - even output that would otherwise finish
+  instantly always timed out. Now stdout is drained first, capped at a
+  new `MAX_EXEC_OUTPUT_BYTES` (10 MiB) with a distinct "output
+  exceeded" error and immediate kill on overflow instead of silently
+  deadlocking into the generic timeout.
+- A `Send`-related fix was needed along the way: `apply_one_operation`'s
+  future is spawned by `run_device` (`main.rs`), which requires it to
+  be `Send`. `crate::text::render_text`'s error type is not `Send`, and
+  merely calling `drop()` on it before a sibling `.await` in a nested
+  `match` was not sufficient to satisfy the compiler's liveness
+  analysis. Fixed by converting every fallible result to an owned
+  `String` immediately via `.map_err(|e| e.to_string())`, before any
+  match/await, sidestepping the question entirely.
+- Tests (+12/updated): inverted the two "fails the whole scene" tests
+  to assert the error label is drawn and the batch still succeeds;
+  added a zero-size-format test asserting graceful degradation
+  (neither the real nor fallback render can succeed, nothing is
+  staged, no crash); added a three-button test proving a sibling with
+  a valid file still draws when another button's file is missing;
+  added a `/dev/zero` text test asserting completion well under a
+  bounded timeout; added two `run_command_with_timeout` tests (output
+  between the pipe buffer size and the cap now succeeds, output past
+  the cap is killed immediately with the new distinct error); added a
+  test proving two exec entries in one scene do not block each other.
+  Two `src/main.rs` tests updated for the new
+  draws-error-label-and-continues behavior instead of "stages nothing".
+- Verified: `cargo test` passes identically in debug and release (292
+  tests), `cargo fmt --check` and `cargo clippy --all-targets` are
+  clean.
+
 ## v0.8.0 — Multi-action lists and a top-level config version key
 
 ### User-facing changes
