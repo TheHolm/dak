@@ -112,7 +112,9 @@ steps:
 
   - name: publish-github-release
     image: debian:trixie-slim
-    secrets: [github_token]
+    environment:
+      GH_TOKEN:
+        from_secret: github_token
     commands:
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
       - mkdir -p -m 755 /etc/apt/keyrings
@@ -120,7 +122,6 @@ steps:
       - chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
       - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
       - apt-get update && apt-get install -y --no-install-recommends gh
-      - export GH_TOKEN="$GITHUB_TOKEN"
       - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
       - >-
         gh release create "$CI_COMMIT_TAG" dist/*
