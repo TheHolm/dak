@@ -3,42 +3,36 @@
 # release process and `git tag -l`). Never runs on ordinary branch pushes or
 # pull requests.
 #
-# Every build step below uses a prebuilt image maintained by
-# .woodpecker/build-ci-images.yaml (Dockerfiles under docker/ci/), so a
-# release build does no apt-get/cargo-install/rustup/FreeBSD-sysroot
-# downloads of its own - those all happened once, ahead of time, when the
-# images were last (re)built. The only downloads left here are dak's own
-# crates.io dependencies during `cargo build`/`cargo deb`, which are cached
-# across releases via the host-path cargo-registry volume below.
+# Every step below uses a plain, official base image and installs whatever
+# it needs inline (apt-get/cargo install/rustup/FreeBSD sysroot download).
 #
-# Requirements for this to work (see chat history for the full walkthrough):
-#   - .woodpecker/build-ci-images.yaml has run at least once, so
-#     dak-ci-deb-trixie:latest / dak-ci-deb-ubuntu2604:latest /
-#     dak-ci-freebsd-cross:latest / dak-ci-publish:latest already exist in
-#     the (single) Woodpecker agent host's local Docker image store.
-#   - This repo is marked "Trusted" in Woodpecker (Project Settings ->
-#     General -> Trusted) - required for the host-path cargo cache volume.
+# An earlier version of this pipeline used prebuilt custom images (built by
+# a since-removed .woodpecker/build-ci-images.yaml) to avoid redoing those
+# installs on every release. That required bind-mounting the Woodpecker
+# agent's Docker socket, which Woodpecker only allows for repos marked
+# "Trusted" (an admin-only setting) - since that's not available here,
+# every step below just does its own installs inline instead, and every
+# tagged release re-downloads its own toolchain. Tags are rare (real
+# releases only), so this is an acceptable trade-off. Revisit with a proper
+# build cache (e.g. a plugin-cache backed by S3/Minio, which needs no
+# Trusted flag since it works over plain HTTP rather than mounting host
+# paths) if release build times become a real problem.
+#
+# Requirements for this to work:
 #   - A `github_token` secret is set on this repo in Woodpecker (Project
 #     Settings -> Secrets), holding a GitHub PAT scoped to Contents:
 #     read/write on theholm/dak, restricted to the "tag" event.
-#   - The cache path below (/srv/woodpecker-cache/dak/...) exists on the
-#     agent host and is writable by the agent's Docker containers - adjust
-#     the path to whatever this Woodpecker instance actually uses for
-#     per-repo caches before relying on it.
+#   - Gitea's push mirror to github.com/theholm/dak is set up and syncs
+#     tags promptly, so the tag this workflow is releasing already exists
+#     on GitHub (or `gh release create` will create it pointing at the
+#     default branch instead of this exact commit).
 
 when:
   - event: tag
     ref: refs/tags/v*
 
-variables:
-  - &cargo_cache_volumes
-    - /srv/woodpecker-cache/dak/cargo-registry:/usr/local/cargo/registry
-    - /srv/woodpecker-cache/dak/cargo-git:/usr/local/cargo/git
-
 steps:
-  # Tiny, stable, official image - relies on normal Docker image caching on
-  # the single agent host (pulled once, reused after) rather than a custom
-  # baked image; not worth a dedicated Dockerfile for just `git archive`.
+  # Tiny, stable, official image - no toolchain to install, just `git archive`.
   - name: src-tarball
     image: alpine/git:latest
     commands:
@@ -47,35 +41,63 @@ steps:
       - ./scripts/make-src-tarball.sh "$VERSION" dist
 
   - name: deb-trixie
-    image: dak-ci-deb-trixie:latest
-    pull: false
+    image: rust:1.92-trixie
     environment:
       CARGO_TARGET_DIR: target/deb-trixie
-    volumes: *cargo_cache_volumes
     commands:
+      - apt-get update && apt-get install -y --no-install-recommends libudev-dev
+      - cargo install cargo-deb --locked
       - mkdir -p dist
       - cargo deb
       - cp target/deb-trixie/debian/*.deb dist/
 
   - name: deb-ubuntu2604
-    image: dak-ci-deb-ubuntu2604:latest
-    pull: false
+    image: ubuntu:26.04
     environment:
       CARGO_TARGET_DIR: target/deb-ubuntu2604
-    volumes: *cargo_cache_volumes
     commands:
+      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libudev-dev pkg-config
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+      - . "$HOME/.cargo/env"
+      - cargo install cargo-deb --locked
       - mkdir -p dist
       - cargo deb
       - cp target/deb-ubuntu2604/debian/*.deb dist/
 
   - name: freebsd-pkg
-    image: dak-ci-freebsd-cross:latest
-    pull: false
+    image: rust:1.92-trixie
     environment:
       CARGO_TARGET_DIR: target/freebsd
-    volumes: *cargo_cache_volumes
+      CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER: clang
+      RUSTFLAGS: "-C link-arg=--target=x86_64-unknown-freebsd15 -C link-arg=--sysroot=/opt/freebsd-sysroot -C link-arg=-fuse-ld=lld -C link-arg=-B/opt/freebsd-sysroot/usr/lib"
     commands:
       - VERSION="${CI_COMMIT_TAG#v}"
+      - rustup target add x86_64-unknown-freebsd
+      - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3
+      - mkdir -p /opt/freebsd-sysroot
+      # CAUTION: the base.txz URL/tar-member paths below are carried over from the
+      # FreeBSD 14.5 verification in NOTES.md section 1.4 and have NOT been
+      # re-verified against a real FreeBSD 15.x base.txz (no outbound internet was
+      # available while writing this). Fix in place if this step 404s or the tar
+      # extraction finds nothing, then update this comment and NOTES.md.
+      - curl -fsSL -o /tmp/base.txz https://download.freebsd.org/releases/amd64/amd64/15.0-RELEASE/base.txz
+      - >-
+        tar -xJf /tmp/base.txz -C /opt/freebsd-sysroot
+        lib/libc.so.7 usr/lib/libc.so usr/lib/libc_nonshared.a
+        lib/libm.so.5 usr/lib/libm.so
+        lib/libutil.so.9 usr/lib/libutil.so
+        lib/librt.so.1 usr/lib/librt.so
+        usr/lib/libexecinfo.so.1 usr/lib/libexecinfo.so
+        lib/libkvm.so.7 usr/lib/libkvm.so
+        usr/lib/libmemstat.so.3 usr/lib/libmemstat.so
+        usr/lib/libprocstat.so.1 usr/lib/libprocstat.so
+        lib/libdevstat.so.7 usr/lib/libdevstat.so
+        lib/libthr.so.3 usr/lib/libthr.so usr/lib/libpthread.so
+        lib/libgcc_s.so.1 usr/lib/libgcc_s.so
+        usr/lib/crt1.o usr/lib/Scrt1.o usr/lib/crti.o usr/lib/crtn.o
+        usr/lib/crtbegin.o usr/lib/crtbeginS.o usr/lib/crtbeginT.o
+        usr/lib/crtend.o usr/lib/crtendS.o
+      - rm -f /tmp/base.txz
       - cargo build --release --target x86_64-unknown-freebsd
       - mkdir -p dist stage-root/usr/local/bin stage-root/usr/local/share/doc/dak
       - cp target/freebsd/x86_64-unknown-freebsd/release/dak stage-root/usr/local/bin/dak
@@ -89,10 +111,15 @@ steps:
         --output "dist/dak-${VERSION}-freebsd-amd64.pkg"
 
   - name: publish-github-release
-    image: dak-ci-publish:latest
-    pull: false
+    image: debian:trixie-slim
     secrets: [github_token]
     commands:
+      - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
+      - mkdir -p -m 755 /etc/apt/keyrings
+      - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      - chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+      - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+      - apt-get update && apt-get install -y --no-install-recommends gh
       - export GH_TOKEN="$GITHUB_TOKEN"
       - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
       - >-

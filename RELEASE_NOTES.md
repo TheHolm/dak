@@ -28,26 +28,17 @@ independently of CI.
 Added:
 - `.woodpecker/release.yaml` - the only tag-triggered workflow
   (`event: tag`, `ref: refs/tags/v*`, never runs on branch pushes or PRs).
-  Builds all four artifacts above then runs `gh release create`.
-- `.woodpecker/build-ci-images.yaml` - a separate, path-filtered
-  (`docker/ci/**`) maintenance workflow that (re)builds the prebuilt images
-  `release.yaml` depends on, building directly against the Woodpecker
-  agent's host Docker socket (bind-mounted, not a nested `docker:dind`) so
-  the images land in the same local image store `release.yaml` reads from -
-  avoids needing any container registry, at the cost of only working
-  correctly with a single Woodpecker agent host.
-- `docker/ci/deb-trixie.Dockerfile`, `deb-ubuntu2604.Dockerfile`,
-  `freebsd-cross.Dockerfile`, `publish.Dockerfile` - the prebuilt images
-  themselves. Baking in `cargo-deb`/`rustup`/`clang`+`lld`/the GitHub CLI/the
-  FreeBSD cross-compile sysroot ahead of time means an actual tagged release
-  build does none of those downloads itself - only `dak`'s own crates.io
-  dependencies remain, and those are cached across releases via a host-path
-  cargo-registry volume mounted into the `deb-*`/`freebsd-pkg` steps
-  (requires the Woodpecker project be marked "Trusted", since host-path
-  volume mounts are a privileged-adjacent feature).
-  `freebsd-cross.Dockerfile` extracts just the ~28 link-time sysroot files
-  identified in `NOTES.md` section 1.4 from a real FreeBSD 15.x `base.txz`,
-  rather than needing a live FreeBSD host to rsync from.
+  Builds all four artifacts above then runs `gh release create`. Every step
+  uses a plain official base image (`rust:1.92-trixie`, `ubuntu:26.04`,
+  `debian:trixie-slim`, `alpine/git`) and installs whatever it needs inline
+  (apt-get/`cargo install`/`rustup`/the FreeBSD sysroot download) - an
+  earlier version of this instead used prebuilt custom images to avoid
+  redoing those installs on every release, but that required bind-mounting
+  the Woodpecker agent's Docker socket, which needs the repo marked
+  "Trusted" (an admin-only setting not available here), so that approach
+  was dropped in favor of this simpler, slower-per-release one. Tags are
+  rare (real releases only), so the extra download time per release is an
+  acceptable trade-off.
 - `scripts/build-freebsd-pkg.py` - promotes the throwaway `.pkg`-building
   recipe from `NOTES.md` section 2.3 into a real, parametrized script (it
   discovers files by walking a staged install root instead of a hardcoded
