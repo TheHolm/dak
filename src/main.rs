@@ -1451,9 +1451,10 @@ mod tests {
         assert_eq!(mock.calls(), vec!["set", "flush"]);
     }
 
-    /// A `~` action whose scene fails to re-apply (here, an `image` setup entry
-    /// pointing at a missing file) logs a warning and leaves the scene name and
-    /// `previous_scene` untouched: staying never counts as leaving.
+    /// A `~` action whose scene has a button that fails to draw (here, an `image` setup
+    /// entry pointing at a missing file) leaves the scene name and `previous_scene`
+    /// untouched: staying never counts as leaving. The failing button draws the red
+    /// "Error" label instead of stopping the reapply.
     #[tokio::test]
     async fn run_action_stay_keeps_scene_when_reapply_fails() {
         let mock = MockButtonDevice::default();
@@ -1487,14 +1488,16 @@ mod tests {
         assert!(previous_scene.is_none());
         assert_eq!(
             mock.calls(),
-            Vec::<&str>::new(),
-            "the failing operation must not stage anything on the device"
+            vec!["set", "flush", "flush"],
+            "the failing operation draws the red \"Error\" label (staged + flushed by \
+             draw_error_label) and the batch's own trailing flush still runs afterward"
         );
     }
 
-    /// An `@scene` action whose target scene fails to enter still switches: the scene
-    /// name and `previous_scene` update before the setup runs, and the failure is only
-    /// logged, mirroring `run_action_stay_keeps_scene_when_reapply_fails`.
+    /// An `@scene` action still switches even when the target scene has a button that
+    /// fails to draw: the scene name and `previous_scene` update before the setup runs,
+    /// and the failing button draws the red "Error" label instead of stopping the
+    /// switch, mirroring `run_action_stay_keeps_scene_when_reapply_fails`.
     #[tokio::test]
     async fn run_action_switch_scene_still_switches_when_enter_fails() {
         let mock = MockButtonDevice::default();
@@ -1529,8 +1532,9 @@ mod tests {
         assert_eq!(previous_scene.as_deref(), Some("on_start"));
         assert_eq!(
             mock.calls(),
-            Vec::<&str>::new(),
-            "the failing operation must not stage anything on the device"
+            vec!["set", "flush", "flush"],
+            "the failing operation draws the red \"Error\" label (staged + flushed by \
+             draw_error_label) and the batch's own trailing flush still runs afterward"
         );
     }
 

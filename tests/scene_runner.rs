@@ -300,6 +300,43 @@ async fn text_op_renders_button_text_and_flushes() {
     let _ = std::fs::remove_file(&text_path);
 }
 
+/// A `text` operation reading from an infinite source (`/dev/zero`) does not hang or
+/// grow memory without bound: the read is capped at `MAX_TEXT_FILE_BYTES`, so it
+/// completes quickly and successfully (null bytes are valid UTF-8; there is nothing
+/// here to fail on) instead of blocking forever waiting for an EOF `/dev/zero` never
+/// produces.
+#[tokio::test]
+async fn text_op_from_dev_zero_completes_quickly_instead_of_hanging() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text", "params": "/dev/zero" }
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runner.enter_scene("main", &scenes),
+    )
+    .await
+    .expect("reading /dev/zero must not hang past MAX_TEXT_FILE_BYTES")
+    .unwrap();
+
+    // A capped read of null bytes is not a failure - the button draws (a boring,
+    // effectively blank) image rather than the red "Error" label.
+    let calls = mock.calls();
+    assert_eq!(mock.kinds(&calls), ["SetImage", "Flush"]);
+}
+
 /// A `clear` operation stages the empty image under the 0-based key and flushes.
 #[tokio::test]
 async fn clear_op_calls_zero_based_key_and_flushes() {
@@ -384,6 +421,39 @@ async fn text_exec_output_drawn_on_button() {
     assert_eq!(mock.keys(&calls), [1]);
     let image = mock.last_image(1).expect("output was not staged");
     assert_eq!(image.dimensions(), (60, 60));
+}
+
+/// Two `text_exec`/`image_exec` entries in the same scene do not block each other:
+/// starting one does not wait for the other (or for either program) to finish.
+/// `start_exec_task` only spawns the program and returns immediately, so applying both
+/// operations - and the whole scene - completes almost instantly even though both
+/// spawned commands are still sleeping.
+#[tokio::test]
+async fn text_exec_and_image_exec_entries_do_not_block_each_other() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_exec", "params": "sleep 5" },
+        "1b02": { "type": "image_exec", "params": "sleep 5" }
+    }));
+    tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        runner.enter_scene("main", &scenes),
+    )
+    .await
+    .expect("applying both exec operations must not wait on either sleeping program")
+    .unwrap();
 }
 
 /// A stale `text_exec` output (button was reassigned meanwhile) is discarded.
@@ -815,9 +885,10 @@ async fn launch_op_spawns_program_and_touches_no_button() {
     let _ = std::fs::remove_file(&done_file);
 }
 
-/// A `text` operation with a missing file fails the whole scene application.
+/// A `text` operation with a missing file does not fail the scene: it draws the red
+/// "Error" label on that button instead, and the batch's own trailing flush still runs.
 #[tokio::test]
-async fn text_op_missing_file_fails_scene() {
+async fn text_op_missing_file_draws_error_label() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
@@ -834,16 +905,19 @@ async fn text_op_missing_file_fails_scene() {
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "text", "params": "/does/not/exist.txt" }
     }));
-    let error = runner.enter_scene("main", &scenes).await.unwrap_err();
-    assert!(
-        !error.to_string().is_empty(),
-        "expected a descriptive error"
-    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let calls = mock.calls();
+    assert_eq!(mock.kinds(&calls), ["SetImage", "Flush", "Flush"]);
+    assert_eq!(mock.keys(&calls), [0]);
+    let image = mock.last_image(0).expect("error label was not staged");
+    assert!(is_red_label(&image), "expected the red \"Error\" label");
 }
 
-/// An `image` operation with a missing file fails the whole scene application.
+/// An `image` operation with a missing file does not fail the scene: it draws the red
+/// "Error" label on that button instead, and the batch's own trailing flush still runs.
 #[tokio::test]
-async fn image_op_missing_file_fails_scene() {
+async fn image_op_missing_file_draws_error_label() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
@@ -860,17 +934,71 @@ async fn image_op_missing_file_fails_scene() {
     let scenes = scenes_with_buttons(json!({
         "1b01": { "type": "image", "params": "/does/not/exist.png" }
     }));
-    let error = runner.enter_scene("main", &scenes).await.unwrap_err();
-    assert!(
-        !error.to_string().is_empty(),
-        "expected a descriptive error"
-    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let calls = mock.calls();
+    assert_eq!(mock.kinds(&calls), ["SetImage", "Flush", "Flush"]);
+    assert_eq!(mock.keys(&calls), [0]);
+    let image = mock.last_image(0).expect("error label was not staged");
+    assert!(is_red_label(&image), "expected the red \"Error\" label");
 }
 
-/// Render failures besides a missing file also fail the scene: with a zero-size
-/// image format, a `text` operation whose file reads fine still cannot be rendered.
+/// A sibling button with valid content still gets drawn even when another button in
+/// the same scene fails: one bad operation must not block the rest of the batch.
 #[tokio::test]
-async fn text_op_unrenderable_text_fails_scene() {
+async fn missing_file_on_one_button_does_not_block_siblings() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap() },
+        "1b02": { "type": "image", "params": "/does/not/exist.png" },
+        "1b03": { "type": "image", "params": image_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let calls = mock.calls();
+    // Buttons are applied in ascending key order (1b01, 1b02, 1b03): the two valid
+    // images stage and draw normally, the missing one draws the red "Error" label
+    // (its own immediate flush from `draw_error_label`), and the batch's own trailing
+    // flush runs last.
+    assert_eq!(
+        mock.kinds(&calls),
+        ["SetImage", "SetImage", "Flush", "SetImage", "Flush"]
+    );
+    assert_eq!(mock.keys(&calls), [0, 1, 2]);
+    assert!(
+        !is_red_label(&mock.last_image(0).unwrap()),
+        "1b01 should show its real image, not the error label"
+    );
+    assert!(
+        is_red_label(&mock.last_image(1).unwrap()),
+        "1b02 should show the error label"
+    );
+    assert!(
+        !is_red_label(&mock.last_image(2).unwrap()),
+        "1b03 should show its real image, not the error label"
+    );
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// Render failures besides a missing file are handled the same way: with a zero-size
+/// image format, a `text` operation whose file reads fine still cannot be rendered -
+/// and neither can the fallback "Error" label, so nothing is staged for that button,
+/// but the scene application itself still succeeds and still flushes.
+#[tokio::test]
+async fn text_op_unrenderable_text_degrades_gracefully() {
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
@@ -893,12 +1021,13 @@ async fn text_op_unrenderable_text_fails_scene() {
         "1b01": { "type": "text", "params": path.to_str().unwrap() }
     }));
 
-    let error = runner.enter_scene("main", &scenes).await.unwrap_err();
+    runner.enter_scene("main", &scenes).await.unwrap();
     let _ = std::fs::remove_file(&path);
-    assert!(
-        error.to_string().contains("render_text"),
-        "expected the render failure, got: {error}"
-    );
+
+    // Neither the real text nor the fallback error label could be rendered at a
+    // zero-size format, so nothing was ever staged for the button - only the batch's
+    // own trailing flush ran.
+    assert_eq!(mock.kinds(&mock.calls()), ["Flush"]);
 }
 
 /// A `text_exec` whose output cannot be rendered is logged and dropped: the error

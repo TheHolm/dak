@@ -3,7 +3,10 @@
 
 use std::time::Duration;
 
-use dak::actions::{run_command_with_timeout, spawn_exec, CommandSpec, ExecEvent, ExecOutputKind};
+use dak::actions::{
+    run_command_with_timeout, spawn_exec, CommandSpec, ExecEvent, ExecOutputKind,
+    MAX_EXEC_OUTPUT_BYTES,
+};
 
 /// Whether a process with the given pid is still running, checked the portable POSIX
 /// way (`kill -0`) rather than via `/proc`, which Linux mounts by default but FreeBSD
@@ -54,6 +57,55 @@ async fn run_command_with_timeout_kills_slow_program() {
         .await
         .expect_err("expected timeout");
     assert!(error.contains("killed"), "unexpected error: {error}");
+}
+
+/// A program producing more output than one OS pipe buffer's worth (but well under
+/// `MAX_EXEC_OUTPUT_BYTES`) still completes successfully within the timeout: stdout is
+/// drained concurrently with waiting for exit, so the program never blocks on its own
+/// `write()` waiting for a reader that only shows up after it exits.
+#[tokio::test]
+async fn run_command_with_timeout_completes_with_output_past_one_pipe_buffer() {
+    // 256 KiB comfortably exceeds a typical 64 KiB Linux pipe buffer, while staying
+    // far under MAX_EXEC_OUTPUT_BYTES (10 MiB).
+    let size = 256 * 1024;
+    let command = CommandSpec {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), format!("head -c {size} /dev/zero")],
+    };
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_command_with_timeout(&command, Duration::from_secs(5)),
+    )
+    .await
+    .expect("should not need the outer test timeout")
+    .expect("expected success");
+    assert_eq!(output.len(), size);
+}
+
+/// A program producing more output than `MAX_EXEC_OUTPUT_BYTES` is killed as soon as
+/// the cap is exceeded and reported with a distinct error, rather than being silently
+/// truncated or left to run until the (much longer) timeout elapses.
+#[tokio::test]
+async fn run_command_with_timeout_reports_output_past_the_cap() {
+    let size = MAX_EXEC_OUTPUT_BYTES + 1024;
+    let command = CommandSpec {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), format!("head -c {size} /dev/zero")],
+    };
+    // The timeout given here is far longer than this should ever take: exceeding the
+    // cap must be detected and the program killed well before it, not merely before
+    // this outer bound.
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_command_with_timeout(&command, Duration::from_secs(30)),
+    )
+    .await
+    .expect("output past the cap should be detected quickly, not after the full timeout")
+    .expect_err("expected the output-too-large error");
+    assert!(
+        error.contains("output exceeded"),
+        "unexpected error: {error}"
+    );
 }
 
 /// A program that cannot be spawned (does not exist) is reported as a start failure.
