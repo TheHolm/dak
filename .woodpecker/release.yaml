@@ -36,6 +36,7 @@ steps:
   - name: src-tarball
     image: alpine/git:latest
     commands:
+      - apk add --no-cache bash
       - VERSION="${CI_COMMIT_TAG#v}"
       - mkdir -p dist
       - ./scripts/make-src-tarball.sh "$VERSION" dist
