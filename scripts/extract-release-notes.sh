@@ -4,9 +4,15 @@
 # itself holds the full history of every release (see AGENTS.md), so it
 # can't be used verbatim as a single release's notes.
 #
-# Each entry starts with a line like "## v0.8.1 — <summary>" and runs until
-# the next "## v" heading (or EOF for the newest entry, since it's at the
-# top of the file - see AGENTS.md's release convention).
+# Each entry starts with a line like "## v0.8.1 — <summary>" and has a
+# "### User-facing changes" subsection followed by a "### Details"
+# subsection (see AGENTS.md's release convention: the merge/release
+# description is user-facing changes only, no low-level implementation
+# detail - RELEASE_NOTES.md keeps the Details narrative for posterity, but
+# it isn't what should ship in a GitHub Release body). This prints only
+# from the "## vX.Y.Z" heading up to (not including) "### Details" - or up
+# to the next "## v" heading as a fallback if an entry has no Details
+# subsection at all.
 #
 # Usage: extract-release-notes.sh <tag> <release-notes-file>
 # Prints the section to stdout; exits 1 if the tag has no matching heading.
@@ -22,6 +28,7 @@ file="$2"
 
 section="$(awk -v tag="## ${tag} " '
     $0 ~ "^" tag { found=1; print; next }
+    found && /^### Details/ { exit }
     found && /^## v/ { exit }
     found { print }
 ' "$file")"

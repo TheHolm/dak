@@ -5,15 +5,15 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
-## v0.8.2 — Woodpecker CI: tag-triggered release packaging to GitHub
+## v0.8.2 — Prebuilt packages now available for every release
 
 ### User-facing changes
-- No changes to the `dak` binary itself.
-- Tagged releases (`vX.Y.Z`) are now built and published automatically:
-  each release gets a source tarball, a Debian trixie `.deb`, an Ubuntu
-  26.04 LTS `.deb`, and a FreeBSD `.pkg`, all attached to a GitHub Release
-  on the public mirror (github.com/theholm/dak) with that tag's
-  `RELEASE_NOTES.md` section as the release body.
+- No changes to `dak` itself since v0.8.1.
+- Tagged releases now come with ready-to-install packages attached to the
+  GitHub Releases page (github.com/theholm/dak/releases): a Debian trixie
+  `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD 15.1-RELEASE `.pkg` (all
+  amd64/x86_64), alongside GitHub's own automatically generated source
+  archive.
 
 ### Details
 The repo is developed on an on-prem Gitea instance (not internet-facing)
@@ -28,26 +28,72 @@ independently of CI.
 Added:
 - `.woodpecker/release.yaml` - the only tag-triggered workflow
   (`event: tag`, `ref: refs/tags/v*`, never runs on branch pushes or PRs).
-  Builds all four artifacts above then runs `gh release create`. Every step
-  uses a plain official base image (`rust:1.92-trixie`, `ubuntu:26.04`,
-  `debian:trixie-slim`) and installs whatever it needs inline
-  (apt-get/`cargo install`/`rustup`/the FreeBSD sysroot download) - an
-  earlier version of this instead used prebuilt custom images to avoid
-  redoing those installs on every release, but that required bind-mounting
-  the Woodpecker agent's Docker socket, which needs the repo marked
-  "Trusted" (an admin-only setting not available here), so that approach
-  was dropped in favor of this simpler, slower-per-release one. Tags are
-  rare (real releases only), so the extra download time per release is an
-  acceptable trade-off.
+  Three independent steps (`freebsd-pkg`, `deb-ubuntu2604`, `deb-trixie`,
+  in that order - `freebsd-pkg` first since it's the slowest, so it isn't
+  left queued behind the others if agent concurrency is limited) run in
+  parallel via `depends_on: []`, each producing one artifact into a shared
+  `dist/`; `publish-github-release` depends on all three and runs
+  `gh release create` once they're done. No separate source-tarball step -
+  GitHub already auto-generates one from the tag, so building/uploading a
+  redundant one ourselves was dropped. Every step uses a plain official
+  base image (`rust:1.92-trixie`, `ubuntu:26.04`) and installs whatever it
+  needs inline (apt-get/`cargo install`/`rustup`/the FreeBSD sysroot
+  download) - an earlier version of this instead used prebuilt custom
+  images to avoid redoing those installs on every release, but that
+  required bind-mounting the Woodpecker agent's Docker socket, which needs
+  the repo marked "Trusted" (an admin-only setting not available here), so
+  that approach was dropped in favor of this simpler, slower-per-release
+  one. Tags are rare (real releases only), so the extra download time per
+  release is an acceptable trade-off.
+- `cargo deb --deb-revision "1~trixie"` / `"1~ubuntu2604"` on the two `.deb`
+  steps - cargo-deb's default naming (`dak_<version>-1_amd64.deb`) doesn't
+  encode which distro a package was built for, so both steps produced an
+  identically-named file into the same shared `dist/`, and the second one
+  silently overwrote the first (only one `.deb` ever actually made it into
+  a real GitHub release, with no indication which). The `~`-prefixed
+  suffix matches Debian's version syntax for the revision component (which
+  disallows hyphens - only digits/letters/`.`/`+`/`~` are permitted there),
+  same convention Ubuntu PPAs use for the same purpose (e.g. `~ubuntu20.04`).
+- `freebsd-pkg` references `${CI_COMMIT_TAG#v}` directly instead of an
+  intermediate `VERSION=` shell variable assigned once at the top of the
+  step - the variable came out empty in a real run's uploaded artifact
+  (`dak--freebsd-amd64.pkg`, empty version) despite the identical pattern
+  working fine in the since-removed, much shorter `src-tarball` step; exact
+  mechanism not conclusively identified, but referencing the real
+  environment variable at the point of use sidesteps the whole class of bug.
 - `scripts/build-freebsd-pkg.py` - promotes the throwaway `.pkg`-building
   recipe from `NOTES.md` section 2.3 into a real, parametrized script (it
   discovers files by walking a staged install root instead of a hardcoded
-  file list, so it isn't tied to `dak`'s current file set).
-- `scripts/make-src-tarball.sh` - wraps `git archive` for the source tarball
-  asset.
+  file list, so it isn't tied to `dak`'s current file set). Its `tar`
+  invocation originally chained a relative `-C stage_root` after an
+  absolute `-C manifest_dir` in the same command - GNU tar's `-C` is
+  positional/cumulative, not reset per use, so the second `-C` resolved
+  *inside* the first one's target and failed with
+  `tar: stage-root: Cannot open: No such file or directory`. Fixed by
+  resolving `stage_root` to an absolute path first (also fixed the same
+  latent bug in `NOTES.md`'s original recipe, which apparently never
+  actually hit it when first hand-validated).
+- The FreeBSD sysroot extraction step originally carried over tar member
+  paths from `NOTES.md`'s FreeBSD 14.5 `rsync`-based recipe unchanged, and
+  failed against a real FreeBSD 15.x `base.txz` with "Not found in
+  archive" for every single member. Root cause (found by actually
+  downloading and inspecting a real `base.txz` with `tar -tvJf`): every
+  member needs a leading `./` when extracting via `tar -x <member> ...`
+  (GNU tar doesn't normalize that away for explicitly named members,
+  unlike for `rsync`), and `libutil.so.9` was bumped to `libutil.so.10`
+  between FreeBSD 14.5 and 15.x. Documented both findings in `NOTES.md`
+  section 1.4a. Also caught (while fixing this) that FreeBSD 15.1-RELEASE
+  had already superseded the originally-pinned 15.0-RELEASE - bumped the
+  pin after confirming the sysroot file list is identical between the two
+  (same major ABI version, as expected).
 - `scripts/extract-release-notes.sh` - pulls just one tag's section out of
   `RELEASE_NOTES.md` (which holds the full history) for use as the GitHub
-  Release body.
+  Release body. Originally extracted the whole `## vX.Y.Z` section
+  including this Details narrative, dumping all of it into real release
+  bodies where actual users would see it - not what `AGENTS.md`'s release
+  convention intends (merge/release descriptions are meant to be
+  user-facing only). Fixed to stop at the `### Details` heading instead of
+  the next `## v` heading.
 - `Cargo.toml` gained `description`/`license`/`repository`/`authors` fields,
   which `cargo-deb` requires (or at least wants) to build a package at all
   (it previously had only `name`/`version`/`edition`).

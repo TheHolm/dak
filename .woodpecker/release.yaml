@@ -3,20 +3,34 @@
 # release process and `git tag -l`). Never runs on ordinary branch pushes or
 # pull requests.
 #
-# Every step below uses a plain, official base image and installs whatever
-# it needs inline (apt-get/cargo install/rustup/FreeBSD sysroot download).
+# Every step uses a plain, official base image and installs whatever it
+# needs inline (apt-get/cargo install/rustup/FreeBSD sysroot download).
 #
-# An earlier version of this pipeline used prebuilt custom images (built by
-# a since-removed .woodpecker/build-ci-images.yaml) to avoid redoing those
-# installs on every release. That required bind-mounting the Woodpecker
-# agent's Docker socket, which Woodpecker only allows for repos marked
-# "Trusted" (an admin-only setting) - since that's not available here,
-# every step below just does its own installs inline instead, and every
-# tagged release re-downloads its own toolchain. Tags are rare (real
+# An earlier version of this pipeline used prebuilt custom images to avoid
+# redoing those installs on every release. That required bind-mounting the
+# Woodpecker agent's Docker socket, which Woodpecker only allows for repos
+# marked "Trusted" (an admin-only setting) - since that's not available
+# here, every step below just does its own installs inline instead, and
+# every tagged release re-downloads its own toolchain. Tags are rare (real
 # releases only), so this is an acceptable trade-off. Revisit with a proper
 # build cache (e.g. a plugin-cache backed by S3/Minio, which needs no
 # Trusted flag since it works over plain HTTP rather than mounting host
 # paths) if release build times become a real problem.
+#
+# freebsd-pkg/deb-ubuntu2604/deb-trixie are fully independent of each other
+# (depends_on: [] puts the whole workflow into DAG mode, so they run
+# concurrently rather than the default serial-by-definition-order) - only
+# publish-github-release needs to wait for all three. freebsd-pkg is listed
+# first since it's the slowest (sysroot download + cross-compile), so if
+# the agent's concurrency is limited it isn't left queued behind the other
+# two. Actual parallelism also depends on the Woodpecker agent's own
+# concurrency setting allowing more than one step container at a time - the
+# DAG here just describes what's *allowed* to run concurrently.
+#
+# There's no separate source-tarball step: GitHub already auto-generates a
+# "Source code (zip/tar.gz)" download for every release from the underlying
+# git tag, so building and uploading a redundant one ourselves would just
+# be extra work for a strictly worse (less discoverable) result.
 #
 # Requirements for this to work:
 #   - A `github_token` secret is set on this repo in Woodpecker (Project
@@ -32,49 +46,14 @@ when:
     ref: refs/tags/v*
 
 steps:
-  # Reuses the same image as the deb-trixie step below (already needed there)
-  # instead of a separate alpine/git pull - it's Debian-based (via
-  # buildpack-deps:trixie-scm), so bash and git are already present, no
-  # apk/apt-get install needed for just a `git archive`.
-  - name: src-tarball
-    image: rust:1.92-trixie
-    commands:
-      - VERSION="${CI_COMMIT_TAG#v}"
-      - mkdir -p dist
-      - ./scripts/make-src-tarball.sh "$VERSION" dist
-
-  - name: deb-trixie
-    image: rust:1.92-trixie
-    environment:
-      CARGO_TARGET_DIR: target/deb-trixie
-    commands:
-      - apt-get update && apt-get install -y --no-install-recommends libudev-dev
-      - cargo install cargo-deb --locked
-      - mkdir -p dist
-      - cargo deb
-      - cp target/deb-trixie/debian/*.deb dist/
-
-  - name: deb-ubuntu2604
-    image: ubuntu:26.04
-    environment:
-      CARGO_TARGET_DIR: target/deb-ubuntu2604
-    commands:
-      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libudev-dev pkg-config
-      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
-      - . "$HOME/.cargo/env"
-      - cargo install cargo-deb --locked
-      - mkdir -p dist
-      - cargo deb
-      - cp target/deb-ubuntu2604/debian/*.deb dist/
-
   - name: freebsd-pkg
     image: rust:1.92-trixie
+    depends_on: []
     environment:
       CARGO_TARGET_DIR: target/freebsd
       CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER: clang
       RUSTFLAGS: "-C link-arg=--target=x86_64-unknown-freebsd15 -C link-arg=--sysroot=/opt/freebsd-sysroot -C link-arg=-fuse-ld=lld -C link-arg=-B/opt/freebsd-sysroot/usr/lib"
     commands:
-      - VERSION="${CI_COMMIT_TAG#v}"
       - rustup target add x86_64-unknown-freebsd
       - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3
       - mkdir -p /opt/freebsd-sysroot
@@ -115,14 +94,58 @@ steps:
       - chmod 555 stage-root/usr/local/bin/dak
       - cp README.markdown LICENSE stage-root/usr/local/share/doc/dak/
       - chmod 644 stage-root/usr/local/share/doc/dak/README.markdown stage-root/usr/local/share/doc/dak/LICENSE
+      # Uses ${CI_COMMIT_TAG#v} directly rather than an intermediate VERSION=
+      # shell variable - an earlier version of this step assigned VERSION
+      # once at the top and referenced it here, many commands later, and it
+      # came out empty in the actual uploaded artifact (dak--freebsd-amd64.pkg)
+      # despite the identical pattern working fine in a shorter step. Root
+      # cause not conclusively identified; referencing the real environment
+      # variable directly at the point of use sidesteps the whole class of
+      # bug regardless of the exact mechanism.
       - >-
         python3 scripts/build-freebsd-pkg.py
-        --version "$VERSION"
+        --version "${CI_COMMIT_TAG#v}"
         --stage-root stage-root
-        --output "dist/dak-${VERSION}-freebsd-amd64.pkg"
+        --output "dist/dak-${CI_COMMIT_TAG#v}-freebsd-amd64.pkg"
+
+  - name: deb-ubuntu2604
+    image: ubuntu:26.04
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/deb-ubuntu2604
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libudev-dev pkg-config
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+      - . "$HOME/.cargo/env"
+      - cargo install cargo-deb --locked
+      - mkdir -p dist
+      # --deb-revision disambiguates the two .deb outputs: cargo-deb's
+      # default naming (dak_<version>-1_amd64.deb) doesn't encode which
+      # distro it was built for, so building both trixie and ubuntu2604
+      # into the same shared dist/ directory silently overwrote one with
+      # the other (only one .deb ever made it into the actual GitHub
+      # release). ~-prefixed suffix matches the Debian version syntax for
+      # the revision component, which disallows hyphens (Debian policy
+      # only permits digits/letters/./+/~ there) - matches the convention
+      # Ubuntu PPAs use for the same purpose (e.g. ~ubuntu20.04).
+      - cargo deb --deb-revision "1~ubuntu2604"
+      - cp target/deb-ubuntu2604/debian/*.deb dist/
+
+  - name: deb-trixie
+    image: rust:1.92-trixie
+    depends_on: []
+    environment:
+      CARGO_TARGET_DIR: target/deb-trixie
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends libudev-dev
+      - cargo install cargo-deb --locked
+      - mkdir -p dist
+      - cargo deb --deb-revision "1~trixie"
+      - cp target/deb-trixie/debian/*.deb dist/
 
   - name: publish-github-release
-    image: debian:trixie-slim
+    image: rust:1.92-trixie
+    depends_on: [freebsd-pkg, deb-ubuntu2604, deb-trixie]
     environment:
       GH_TOKEN:
         from_secret: github_token

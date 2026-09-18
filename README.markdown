@@ -72,6 +72,8 @@ All runtime behavior is driven by `config.json` instead of the hard-coded demo o
 
 The target platforms are generic Linux and FreeBSD. No effort is made (or planned) to make the code compile and run under any other platform.
 
+Prebuilt packages for tagged releases are published to [GitHub Releases](https://github.com/theholm/dak/releases): a Debian trixie `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD 15.1-RELEASE `.pkg` (all amd64/x86_64), plus GitHub's automatically generated source archive.
+
 ## Config structure
 
 `config.json` drives all runtime behavior. The top level of the config is a dictionary with up to four keys:

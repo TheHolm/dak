@@ -53,6 +53,8 @@ under other platforms.
   convention below
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
 - `NOTES.md` — agent-to-agent knowledge base for cross-compiling/packaging/testing `dak` for FreeBSD from Linux (sysroot setup, building a `.pkg`, jail-based dependency testing). Read it before touching CI or cross-compilation; keep it updated as you learn more, don't let it go stale.
+- `.woodpecker/release.yaml` — tag-triggered CI pipeline (`event: tag`, `ref: refs/tags/v*`) that builds a Debian trixie `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD `.pkg`, then publishes them to a GitHub Release; `.woodpecker/check-target-freshness.yaml` — monthly cron job flagging when the OS versions pinned in `release.yaml` go stale (see `scripts/check-target-freshness.sh`)
+- `scripts/` — helpers used only by `.woodpecker/*.yaml`: `build-freebsd-pkg.py` (builds the FreeBSD `.pkg`, see `NOTES.md` section 2), `extract-release-notes.sh` (pulls one tag's user-facing section out of `RELEASE_NOTES.md` for the GitHub release body), `check-target-freshness.sh` (the actual staleness checks referenced above)
 
 ## Device notes
 
