@@ -37,9 +37,9 @@ under other platforms.
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
 - `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
   key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,
-  used by `tests/hardware.rs` to detect and drive real hardware; `main.rs` and
-  `map.rs` keep their own private copies of the same constants for their own
-  connection setup rather than depending on this module
+  used by `tests/hardware.rs` and `tests/hardware_read_loop.rs` to detect and drive
+  real hardware; `main.rs` and `map.rs` keep their own private copies of the same
+  constants for their own connection setup rather than depending on this module
 - `src/lib.rs` — library crate exposing config loading/validation and the scene
   runner so both the binary and the integration tests can drive it
 - `config.json` — the user's own runtime config (gitignored, not checked in):
@@ -69,11 +69,24 @@ Work in progress. Current known issues:
 - `main.rs` config errors are printed, but the program still exits with `MirajazzError::BadData` regardless of the specific failure
 - `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's
   interactive I/O still have no test coverage (both need a physical device *and*
-  driving actual button presses/encoder turns/typed answers, which `tests/hardware.rs`
-  deliberately doesn't attempt). `tests/hardware.rs` does cover, against real
-  hardware when attached (skipping itself otherwise): enumeration, connect/identify/
-  shutdown, `set_brightness`, the `set_button_image`/`flush`/`clear_button_image`
-  image path, and opening the raw input reader without erroring
+  driving actual button presses/encoder turns/typed answers, which
+  `tests/hardware.rs`/`tests/hardware_read_loop.rs` deliberately don't attempt).
+  Between them, those two files cover, against real hardware when attached
+  (skipping themselves otherwise): enumeration, connect/identify/shutdown,
+  `set_brightness`, the `set_button_image`/`flush`/`clear_button_image` image
+  path, and opening the raw input reader without erroring. The raw-input-reader
+  test lives in its own `tests/hardware_read_loop.rs` binary rather than
+  alongside the others in `tests/hardware.rs`: on FreeBSD it starts a background
+  reader thread that (deliberately, to avoid a worse shutdown-hang bug) never
+  releases the device's `hidraw` node for the rest of the process's life once
+  nothing more ever reads from it, which would otherwise make every hardware
+  test that ran afterwards *in the same process* falsely report "no device
+  attached" instead of a real pass. Both files also serialize their own tests
+  against each other via `tests/hardware_common`'s `lock_hardware()` (see its
+  doc comment): the real device only allows one open handle at a time, and
+  `cargo test`'s default parallelism otherwise races multiple tests against it,
+  intermittently causing that same false "no device" skip or, worse, genuine
+  test failures
 
 ## Commands
 

@@ -12,6 +12,15 @@
 //! when no device is found, so this file (and `cargo test` as a whole) still
 //! succeeds unattended on a machine with no keypad connected.
 //!
+//! Every test also starts by acquiring
+//! [`hardware_common::lock_hardware`] before that presence check, and holds
+//! the guard for its whole body: `cargo test`'s default parallelism runs
+//! multiple tests in this file concurrently, but the real device only allows
+//! one open handle at a time, so unguarded concurrent tests intermittently
+//! either false-skip (losing a connect race during the presence check) or
+//! fail outright (losing it just after) - confirmed by hand on a 2-CPU
+//! machine. See `hardware_common`'s doc comment for detail.
+//!
 //! Every test uses `#[tokio::test(flavor = "multi_thread")]`, matching the
 //! multi-threaded runtime `#[tokio::main]` gives the real binary: `mirajazz`'s
 //! image conversion path (used by [`uploads_and_clears_a_button_image`]) calls
@@ -19,48 +28,22 @@
 //! multi-threaded runtime") under the single-threaded runtime `#[tokio::test]`
 //! defaults to - a real bug this test caught by actually running against
 //! hardware with the default flavor before this was added.
-
-use std::time::Duration;
+//!
+//! `read_loop_does_not_error_without_input` deliberately lives in its own
+//! `tests/hardware_read_loop.rs` binary rather than here - see that file's doc
+//! comment for why sharing a process with it corrupts every hardware test that
+//! runs afterwards.
 
 // See src/lib.rs for why this is needed on FreeBSD only: each integration test file
 // compiles as its own crate, so it needs its own copy of the rename.
 #[cfg(target_os = "freebsd")]
 extern crate mirajazz_freebsd as mirajazz;
 
+mod hardware_common;
+
 use dak::actions::ButtonDevice;
 use dak::hardware;
-use mirajazz::device::Device;
-use mirajazz::types::DeviceInput;
-
-/// Prints a skip notice and returns `true` when no supported device is attached.
-///
-/// Every test in this file starts with `if skip_without_hardware().await { return; }`
-/// so it passes trivially instead of failing when run without real hardware.
-async fn skip_without_hardware() -> bool {
-    if hardware::is_present().await {
-        false
-    } else {
-        eprintln!("skipping: no Ajazz AKP03E/AKP03R device attached");
-        true
-    }
-}
-
-/// Connects to the first attached device using the same protocol version and
-/// default key/encoder counts `map.rs` uses before the real counts are known.
-/// Shared by every test below that needs a live connection.
-async fn connect() -> Device {
-    let devices = hardware::discover()
-        .await
-        .expect("enumeration should succeed once is_present() reported a device");
-    Device::connect(
-        &devices[0],
-        hardware::PROTOCOL_VERSION,
-        hardware::DEFAULT_KEY_COUNT,
-        hardware::DEFAULT_ENCODER_COUNT,
-    )
-    .await
-    .expect("connect should succeed against real hardware")
-}
+use hardware_common::{connect, lock_hardware, skip_without_hardware};
 
 /// Confirms [`hardware::discover`] finds at least one device, and that every
 /// discovered device actually matches the Ajazz vendor/product ID DAK targets -
@@ -68,6 +51,7 @@ async fn connect() -> Device {
 /// also attached to the test machine.
 #[tokio::test(flavor = "multi_thread")]
 async fn discovers_only_ajazz_devices() {
+    let _guard = lock_hardware().await;
     if skip_without_hardware().await {
         return;
     }
@@ -88,6 +72,7 @@ async fn discovers_only_ajazz_devices() {
 /// wizard both perform.
 #[tokio::test(flavor = "multi_thread")]
 async fn connects_and_reports_identity() {
+    let _guard = lock_hardware().await;
     if skip_without_hardware().await {
         return;
     }
@@ -105,6 +90,7 @@ async fn connects_and_reports_identity() {
 /// initialization handshake the keypad needs before it responds to anything.
 #[tokio::test(flavor = "multi_thread")]
 async fn sets_brightness() {
+    let _guard = lock_hardware().await;
     if skip_without_hardware().await {
         return;
     }
@@ -124,6 +110,7 @@ async fn sets_brightness() {
 /// display sanity check both rely on.
 #[tokio::test(flavor = "multi_thread")]
 async fn uploads_and_clears_a_button_image() {
+    let _guard = lock_hardware().await;
     if skip_without_hardware().await {
         return;
     }
@@ -184,6 +171,7 @@ async fn drive_through_button_device<D: ButtonDevice>(
 /// directly (the other tests in this file), neither of which reaches this impl.
 #[tokio::test(flavor = "multi_thread")]
 async fn button_device_trait_drives_a_real_device() {
+    let _guard = lock_hardware().await;
     if skip_without_hardware().await {
         return;
     }
@@ -192,29 +180,6 @@ async fn button_device_trait_drives_a_real_device() {
     drive_through_button_device(&device, hardware::DEFAULT_KEY_COUNT)
         .await
         .expect("ButtonDevice methods should succeed against real hardware");
-
-    device.shutdown().await.expect("shutdown should succeed");
-}
-
-/// Opens the raw input reader and confirms a short, unattended read attempt
-/// either times out or returns without a transport-level error - i.e. the read
-/// path `run_device`'s main loop and the wizard's capture steps rely on
-/// (`get_reader` + `raw_read_data`) is wired correctly, without requiring
-/// anyone to actually press a button during an unattended test run.
-#[tokio::test(flavor = "multi_thread")]
-async fn read_loop_does_not_error_without_input() {
-    if skip_without_hardware().await {
-        return;
-    }
-
-    let device = connect().await;
-    let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
-
-    match tokio::time::timeout(Duration::from_millis(300), reader.raw_read_data(512)).await {
-        Ok(Ok(_)) => {} // a report arrived (e.g. a keepalive); fine, no error
-        Ok(Err(error)) => panic!("raw_read_data returned a transport error: {error}"),
-        Err(_) => {} // no data within the timeout; expected when nothing is pressed
-    }
 
     device.shutdown().await.expect("shutdown should succeed");
 }
