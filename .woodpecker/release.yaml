@@ -78,28 +78,33 @@ steps:
       - rustup target add x86_64-unknown-freebsd
       - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3
       - mkdir -p /opt/freebsd-sysroot
-      # CAUTION: the base.txz URL/tar-member paths below are carried over from the
-      # FreeBSD 14.5 verification in NOTES.md section 1.4 and have NOT been
-      # re-verified against a real FreeBSD 15.x base.txz (no outbound internet was
-      # available while writing this). Fix in place if this step 404s or the tar
-      # extraction finds nothing, then update this comment and NOTES.md.
+      # Verified against a real FreeBSD 15.0-RELEASE base.txz (downloaded and
+      # inspected with `tar -tvJf`): every member needs the leading `./` -
+      # GNU tar does NOT normalize that away when extracting explicitly
+      # named members, contrary to what NOTES.md section 1.4 assumed -
+      # and `libutil.so.9` was bumped to `libutil.so.10` in FreeBSD 15
+      # (soname bump, everything else unchanged from the 14.5 list). If a
+      # future FreeBSD release moves other sonames, re-run
+      # `tar -tvJf base.txz | grep <libname>` against that release's
+      # base.txz to find the new name, then update this list, this comment,
+      # and NOTES.md section 1.4.
       - curl -fsSL -o /tmp/base.txz https://download.freebsd.org/releases/amd64/amd64/15.0-RELEASE/base.txz
       - >-
         tar -xJf /tmp/base.txz -C /opt/freebsd-sysroot
-        lib/libc.so.7 usr/lib/libc.so usr/lib/libc_nonshared.a
-        lib/libm.so.5 usr/lib/libm.so
-        lib/libutil.so.9 usr/lib/libutil.so
-        lib/librt.so.1 usr/lib/librt.so
-        usr/lib/libexecinfo.so.1 usr/lib/libexecinfo.so
-        lib/libkvm.so.7 usr/lib/libkvm.so
-        usr/lib/libmemstat.so.3 usr/lib/libmemstat.so
-        usr/lib/libprocstat.so.1 usr/lib/libprocstat.so
-        lib/libdevstat.so.7 usr/lib/libdevstat.so
-        lib/libthr.so.3 usr/lib/libthr.so usr/lib/libpthread.so
-        lib/libgcc_s.so.1 usr/lib/libgcc_s.so
-        usr/lib/crt1.o usr/lib/Scrt1.o usr/lib/crti.o usr/lib/crtn.o
-        usr/lib/crtbegin.o usr/lib/crtbeginS.o usr/lib/crtbeginT.o
-        usr/lib/crtend.o usr/lib/crtendS.o
+        ./lib/libc.so.7 ./usr/lib/libc.so ./usr/lib/libc_nonshared.a
+        ./lib/libm.so.5 ./usr/lib/libm.so
+        ./lib/libutil.so.10 ./usr/lib/libutil.so
+        ./lib/librt.so.1 ./usr/lib/librt.so
+        ./usr/lib/libexecinfo.so.1 ./usr/lib/libexecinfo.so
+        ./lib/libkvm.so.7 ./usr/lib/libkvm.so
+        ./usr/lib/libmemstat.so.3 ./usr/lib/libmemstat.so
+        ./usr/lib/libprocstat.so.1 ./usr/lib/libprocstat.so
+        ./lib/libdevstat.so.7 ./usr/lib/libdevstat.so
+        ./lib/libthr.so.3 ./usr/lib/libthr.so ./usr/lib/libpthread.so
+        ./lib/libgcc_s.so.1 ./usr/lib/libgcc_s.so
+        ./usr/lib/crt1.o ./usr/lib/Scrt1.o ./usr/lib/crti.o ./usr/lib/crtn.o
+        ./usr/lib/crtbegin.o ./usr/lib/crtbeginS.o ./usr/lib/crtbeginT.o
+        ./usr/lib/crtend.o ./usr/lib/crtendS.o
       - rm -f /tmp/base.txz
       - cargo build --release --target x86_64-unknown-freebsd
       - mkdir -p dist stage-root/usr/local/bin stage-root/usr/local/share/doc/dak

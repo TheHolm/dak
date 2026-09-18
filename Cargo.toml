@@ -2,6 +2,7 @@
 name = "dak"
 version = "0.8.2"
 edition = "2021"
+authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"
 # `license` and `license-file` are mutually exclusive in Cargo.toml; AGPL-3.0-or-later
 # has a valid SPDX identifier so that's used here rather than license-file - cargo-deb

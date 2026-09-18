@@ -175,6 +175,36 @@ EOF
 rsync -avz --files-from=/tmp/sysroot_files.txt --relative <freebsd-host>:/ ./freebsd-sysroot/
 ```
 
+### 1.4a Building the same sysroot without a live FreeBSD host (CI)
+
+`.woodpecker/release.yaml`'s `freebsd-pkg` step needs the same file list but
+has no live FreeBSD box to `rsync` from - only outbound internet access. It
+instead downloads a release's `base.txz` distribution set directly from
+`download.freebsd.org` and extracts just the needed members with GNU tar's
+selective extraction (`tar -xJf base.txz -C sysroot <member> <member> ...`).
+
+This needs two adjustments relative to the `rsync` recipe above, both found
+by actually downloading and inspecting a real FreeBSD **15.0-RELEASE**
+`base.txz` (`tar -tvJf base.txz`, ~30k entries) after the CI step first
+failed with every single member reporting "Not found in archive":
+
+- **Every member needs a literal leading `./`** (e.g. `./lib/libc.so.7`, not
+  `lib/libc.so.7` or `/lib/libc.so.7`) - `base.txz`'s tar members are all
+  stored as `./lib/...`/`./usr/lib/...`, and GNU tar's selective extraction
+  does **not** normalize away a missing/extra leading `./` when matching
+  member names given on the command line - it needs an exact string match.
+  (This is unrelated to the section 2.1 `.pkg`-building gotcha, which is
+  about `-P`/`--transform` and tar member names on *write*, not `extract`
+  argument matching on *read* - don't conflate the two.)
+- **`libutil.so.9` is `libutil.so.10` in FreeBSD 15** (soname bump between
+  14.5 and 15.0) - confirmed via `grep libutil /tmp/full_list.txt` against
+  the real 15.0-RELEASE `base.txz`. Every other file in the list is
+  unchanged between 14.5 and 15.0.
+
+If a future FreeBSD release moves another soname, the same
+download-and-`tar -tvJf`-grep process will find the new name - don't
+re-guess from the 14.5 list.
+
 ### 1.5 Cargo/linker configuration
 
 `.cargo/config.toml` (this exact file is **gitignored** - see below - because
