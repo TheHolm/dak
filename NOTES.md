@@ -19,11 +19,13 @@
 > - Nothing here has been wired into actual CI yet (see the TODO section) -
 >   it's the reconnaissance for building that.
 
-All of the below was worked out and verified on: a Debian 13 (trixie) Linux
-sandbox (no root filesystem access beyond apt/rustup) cross-compiling for, and
-testing against, a FreeBSD 14.5-RELEASE amd64 VM. Re-verify version-specific
-details (library sonames, jail base.txz URL, etc.) if the target FreeBSD
-release changes.
+All of sections 1-5 below was worked out and verified on: a Debian 13
+(trixie) Linux sandbox (no root filesystem access beyond apt/rustup)
+cross-compiling for, and testing against, a FreeBSD 14.5-RELEASE amd64 VM.
+Re-verify version-specific details (library sonames, jail base.txz URL,
+etc.) if the target FreeBSD release changes. Section 6 is unrelated
+(animated button images against real Linux-attached hardware, not
+FreeBSD/cross-compiling) and states its own environment inline.
 
 ## Table of contents
 
@@ -32,6 +34,7 @@ release changes.
 3. [Testing a package without a full VM (jails)](#3-testing-a-package-without-a-full-vm-jails)
 4. [`dak`'s actual runtime dependencies on FreeBSD](#4-daks-actual-runtime-dependencies-on-freebsd)
 5. [CI TODO / open questions](#5-ci-todo--open-questions)
+6. [Animated button images: real-hardware findings](#6-animated-button-images-real-hardware-findings)
 
 ---
 
@@ -595,3 +598,127 @@ this into an actual CI pipeline.
       `amd64`, or FreeBSD releases other than 14.5 - version/arch-specific
       details (library sonames, `base.txz` URL shape, jail cleanup
       specifics) may need re-verification.
+
+---
+
+## 6. Animated button images: real-hardware findings
+
+Verified on a real Ajazz AKP03E (protocol v2, VID:PID `0300:3002`) over SSH
+against a Linux (Debian 13) test VM, using throwaway (never committed)
+example binaries that pushed a drawn-not-static animation to button images
+each frame instead of the usual "set once, leave it" usage. Buttons here
+means the first 6 device-relative keys (0-5) - the screen-capable ones on
+this device model; keys 6-8 have no display at all.
+
+### Sustained throughput: 30fps across 6 buttons is free
+
+A steady 30fps update of all 6 button screens at once ran for a full 3 hours
+straight with **zero** HID write errors and **zero** fps dips - averaged
+exactly 30.00fps for the entire run, every one of 360 logged 30-second
+windows on target, no slowdown trend. Each frame (6 images staged +
+1 shared `flush()`) cost ~12ms average / ~24ms worst case, comfortably
+inside the 33ms/frame budget. Conclusion: 30fps on every screen at once is
+solidly within this device's capability for as long as you'd want to run it,
+not just a short demo.
+
+### Max throughput and where the real bottleneck is
+
+Removing all pacing (push frames as fast as the code + device allow) on the
+same 6 buttons sustained **~85fps**, not much more - and the reason why is
+useful:
+
+- Per frame: encode (draw + JPEG-encode 6 images) ~1.9ms (~16%) vs. HID
+  transfer (write + flush) ~9.9ms (~84%). Transfer dominates completely;
+  encoding is nearly free.
+- Process CPU usage: ~31% of *one* core, with 2 cores available - nowhere
+  near CPU-bound.
+- Actual USB-bus utilization (measured via `usbmon`, see below): only
+  **~2.7%** of the 480Mbit/s High-Speed link.
+- What *is* saturated: the rate of individual HID reports going out -
+  **~1,600 reports/sec (~0.62ms/report)**, matching the observed frame rate
+  almost exactly (a 6-button frame takes ~19 reports: a "BAT" header +
+  ~2 image-data chunks per button, plus one shared "STP" flush report).
+
+So the bottleneck is neither this host's CPU nor raw USB bandwidth - it's
+the **number of individual HID reports per update**, each a fixed 1024-byte
+interrupt-OUT transaction (protocol v2's `packet_size` is 1024) regardless of
+how little of that report is meaningful payload. A short command (the image
+header, the flush) costs exactly as much wire time as a full data chunk.
+This means: fewer, larger writes would help throughput far more than a
+faster host, less CPU work, or smaller images - there's currently no way to
+batch multiple buttons' image data into fewer reports (mirajazz's
+`send_image` always emits one "BAT" header per button), so this is a
+protocol-level ceiling, not something dak's own code controls.
+
+### Gotcha: `Device::shutdown()` blanks the display like `sleep()`
+
+`Device::shutdown()`'s final wire command is byte-for-byte the same as
+`Device::sleep()` (`"HAN"`). A test/demo that runs for a fixed duration and
+then calls `shutdown()` will have already gone dark by the time a human
+actually looks at the screen, since there's essentially always some delay
+between "the program finished" and "someone checks" - this bit a first
+attempt at an animation demo (ran, finished, blanked, all within the time it
+took to report back "done"). Fix: for anything meant to be *watched live*,
+loop until interrupted (SIGINT/`kill -INT <pid>`) instead of a fixed
+duration, so there's a real window to look during which the screen is
+still lit and updating.
+
+### mirajazz tip: getting the encoded byte size
+
+`Device::set_button_image` (and the `ButtonDevice` trait dak wraps it with)
+hides the encoded JPEG size - it encodes and caches internally, returning
+only `Result<(), _>`. Both `mirajazz::images::convert_image_with_format`
+(the `pub fn` that does the encoding) and `Device::write_image` (the
+`pub` method that stages already-encoded bytes, which
+`set_button_image` calls internally after encoding) are public, so calling
+them directly instead - encode yourself, then stage the bytes - gets you the
+byte count for free, with an identical wire format either way.
+
+### Gotcha: backgrounding a job over a non-interactive `ssh` doesn't reliably detach it
+
+`ssh host 'nohup cmd >log 2>&1 </dev/null & disown; ...'` does start `cmd`
+detached on the remote host correctly, **but** the invoking `ssh` command
+itself can hang/block well past the point where the remote shell has
+finished its own script - don't assume it returning promptly is required or
+even expected; verify independently with a fresh `ssh host pgrep ...`
+instead of trusting the return of the command that launched the background
+job.
+
+The converse bit harder: a local "poll until the remote job finishes" loop
+(`ssh host 'while pgrep ...; do sleep 60; done; ...'`) that gets force-killed
+from the *local* side (e.g. a tool's own timeout) does not necessarily kill
+the *remote* loop - it can be left running as an orphan on the VM
+indefinitely. Observed directly: such a loop kept polling for ~7 hours after
+the process it was waiting for had already exited (and the loop's own exit
+condition had been true the whole time) simply because nothing ever
+re-connected to check on it or kill it. Always explicitly check for (and
+clean up) stray remote processes after this pattern - killing/timing-out the
+local side is not sufficient.
+
+### Measuring real USB-bus traffic with `usbmon`
+
+Independent of whatever the app itself reports, the kernel's `usbmon`
+facility gives ground-truth bytes/URBs on the wire:
+
+```sh
+# one-time, needs root:
+/sbin/modprobe usbmon        # full path: kmod's modprobe may not be on a non-root PATH via `su -c`
+
+# find which USB bus the device is actually on:
+lsusb -d 0300:3002           # e.g. "Bus 002 Device 003: ..." -> bus 2
+
+# capture that bus only while the workload runs (bus number 0 = all buses combined):
+cat /sys/kernel/debug/usb/usbmon/2u > capture.txt   # needs root; file is mode 0600 root:root
+```
+
+Text format, one line per event: `tag timestamp_us S|C|E address
+status_or_pending length [hex data...]`, where `address` looks like
+`Io:2:003:3` (`I`nterrupt/`C`ontrol, direction `i`n/`o`ut, bus, device
+number, endpoint). `S` = submission, `C` = completion - sum the **`C`**
+lines' length field for actual transferred bytes (summing both `S` and `C`
+double-counts, since every URB gets one of each). One-liner for one
+endpoint's total bytes/URB count:
+
+```sh
+awk '$3=="C" && $4 ~ /^Io:2:003/ {sum+=$6; n++} END {print n, sum}' capture.txt
+```

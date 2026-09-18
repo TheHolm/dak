@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Repository visibility
+
+**This repository is pushed to a public GitHub repo.** Before committing,
+pushing, or writing anything into a tracked file (code, docs, `NOTES.md`,
+scripts, test fixtures, commit messages), make sure it contains no sensitive
+or identifying information: no real hostnames/IPs, credentials/passwords/API
+keys/private keys, serial numbers of specific physical devices, personal
+file paths, or other details tied to a particular person's or machine's
+identity. Genuinely throwaway material (e.g. ad hoc test scripts/VM
+connection details written for a single session) belongs outside the repo
+entirely (e.g. under `/tmp`), never committed - see the "Never commit
+changes unless the user explicitly asks to commit" rule below, which exists
+partly for this reason.
+
 ## Project overview
 
 DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.8.2 (declared as `0.8.2` in `Cargo.toml`, also printed on startup).

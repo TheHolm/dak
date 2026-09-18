@@ -72,6 +72,8 @@ All runtime behavior is driven by `config.json` instead of the hard-coded demo o
 
 The target platforms are generic Linux and FreeBSD. No effort is made (or planned) to make the code compile and run under any other platform.
 
+DAK is, and is planned to remain, a **CLI-only** tool: a config file plus a command-line binary, no GUI (no windowed config editor, no tray icon, no bundled companion app). There is no plan to add one.
+
 Prebuilt packages for tagged releases are published to [GitHub Releases](https://github.com/theholm/dak/releases): a Debian trixie `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD 15.1-RELEASE `.pkg` (all amd64/x86_64), plus GitHub's automatically generated source archive.
 
 ## Config structure
@@ -267,6 +269,8 @@ At startup each definition is matched against the discovered hardware:
 
 Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with an error.
 
+Driving multiple devices at once (multiple entries under `devices`, each on its own connection and input loop) is implemented - see `main.rs`'s `run_device`, spawned once per matched device - but has only been exercised with mocked devices in tests, never against two or more real keypads attached at the same time. Treat it as unverified in practice until someone confirms it against actual hardware.
+
 A complete config combining both sections looks like:
 
 ```json
@@ -303,6 +307,27 @@ A complete config combining both sections looks like:
 See [INSTALL.md](INSTALL.md) for one-time device/permissions setup (Linux udev
 rules, FreeBSD hidraw setup).
 
+## Help me support more devices
+
+DAK has only actually been tested against a real **Ajazz AKP03E**. The Ajazz AKP03
+family reportedly comes in several button/screen/encoder layouts (AKP03, AKP03E,
+AKP03R, possibly others), and every one of them should work - `dak --map` exists
+specifically to walk through and capture whatever layout is actually connected rather
+than assuming one - but that's untested for anything other than the one model this was
+built against.
+
+If you're running DAK against a different Ajazz model (or even another AKP03E/AKP03R
+that reports different codes), please [open a GitHub
+issue](https://github.com/theholm/dak/issues) with:
+
+1. The full JSON output of `dak --map`, and
+2. The output of a normal run with `-d device` enabled (`dak -d device`), pressing
+   every button and turning/pushing every encoder at least once so its codes show up
+   in the log.
+
+Both together let us build up a database of which models report which raw codes,
+without needing physical access to every device model ourselves.
+
 ## TODO
 
 1. The FreeBSD build vendors its own copies of `mirajazz` and `async-hid` under
@@ -331,6 +356,23 @@ rules, FreeBSD hidraw setup).
    list, and might be better served by composing existing primitives (commands,
    variables once they exist, multiple actions per event) instead of adding a second
    configuration language alongside JSON.
+5. Animated button images: a button's screen can already be redrawn continuously with
+   a different image each frame at a solid 30fps, across all of a device's screens at
+   once, with no config support needed for that at all - confirmed against real
+   hardware, including a 3-hour zero-error run (see `NOTES.md` section 6 for the full
+   findings, including where the real throughput ceiling is). What's missing is a way
+   to *configure* one from `config.json`: today `setup` only ever pushes a single
+   static frame (`"image"`/`"image_exec"`), with no way to say "cycle through these
+   frames" or "call this command every N ms and redraw". Needs a new setup type (or an
+   extension of the existing ones) plus a way to control the frame rate.
+6. (Maybe - lower priority, and only relevant once #5 above exists) A sleep/low-power
+   mode for animations specifically: redrawing a button continuously costs real,
+   measurable CPU and HID bandwidth (see `NOTES.md` section 6) even though today's
+   measured headroom is ample - it might be worth pausing an animation's redraws once
+   its scene isn't the active one, rather than only when a config author remembers to
+   stop it explicitly. There's no existing signal for "is anyone actually looking at
+   this button" beyond scene switches and button presses, so this may not be worth the
+   added complexity - noted as a "maybe", not a commitment.
 
 ## License
 
