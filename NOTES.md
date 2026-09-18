@@ -429,13 +429,27 @@ tar_cmd = ["tar", "--numeric-owner", "--owner=0", "--group=0",
            "-P", "--transform=s,^usr/,/usr/,",
            "-C", "stage", "-cf", "-", "+MANIFEST", "+COMPACT_MANIFEST"]
 for rel in FILES:
-    tar_cmd += ["-C", ROOT, rel.lstrip("/")]
+    tar_cmd += ["-C", os.path.abspath(ROOT), rel.lstrip("/")]
 
 with open(OUT, "wb") as out:
     p1 = subprocess.Popen(tar_cmd, stdout=subprocess.PIPE)
     subprocess.run(["zstd", "-19", "-q", "-c"], stdin=p1.stdout, stdout=out)
     p1.wait()
 ```
+
+**Gotcha (found later, when this recipe was promoted into
+`scripts/build-freebsd-pkg.py` and actually exercised in real CI - the
+throwaway version above was hand-run once and happened not to hit this,
+which is why it isn't flagged in section 2.4 below):** GNU tar's `-C` is
+positional/cumulative, not reset per use - a later `-C <relative-dir>`
+resolves **relative to wherever the previous `-C` left tar's directory
+context**, not the original invocation cwd. This command has `-C stage`
+first (for the manifest files), then `-C <ROOT>` for every staged file - if
+`ROOT` is relative, tar looks for it *inside* `stage/`, not next to it, and
+fails with `tar: <ROOT>: Cannot open: No such file or directory`. Fix (also
+already applied above): pass `-C` an **absolute** path
+(`os.path.abspath(ROOT)`) once more than one `-C` appears in the same tar
+invocation.
 
 (This is the exact shape of the script used and validated against the real
 `pkg` tool - see section 2.4. It was a throwaway script, not committed

@@ -103,13 +103,22 @@ def write_pkg(manifest: dict, stage_root: str, output: str) -> None:
     with open(os.path.join(manifest_dir, "+COMPACT_MANIFEST"), "w") as f:
         json.dump(compact, f, separators=(",", ":"))
 
+    # GNU tar's `-C` is positional/cumulative, not reset per use: a later
+    # `-C <relative-dir>` resolves relative to wherever the *previous* `-C`
+    # left tar's directory context, not the original invocation cwd. Since
+    # the first `-C` above already points at `manifest_dir` (an absolute
+    # path), every later `-C stage_root` must also be absolute, or tar goes
+    # looking for `stage_root` *inside* `manifest_dir` and fails with
+    # "Cannot open: No such file or directory".
+    stage_root_abs = os.path.abspath(stage_root)
+
     tar_cmd = [
         "tar", "--numeric-owner", "--owner=0", "--group=0",
         "-P", "--transform=s,^usr/,/usr/,",
         "-C", manifest_dir, "-cf", "-", "+MANIFEST", "+COMPACT_MANIFEST",
     ]
     for rel in manifest["files"]:
-        tar_cmd += ["-C", stage_root, rel.lstrip("/")]
+        tar_cmd += ["-C", stage_root_abs, rel.lstrip("/")]
 
     os.makedirs(os.path.dirname(os.path.abspath(output)) or ".", exist_ok=True)
     with open(output, "wb") as out:
