@@ -30,7 +30,7 @@ Added:
   (`event: tag`, `ref: refs/tags/v*`, never runs on branch pushes or PRs).
   Builds all four artifacts above then runs `gh release create`. Every step
   uses a plain official base image (`rust:1.92-trixie`, `ubuntu:26.04`,
-  `debian:trixie-slim`, `alpine/git`) and installs whatever it needs inline
+  `debian:trixie-slim`) and installs whatever it needs inline
   (apt-get/`cargo install`/`rustup`/the FreeBSD sysroot download) - an
   earlier version of this instead used prebuilt custom images to avoid
   redoing those installs on every release, but that required bind-mounting

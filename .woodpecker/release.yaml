@@ -32,11 +32,13 @@ when:
     ref: refs/tags/v*
 
 steps:
-  # Tiny, stable, official image - no toolchain to install, just `git archive`.
+  # Reuses the same image as the deb-trixie step below (already needed there)
+  # instead of a separate alpine/git pull - it's Debian-based (via
+  # buildpack-deps:trixie-scm), so bash and git are already present, no
+  # apk/apt-get install needed for just a `git archive`.
   - name: src-tarball
-    image: alpine/git:latest
+    image: rust:1.92-trixie
     commands:
-      - apk add --no-cache bash
       - VERSION="${CI_COMMIT_TAG#v}"
       - mkdir -p dist
       - ./scripts/make-src-tarball.sh "$VERSION" dist
