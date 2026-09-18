@@ -47,8 +47,9 @@ under other platforms.
 - `config.json.example` — checked-in template new users copy to `config.json`
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
-- `INSTALL.md` — one-time device/permissions setup (Linux udev rules, FreeBSD
-  hidraw setup)
+- `INSTALL.md` — building from source (both platforms, plus a FreeBSD-specific
+  note about a stray cross-compile `.cargo/config.toml`) and one-time device/
+  permissions setup (Linux udev rules, FreeBSD hidraw setup)
 - `RELEASE_NOTES.md` — history of tagged releases; see the merge/release
   convention below
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.

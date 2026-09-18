@@ -1,8 +1,46 @@
 # Installing dak
 
-One-time device/permissions setup so `dak` can talk to the Ajazz AKP03E /
-AKP03R over USB HID as a regular (non-root) user. Device list is imported
-from https://github.com/4ndv/opendeck-akp03/
+Building from source, and one-time device/permissions setup so `dak` can talk
+to the Ajazz AKP03E / AKP03R over USB HID as a regular (non-root) user.
+Device list is imported from https://github.com/4ndv/opendeck-akp03/
+
+## Building from source
+
+Most users don't need this - see [GitHub Releases](https://github.com/theholm/dak/releases)
+for prebuilt packages instead. Building from source needs `git` and a
+reasonably recent stable Rust toolchain, on both Linux and FreeBSD:
+
+```
+git clone https://github.com/theholm/dak.git
+cd dak
+cargo build --release
+```
+
+The binary is at `target/release/dak`. `cargo test` runs the full suite,
+including the hardware-gated tests in `tests/hardware.rs`/
+`tests/hardware_read_loop.rs` - they need the device permission setup below
+to actually exercise real hardware, and skip themselves cleanly otherwise.
+
+Your OS's packaged Rust toolchain may be too old: e.g. Debian 13 (trixie)
+ships `rustc` 1.85, but `image` and `built` (two of `dak`'s dependencies)
+need 1.88 and 1.87 respectively, so `cargo build` fails with `rustc x.y.z is
+not supported by the following packages`. Install a current toolchain via
+[rustup.rs](https://rustup.rs) instead of (or alongside) your OS package if
+you hit this.
+
+### FreeBSD-specific note
+
+If you've set up local cross-compilation from Linux to FreeBSD per
+`NOTES.md`, that leaves a repo-root `.cargo/config.toml` (gitignored, not
+part of the repo) pinning the `x86_64-unknown-freebsd` target to a
+Linux-side sysroot path. Remove or rename that file before building
+*natively* on a real FreeBSD machine - the native target triple is the same
+one that config overrides, so Cargo applies it there too, and the build
+fails at the link step looking for libraries (`-lexecinfo`, `-lpthread`,
+...) under a sysroot path that only exists on the Linux machine you cross-
+compiled from.
+
+## Device permissions
 
 ### Linux
 
