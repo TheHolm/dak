@@ -48,9 +48,15 @@ Added:
 - `scripts/extract-release-notes.sh` - pulls just one tag's section out of
   `RELEASE_NOTES.md` (which holds the full history) for use as the GitHub
   Release body.
-- `Cargo.toml` gained `description`/`license`/`repository` fields, which
-  `cargo-deb` requires to build a package at all (it previously had only
-  `name`/`version`/`edition`).
+- `Cargo.toml` gained `description`/`license`/`repository`/`authors` fields,
+  which `cargo-deb` requires (or at least wants) to build a package at all
+  (it previously had only `name`/`version`/`edition`).
+- `scripts/check-target-freshness.sh` + `.woodpecker/check-target-freshness.yaml`
+  - a monthly cron job that checks whether the OS versions pinned above
+  (Debian trixie, Ubuntu 26.04 LTS, FreeBSD 15.1-RELEASE) have gone stale
+  (trixie demoted to oldstable, a newer Ubuntu LTS or FreeBSD release
+  published), so that's caught by a scheduled job rather than an actual
+  tagged release suddenly failing months from now.
 
 ## v0.8.1 — Resilient scene setup: one bad operation no longer blocks the rest
 

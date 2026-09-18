@@ -1,0 +1,24 @@
+# Periodically checks whether the OS versions .woodpecker/release.yaml
+# targets have gone stale - Debian trixie demoted to oldstable, a newer
+# Ubuntu LTS released, or a newer FreeBSD release published - see
+# scripts/check-target-freshness.sh for the actual checks. The point is to
+# find this out from a scheduled job rather than from an actual tagged
+# release build suddenly failing months from now.
+#
+# Requires a cron job to be created server-side (Woodpecker UI: this repo
+# -> Cron -> Add). Name it exactly `check-target-freshness` to match the
+# `cron:` filter below - Woodpecker's cron filter matches by job name, not
+# by workflow file. A monthly schedule is more than often enough, since
+# these versions change on the order of months/years, not days.
+
+when:
+  - event: cron
+    cron: check-target-freshness
+  - event: manual
+
+steps:
+  - name: check
+    image: debian:trixie-slim
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates
+      - ./scripts/check-target-freshness.sh

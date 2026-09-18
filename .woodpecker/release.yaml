@@ -78,17 +78,20 @@ steps:
       - rustup target add x86_64-unknown-freebsd
       - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3
       - mkdir -p /opt/freebsd-sysroot
-      # Verified against a real FreeBSD 15.0-RELEASE base.txz (downloaded and
-      # inspected with `tar -tvJf`): every member needs the leading `./` -
-      # GNU tar does NOT normalize that away when extracting explicitly
-      # named members, contrary to what NOTES.md section 1.4 assumed -
-      # and `libutil.so.9` was bumped to `libutil.so.10` in FreeBSD 15
-      # (soname bump, everything else unchanged from the 14.5 list). If a
-      # future FreeBSD release moves other sonames, re-run
+      # Verified against real FreeBSD 15.0-RELEASE and 15.1-RELEASE base.txz
+      # files (downloaded and inspected with `tar -tvJf`): every member
+      # needs the leading `./` - GNU tar does NOT normalize that away when
+      # extracting explicitly named members, contrary to what NOTES.md
+      # section 1.4 assumed - and `libutil.so.9` was bumped to
+      # `libutil.so.10` in FreeBSD 15 (soname bump, everything else
+      # unchanged from the 14.5 list; confirmed identical between 15.0 and
+      # 15.1, as expected within the same major ABI version). If a future
+      # FreeBSD release moves other sonames, re-run
       # `tar -tvJf base.txz | grep <libname>` against that release's
       # base.txz to find the new name, then update this list, this comment,
-      # and NOTES.md section 1.4.
-      - curl -fsSL -o /tmp/base.txz https://download.freebsd.org/releases/amd64/amd64/15.0-RELEASE/base.txz
+      # and NOTES.md section 1.4a. scripts/check-target-freshness.sh flags
+      # in CI when a newer FreeBSD release than the one pinned below exists.
+      - curl -fsSL -o /tmp/base.txz https://download.freebsd.org/releases/amd64/amd64/15.1-RELEASE/base.txz
       - >-
         tar -xJf /tmp/base.txz -C /opt/freebsd-sysroot
         ./lib/libc.so.7 ./usr/lib/libc.so ./usr/lib/libc_nonshared.a
