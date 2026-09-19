@@ -5,6 +5,117 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.9.1 — Recognizes the wider Ajazz/Mirabox device family; configurable per-device protocol version; documents the AKP03E rev.2 protocol/image-format investigation
+
+### User-facing changes
+- `dak` and `dak --map` now recognize twelve more USB vendor/product IDs
+  beyond the one Ajazz AKP03E (rev. 2) unit this project has hardware to
+  test against: the rest of the Ajazz AKP03 line (AKP03, AKP03E, AKP03R,
+  AKP03R rev. 2) and several Mirabox-branded/rebranded equivalents (Mirabox
+  N3 variants, Soomfon Stream Controller SE, Mars Gaming MSD-TWO, TreasLin
+  N3, Redragon Skyrider SS-551), taken from the `mirajazz` author's own
+  reference `opendeck-akp03` plugin. None of these twelve are verified by
+  this project - see the README's "Help me support more devices" section
+  for the full table and how to report success or failure with one of them.
+- `dak --map`'s device picker now shows a human-readable name (e.g. "Ajazz
+  AKP03R (rev. 2)") for every recognized device, with a note when picking an
+  unverified one. It also now prints a short reference list of what
+  `mirajazz`'s protocol versions 0-3 mean before asking which one to
+  connect with - press Enter to keep the recognized kind's default, or type
+  a different number.
+- New optional `protocol_version` config key on each `devices` entry,
+  overriding the recognized device kind's own default (which `dak --map`
+  now also writes into its JSON output). Lets you override the connection
+  protocol version for a specific unit by hand - e.g. for one of the twelve
+  newly-recognized-but-unverified kinds above, if a different value turns
+  out to work better than the one currently wired up for it.
+- Normal startup no longer prints a single "N device(s) present: 1, 2, ..."
+  summary line before connecting; instead each device prints its own
+  "Connected to <name> s/n <serial> as device #<n> using protocol version
+  <version>" line once it has actually connected (the old line was printed
+  before connecting even started, so it claimed less than it looked like).
+  A config device definition that has no matching hardware now also names
+  what it was looking for ("device #<n> (<name> s/n <serial>, expecting
+  <vid:pid>) defined in config was not found") instead of just its number.
+
+### Details
+Added:
+- `hardware::Kind`: an enum for every recognized device, with
+  `from_vid_pid`/`human_name`/`protocol_version`/`image_format`, plus
+  `hardware::QUERIES` (13 `DeviceQuery` entries, replacing the single
+  `hardware::QUERY`/private `main.rs`/`map.rs` copies of it). `hardware.rs`
+  is now the single source of these identifiers - `main.rs` and `map.rs` had
+  each kept their own private copy of one `QUERY`/`PROTOCOL_VERSION`/
+  `IMAGE_FORMAT` "by convention"; with the table now at 13 entries that
+  convention was dropped in favor of both importing directly from
+  `hardware.rs`.
+- `main.rs::run_device` and `map.rs::run_map_wizard` now resolve the
+  connected device's `Kind` from its vendor/product ID and use its
+  `protocol_version`/`image_format` instead of a single flat constant used
+  for every device.
+- `Mapping::protocol_version: Option<usize>` (`#[serde(default)]`, so it's
+  absent-safe for older/hand-written configs): when set, `run_device`
+  connects with it instead of the recognized `Kind`'s own default;
+  `run_map_wizard` always fills it in with the value it actually connected
+  with (`Some(kind.protocol_version())`) so the emitted config documents
+  what was used, and prints the same value to the console as it connects.
+  `map.rs`'s hand-rolled `mapping_json` pretty-printer (not `serde_json`
+  directly, to keep its compact one-entry-per-line array formatting) gained
+  a matching `"protocol_version": <value>|null` line.
+- Investigated a discrepancy between this project's shipped, hardware-tested
+  settings for the one owned device (`0300:3002`: `protocol_version = 2`,
+  60x60 image, `Rot90`) and `opendeck-akp03`'s own table for that same exact
+  ID (`protocol_version = 3`, 64x64 image). Built both configurations and
+  ran them against the real unit. Protocol version 2 completed every test
+  (connect, `set_brightness`, `set_button_image`/`flush`/`clear`, extended
+  raw-input reads with real button presses and encoder turns) across the
+  whole investigation with zero instability, matching its existing shipped
+  track record. Protocol version 3 rendered images correctly and captured
+  raw input correctly when it worked, but on two separate extended
+  (~45s) raw-input reads with real button/encoder activity, the device
+  dropped off the USB bus entirely partway through (blank screen, gone
+  from `lsusb`); one needed a physical unplug/replug to recover, the other
+  auto-recovered on its own. Both failures correlated with bursts of
+  encoder-related activity. `Kind::Akp03ERev2` keeps protocol version 2 as
+  authoritative: not merely "less verified" than the upstream table's
+  claimed protocol version 3 for this ID, but demonstrated unsafe under
+  sustained real use, documented on `Kind::protocol_version`'s doc comment.
+  Every other `Kind` still uses `opendeck-akp03`'s table values as-is,
+  explicitly marked unverified.
+- `tests/hardware.rs`'s `discovers_only_ajazz_devices` now asserts every
+  discovered device resolves to some `Kind` instead of hardcoding the one
+  vendor/product ID pair; added unit tests in `hardware.rs` covering every
+  `Kind`'s `from_vid_pid`/`human_name`/`protocol_version`/`image_format`,
+  that `QUERIES`/the enum stay in sync, and that `Kind::Akp03ERev2` keeps
+  its verified values. Added unit tests in `map.rs` covering
+  `Mapping::protocol_version`'s JSON round-trip (present and absent/`null`).
+- `map.rs`'s protocol-version prompt: replaced the initial yes/no `confirm`
+  step with `ask_number_with_default` (new, alongside its pure
+  `parse_number_or_default` helper, unit-tested like the existing
+  `ask_number`/`parse_number` pair) - pressing Enter keeps the recognized
+  kind's default, typing a number overrides it, matching the already
+  Enter-friendly feel of the rest of the wizard. Printed alongside it: a new
+  `PROTOCOL_VERSION_DESCRIPTIONS` reference table (one line per protocol
+  version 0-3). Deliberately does not use the upstream `mirajazz` README's
+  own "(aka long press, PTT)" phrasing for the "supports both keypress
+  states" capability some versions lack: dak's own long-press/short-press/
+  double-click detection (`press.rs`) is entirely software, timed off raw
+  press/release edges, and works identically regardless of protocol version
+  - `run_device`/`run_map_wizard` even unconditionally request
+  `with_supports_both_keypress_states(true)` on every connection - so
+  describing that capability in terms of dak's own long-press feature would
+  have been misleading.
+- `main.rs::main`'s single `"N device(s) present: ..."` summary line
+  (printed before any device had actually connected) is gone; the
+  now-otherwise-unused `Baseplane::from_present`/`baseplane` local (its
+  only call site) went with it. `run_device` prints its own
+  `"Connected to <name> s/n <serial> as device #<n> using protocol version
+  <version>"` line (`log.info`, so still on by default) once it has
+  actually connected, alongside the existing `log.debug(Subsystem::Device,
+  ...)` breadcrumbs for `-d device` users. The unmatched-config-device
+  warning also names what it was looking for now, instead of just its
+  logical device id.
+
 ## v0.9.0 — Breaking: `~` no longer means "stay"; configurable brightness, `$`-actions, home-dir expansion
 
 ### User-facing changes

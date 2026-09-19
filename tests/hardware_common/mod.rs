@@ -62,16 +62,24 @@ pub async fn skip_without_hardware() -> bool {
     }
 }
 
-/// Connects to the first attached device using the same protocol version and
-/// default key/encoder counts `map.rs` uses before the real counts are known.
-/// Shared by every hardware-gated test that needs a live connection.
+/// Connects to the first attached device using its recognized [`hardware::Kind`]'s
+/// protocol version and the default key/encoder counts `map.rs` uses before the
+/// real counts are known. Shared by every hardware-gated test that needs a live
+/// connection.
 pub async fn connect() -> Device {
     let devices = hardware::discover()
         .await
         .expect("enumeration should succeed once is_present() reported a device");
+    let dev = &devices[0];
+    // Every device discover() can return already matched hardware::QUERIES, so this
+    // should always resolve; `unwrap_or` just avoids a false connect failure over a
+    // defensive fallback protocol version if that invariant is ever broken.
+    let protocol_version = hardware::Kind::from_vid_pid(dev.vendor_id, dev.product_id)
+        .map(|kind| kind.protocol_version())
+        .unwrap_or(2);
     Device::connect(
-        &devices[0],
-        hardware::PROTOCOL_VERSION,
+        dev,
+        protocol_version,
         hardware::DEFAULT_KEY_COUNT,
         hardware::DEFAULT_ENCODER_COUNT,
     )

@@ -15,38 +15,46 @@ use std::io::{self, Write};
 
 use async_hid::DeviceId as HidDeviceId;
 use mirajazz::{
-    device::{list_devices, Device, DeviceQuery},
+    device::{list_devices, Device},
     error::MirajazzError,
     state::DeviceStateReader,
-    types::{DeviceInput, HidDevice, ImageFormat, ImageMirroring, ImageMode, ImageRotation},
+    types::{DeviceInput, HidDevice},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::hardware::{self, Kind};
 use crate::log::{Log, Subsystem};
 
-/// True everywhere because a mapping wizard makes no sense without a device.
-const QUERY: DeviceQuery = DeviceQuery::new(65440, 1, 0x0300, 0x3002);
-
-/// Protocol version used to connect, identical to the normal mode.
-const PROTOCOL_VERSION: usize = 2;
-
-/// Default key count used to connect, identical to the normal mode. The wizard
-/// then asks the user to confirm (or manually correct) the real counts for the
-/// mapping itself.
-const DEFAULT_KEY_COUNT: usize = 9;
-
-/// Default encoder count used to connect, identical to the normal mode.
-const DEFAULT_ENCODER_COUNT: usize = 3;
-
-/// The image format used for painting the button-number display test,
-/// identical to the one the normal mode uses for this device family.
-const IMAGE_FORMAT: ImageFormat = ImageFormat {
-    mode: ImageMode::JPEG,
-    size: (60, 60),
-    // The device's LCDs display images rotated 90 degrees clockwise.
-    rotation: ImageRotation::Rot90,
-    mirror: ImageMirroring::None,
-};
+/// One line each describing what `mirajazz`'s protocol versions 0-3 mean, shown to
+/// the user before `run_map_wizard` asks them to pick one. See
+/// `vendor/mirajazz-freebsd/README.md`'s "Protocol versions" section for the full
+/// low-level detail this summarizes.
+///
+/// Deliberately does not mention "long press"/"short press"/PTT at all, unlike that
+/// upstream README: the raw protocol capability some versions lack (an extra
+/// "held"/PTT input state) is *not* what dak's own long-press/short-press/
+/// double-click detection depends on - that's computed entirely in software from
+/// press/release timing (`press.rs`) and works identically regardless of protocol
+/// version. `run_device`/`run_map_wizard` also unconditionally request
+/// `with_supports_both_keypress_states(true)` on every connection, so this
+/// capability isn't even consulted for its intended purpose here.
+const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 4] = [
+    (
+        0,
+        "oldest firmware fallback; 512-byte packets, no unique serial number reported",
+    ),
+    (1, "512-byte packets, hardcoded/shared serial number"),
+    (
+        2,
+        "1024-byte packets, unique serial numbers (this project's own tested device uses this)",
+    ),
+    (
+        3,
+        "1024-byte packets, unique serial numbers, an extra raw \"held\" input state some \
+         firmwares report (not used by dak's own long/short-press detection, which is timed \
+         in software and identical across every version)",
+    ),
+];
 
 /// Everything the wizard learned about one device.
 ///
@@ -66,6 +74,15 @@ pub struct Mapping {
     pub encoder_count: u8,
     /// How many of the keys have a display.
     pub screens: u8,
+    /// Protocol version to connect with (see `mirajazz::device::Device::connect`).
+    /// `--map` fills this in with the value its recognized [`hardware::Kind`] uses
+    /// (see [`hardware::Kind::protocol_version`]); absent (or explicit `null`) in an
+    /// older config, or a config written by hand, falls back to that same
+    /// recognized default at connect time. Set this to override it - e.g. for a
+    /// device kind this project has not verified itself, if a different protocol
+    /// version turns out to work better for your specific unit.
+    #[serde(default)]
+    pub protocol_version: Option<usize>,
     /// Raw codes per physical button, in the order the user pressed them.
     pub buttons: Vec<ButtonMapping>,
     /// Raw twist codes per encoder, in the order the user turned them.
@@ -211,7 +228,10 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     log.info("DAK device-mapping wizard (config is not read, no actions run)");
 
     // Step 1: numbered list of detected devices, user picks one by number.
-    let devices: Vec<HidDevice> = list_devices(&[QUERY]).await?.into_iter().collect();
+    let devices: Vec<HidDevice> = list_devices(&hardware::QUERIES)
+        .await?
+        .into_iter()
+        .collect();
     if devices.is_empty() {
         log.error("no compatible devices found");
         return Err(MirajazzError::DeviceNotFoundError);
@@ -237,6 +257,43 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     let dev = &devices[pick];
     println!();
 
+    // Every dev reaching this point already matched hardware::QUERIES above, so this
+    // should always resolve; treated as a hard error rather than assumed, in case
+    // that invariant is ever broken.
+    let kind = match Kind::from_vid_pid(dev.vendor_id, dev.product_id) {
+        Some(kind) => kind,
+        None => {
+            log.error(format!(
+                "unrecognized vendor/product ID {:04x}:{:04x}",
+                dev.vendor_id, dev.product_id
+            ));
+            return Err(MirajazzError::DeviceNotFoundError);
+        }
+    };
+    println!("Recognized as: {}", kind.human_name());
+    if !matches!(kind, Kind::Akp03ERev2) {
+        println!(
+            "Note: this device kind has not been verified against real hardware by DAK - see the README's \"Help me support more devices\" section."
+        );
+    }
+
+    // The protocol version has to be settled before connecting (unlike key_count/
+    // encoder_count below, which get read back from an already-connected device and
+    // can be corrected afterward without reconnecting): it changes how mirajazz talks
+    // to the device at the wire level, so whatever value ends up used here is also
+    // what every later capture step runs under.
+    println!("Protocol versions:");
+    for (version, description) in PROTOCOL_VERSION_DESCRIPTIONS {
+        println!("  {version}: {description}");
+    }
+    let protocol_version = ask_number_with_default(
+        "protocol version to connect with",
+        0,
+        3,
+        kind.protocol_version() as u64,
+    ) as usize;
+    println!();
+
     // Step 2: connect and confirm (or manually enter) the counts.
     println!(
         "Connecting to {}...",
@@ -250,9 +307,9 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     );
     let device = Device::connect(
         dev,
-        PROTOCOL_VERSION,
-        DEFAULT_KEY_COUNT,
-        DEFAULT_ENCODER_COUNT,
+        protocol_version,
+        hardware::DEFAULT_KEY_COUNT,
+        hardware::DEFAULT_ENCODER_COUNT,
     )
     .await?;
     let device = device.with_supports_both_keypress_states(true);
@@ -336,7 +393,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     // ones without a display, which stay dark) and ask the user to verify.
     println!("painting button numbers on every button...");
     for (index, number) in (1..=key_count).enumerate() {
-        let image = match crate::text::render_text(&[number.to_string()], IMAGE_FORMAT) {
+        let image = match crate::text::render_text(&[number.to_string()], kind.image_format()) {
             Ok(image) => image,
             Err(error) => {
                 log.error(format!("failed to render test label: {error}"));
@@ -344,7 +401,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
             }
         };
         device
-            .set_button_image(index as u8, IMAGE_FORMAT, image)
+            .set_button_image(index as u8, kind.image_format(), image)
             .await?;
     }
     device.flush().await?;
@@ -404,6 +461,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         key_count,
         encoder_count,
         screens,
+        protocol_version: Some(protocol_version),
         buttons,
         encoders,
     };
@@ -440,6 +498,13 @@ fn mapping_json(mapping: &Mapping) -> String {
     ] {
         lines.push_str(&format!("  \"{field}\": {value},\n"));
     }
+    lines.push_str(&format!(
+        "  \"protocol_version\": {},\n",
+        match mapping.protocol_version {
+            Some(version) => version.to_string(),
+            None => "null".to_string(),
+        }
+    ));
     lines.push_str("  \"buttons\": [\n");
     for (index, button) in mapping.buttons.iter().enumerate() {
         let comma = if index + 1 == mapping.buttons.len() {
@@ -685,6 +750,47 @@ fn ask_number(prompt: &str, min: u64, max: u64) -> u64 {
     }
 }
 
+/// Parses one typed line for a number question that has a default: an empty
+/// (whitespace-only) line means "keep the default" (`Some(default)`), a valid
+/// number in `min..=max` is used as typed, anything else is invalid (`None`).
+fn parse_number_or_default(input: &str, default: u64, min: u64, max: u64) -> Option<u64> {
+    if input.trim().is_empty() {
+        return Some(default);
+    }
+    match parse_number(input) {
+        Some(number) if (min..=max).contains(&number) => Some(number),
+        _ => None,
+    }
+}
+
+/// Asks the user to type a number in `min..=max`, or just press Enter to keep
+/// `default`. End-of-input (piping from a closed/empty stream) also keeps the
+/// default rather than looping forever, unlike [`ask_number`] (which has no
+/// default to fall back to).
+fn ask_number_with_default(prompt: &str, min: u64, max: u64, default: u64) -> u64 {
+    loop {
+        print!("{prompt} [{min}..{max}, default {default}, Enter to keep it]: ");
+        if let Err(error) = io::stdout().flush() {
+            eprintln!("failed to flush stdout: {error}");
+        }
+        let mut line = String::new();
+        let input = match io::stdin().read_line(&mut line) {
+            Ok(0) => Some(default),
+            Ok(_) => parse_number_or_default(&line, default, min, max),
+            Err(error) => {
+                eprintln!("failed to read input: {error}");
+                None
+            }
+        };
+        match input {
+            Some(number) => return number,
+            None => {
+                eprintln!("enter a number from {min} to {max}, or press Enter to keep {default}")
+            }
+        }
+    }
+}
+
 /// Asks a yes/no question. The user answers with `y`/`yes` or `n`/`no`;
 /// the numeric `1`/`0` forms are accepted as well and the prompt repeats
 /// until a valid answer is typed.
@@ -815,7 +921,7 @@ mod tests {
     use super::HidDeviceId;
     use super::{
         device_details, device_summary, is_no, parse_key_list, parse_key_number, parse_number,
-        parse_yes_no, raw_event,
+        parse_number_or_default, parse_yes_no, raw_event,
     };
     use super::{ButtonMapping, ControlEvent, EncoderMapping, Mapping, TwistDirection};
     use std::collections::HashSet;
@@ -829,6 +935,19 @@ mod tests {
         assert_eq!(parse_number("abc"), None);
         assert_eq!(parse_number(""), None);
         assert_eq!(parse_number("12.5"), None);
+    }
+
+    /// An empty (or whitespace-only) line means "keep the default"; a valid
+    /// in-range number is used as typed; anything else (out of range, or not a
+    /// number at all) is rejected so the caller re-prompts.
+    #[test]
+    fn parse_number_or_default_handles_empty_valid_and_invalid_input() {
+        assert_eq!(parse_number_or_default("", 2, 0, 3), Some(2));
+        assert_eq!(parse_number_or_default("   \n", 2, 0, 3), Some(2));
+        assert_eq!(parse_number_or_default("3", 2, 0, 3), Some(3));
+        assert_eq!(parse_number_or_default(" 0 \n", 2, 0, 3), Some(0));
+        assert_eq!(parse_number_or_default("4", 2, 0, 3), None);
+        assert_eq!(parse_number_or_default("abc", 2, 0, 3), None);
     }
 
     /// `raw_event` extracts `(data[9], data[10])` from an ACK-prefixed report
@@ -927,6 +1046,7 @@ mod tests {
             key_count: 9,
             encoder_count: 3,
             screens: 6,
+            protocol_version: None,
             buttons: vec![
                 ButtonMapping {
                     number: 1,
@@ -964,6 +1084,7 @@ mod tests {
             key_count: 1,
             encoder_count: 0,
             screens: 1,
+            protocol_version: None,
             buttons: vec![ButtonMapping {
                 number: 3,
                 press: 0x60,
@@ -991,6 +1112,7 @@ mod tests {
             key_count: 2,
             encoder_count: 1,
             screens: 1,
+            protocol_version: Some(2),
             buttons: vec![
                 ButtonMapping {
                     number: 1,
@@ -1034,6 +1156,7 @@ mod tests {
                 "  \"key_count\": 2,\n",
                 "  \"encoder_count\": 1,\n",
                 "  \"screens\": 1,\n",
+                "  \"protocol_version\": 2,\n",
                 "  \"buttons\": [\n",
                 "    { \"number\": 1, \"press\": 1, \"release\": 1, \"screen\": true, \"draw_id\": 1 },\n",
                 "    { \"number\": 2, \"press\": 48, \"release\": 48, \"screen\": false, \"draw_id\": -1 }\n",
@@ -1045,6 +1168,28 @@ mod tests {
                 "}"
             )
         );
+    }
+
+    /// An absent `protocol_version` (the wizard never leaves it unset itself, but a
+    /// hand-written or older config might) round-trips through the mapping JSON as
+    /// a literal `null`, matching how a config author would spell "use the
+    /// recognized kind's default" - not `0`, and not simply omitting the field
+    /// (which would also default to `None` on the next load, but reads as an
+    /// oversight rather than a deliberate choice when looking at emitted JSON).
+    #[test]
+    fn mapping_json_renders_absent_protocol_version_as_null() {
+        let mapping = Mapping {
+            device_id: "0300:3002".to_string(),
+            device_name: "t".to_string(),
+            serial: "unknown".to_string(),
+            key_count: 1,
+            encoder_count: 0,
+            screens: 0,
+            protocol_version: None,
+            buttons: vec![],
+            encoders: vec![],
+        };
+        assert!(mapping_json(&mapping).contains("\"protocol_version\": null,\n"));
     }
 
     /// Debug-prints like the real Linux `DeviceId::DevPath`, so the summary
@@ -1155,6 +1300,7 @@ mod tests {
             key_count: 9,
             encoder_count: 3,
             screens: 6,
+            protocol_version: Some(2),
             buttons: vec![
                 super::ButtonMapping {
                     number: 1,
@@ -1183,6 +1329,7 @@ mod tests {
         assert_eq!(value["device_id"], "0300:3002");
         assert_eq!(value["key_count"], 9);
         assert_eq!(value["screens"], 6);
+        assert_eq!(value["protocol_version"], 2);
         assert_eq!(value["buttons"][0]["press"], 1);
         assert_eq!(value["buttons"][0]["screen"], true);
         assert_eq!(value["buttons"][0]["draw_id"], 1);
@@ -1326,6 +1473,7 @@ mod tests {
             key_count: 9,
             encoder_count: 1,
             screens: 6,
+            protocol_version: None,
             buttons: vec![
                 ButtonMapping {
                     number: 1,

@@ -48,6 +48,7 @@
       "key_count": 9,
       "encoder_count": 3,
       "screens": 6,
+      "protocol_version": 2,
       "buttons": [
         { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
         { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
