@@ -25,6 +25,37 @@ use serde::{Deserialize, Serialize};
 use crate::hardware::{self, Kind};
 use crate::log::{Log, Subsystem};
 
+/// One line each describing what `mirajazz`'s protocol versions 0-3 mean, shown to
+/// the user before `run_map_wizard` asks them to pick one. See
+/// `vendor/mirajazz-freebsd/README.md`'s "Protocol versions" section for the full
+/// low-level detail this summarizes.
+///
+/// Deliberately does not mention "long press"/"short press"/PTT at all, unlike that
+/// upstream README: the raw protocol capability some versions lack (an extra
+/// "held"/PTT input state) is *not* what dak's own long-press/short-press/
+/// double-click detection depends on - that's computed entirely in software from
+/// press/release timing (`press.rs`) and works identically regardless of protocol
+/// version. `run_device`/`run_map_wizard` also unconditionally request
+/// `with_supports_both_keypress_states(true)` on every connection, so this
+/// capability isn't even consulted for its intended purpose here.
+const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 4] = [
+    (
+        0,
+        "oldest firmware fallback; 512-byte packets, no unique serial number reported",
+    ),
+    (1, "512-byte packets, hardcoded/shared serial number"),
+    (
+        2,
+        "1024-byte packets, unique serial numbers (this project's own tested device uses this)",
+    ),
+    (
+        3,
+        "1024-byte packets, unique serial numbers, an extra raw \"held\" input state some \
+         firmwares report (not used by dak's own long/short-press detection, which is timed \
+         in software and identical across every version)",
+    ),
+];
+
 /// Everything the wizard learned about one device.
 ///
 /// [`Deserialize`] is derived so the same structure can be pasted into the config's
@@ -240,12 +271,28 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         }
     };
     println!("Recognized as: {}", kind.human_name());
-    println!("Protocol version: {}", kind.protocol_version());
     if !matches!(kind, Kind::Akp03ERev2) {
         println!(
             "Note: this device kind has not been verified against real hardware by DAK - see the README's \"Help me support more devices\" section."
         );
     }
+
+    // The protocol version has to be settled before connecting (unlike key_count/
+    // encoder_count below, which get read back from an already-connected device and
+    // can be corrected afterward without reconnecting): it changes how mirajazz talks
+    // to the device at the wire level, so whatever value ends up used here is also
+    // what every later capture step runs under.
+    println!("Protocol versions:");
+    for (version, description) in PROTOCOL_VERSION_DESCRIPTIONS {
+        println!("  {version}: {description}");
+    }
+    let protocol_version = ask_number_with_default(
+        "protocol version to connect with",
+        0,
+        3,
+        kind.protocol_version() as u64,
+    ) as usize;
+    println!();
 
     // Step 2: connect and confirm (or manually enter) the counts.
     println!(
@@ -260,7 +307,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     );
     let device = Device::connect(
         dev,
-        kind.protocol_version(),
+        protocol_version,
         hardware::DEFAULT_KEY_COUNT,
         hardware::DEFAULT_ENCODER_COUNT,
     )
@@ -414,7 +461,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         key_count,
         encoder_count,
         screens,
-        protocol_version: Some(kind.protocol_version()),
+        protocol_version: Some(protocol_version),
         buttons,
         encoders,
     };
@@ -703,6 +750,47 @@ fn ask_number(prompt: &str, min: u64, max: u64) -> u64 {
     }
 }
 
+/// Parses one typed line for a number question that has a default: an empty
+/// (whitespace-only) line means "keep the default" (`Some(default)`), a valid
+/// number in `min..=max` is used as typed, anything else is invalid (`None`).
+fn parse_number_or_default(input: &str, default: u64, min: u64, max: u64) -> Option<u64> {
+    if input.trim().is_empty() {
+        return Some(default);
+    }
+    match parse_number(input) {
+        Some(number) if (min..=max).contains(&number) => Some(number),
+        _ => None,
+    }
+}
+
+/// Asks the user to type a number in `min..=max`, or just press Enter to keep
+/// `default`. End-of-input (piping from a closed/empty stream) also keeps the
+/// default rather than looping forever, unlike [`ask_number`] (which has no
+/// default to fall back to).
+fn ask_number_with_default(prompt: &str, min: u64, max: u64, default: u64) -> u64 {
+    loop {
+        print!("{prompt} [{min}..{max}, default {default}, Enter to keep it]: ");
+        if let Err(error) = io::stdout().flush() {
+            eprintln!("failed to flush stdout: {error}");
+        }
+        let mut line = String::new();
+        let input = match io::stdin().read_line(&mut line) {
+            Ok(0) => Some(default),
+            Ok(_) => parse_number_or_default(&line, default, min, max),
+            Err(error) => {
+                eprintln!("failed to read input: {error}");
+                None
+            }
+        };
+        match input {
+            Some(number) => return number,
+            None => {
+                eprintln!("enter a number from {min} to {max}, or press Enter to keep {default}")
+            }
+        }
+    }
+}
+
 /// Asks a yes/no question. The user answers with `y`/`yes` or `n`/`no`;
 /// the numeric `1`/`0` forms are accepted as well and the prompt repeats
 /// until a valid answer is typed.
@@ -833,7 +921,7 @@ mod tests {
     use super::HidDeviceId;
     use super::{
         device_details, device_summary, is_no, parse_key_list, parse_key_number, parse_number,
-        parse_yes_no, raw_event,
+        parse_number_or_default, parse_yes_no, raw_event,
     };
     use super::{ButtonMapping, ControlEvent, EncoderMapping, Mapping, TwistDirection};
     use std::collections::HashSet;
@@ -847,6 +935,19 @@ mod tests {
         assert_eq!(parse_number("abc"), None);
         assert_eq!(parse_number(""), None);
         assert_eq!(parse_number("12.5"), None);
+    }
+
+    /// An empty (or whitespace-only) line means "keep the default"; a valid
+    /// in-range number is used as typed; anything else (out of range, or not a
+    /// number at all) is rejected so the caller re-prompts.
+    #[test]
+    fn parse_number_or_default_handles_empty_valid_and_invalid_input() {
+        assert_eq!(parse_number_or_default("", 2, 0, 3), Some(2));
+        assert_eq!(parse_number_or_default("   \n", 2, 0, 3), Some(2));
+        assert_eq!(parse_number_or_default("3", 2, 0, 3), Some(3));
+        assert_eq!(parse_number_or_default(" 0 \n", 2, 0, 3), Some(0));
+        assert_eq!(parse_number_or_default("4", 2, 0, 3), None);
+        assert_eq!(parse_number_or_default("abc", 2, 0, 3), None);
     }
 
     /// `raw_event` extracts `(data[9], data[10])` from an ACK-prefixed report

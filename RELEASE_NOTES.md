@@ -19,7 +19,10 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   for the full table and how to report success or failure with one of them.
 - `dak --map`'s device picker now shows a human-readable name (e.g. "Ajazz
   AKP03R (rev. 2)") for every recognized device, with a note when picking an
-  unverified one, and prints the protocol version it connects with.
+  unverified one. It also now prints a short reference list of what
+  `mirajazz`'s protocol versions 0-3 mean before asking which one to
+  connect with - press Enter to keep the recognized kind's default, or type
+  a different number.
 - New optional `protocol_version` config key on each `devices` entry,
   overriding the recognized device kind's own default (which `dak --map`
   now also writes into its JSON output). Lets you override the connection
@@ -78,6 +81,22 @@ Added:
   that `QUERIES`/the enum stay in sync, and that `Kind::Akp03ERev2` keeps
   its verified values. Added unit tests in `map.rs` covering
   `Mapping::protocol_version`'s JSON round-trip (present and absent/`null`).
+- `map.rs`'s protocol-version prompt: replaced the initial yes/no `confirm`
+  step with `ask_number_with_default` (new, alongside its pure
+  `parse_number_or_default` helper, unit-tested like the existing
+  `ask_number`/`parse_number` pair) - pressing Enter keeps the recognized
+  kind's default, typing a number overrides it, matching the already
+  Enter-friendly feel of the rest of the wizard. Printed alongside it: a new
+  `PROTOCOL_VERSION_DESCRIPTIONS` reference table (one line per protocol
+  version 0-3). Deliberately does not use the upstream `mirajazz` README's
+  own "(aka long press, PTT)" phrasing for the "supports both keypress
+  states" capability some versions lack: dak's own long-press/short-press/
+  double-click detection (`press.rs`) is entirely software, timed off raw
+  press/release edges, and works identically regardless of protocol version
+  - `run_device`/`run_map_wizard` even unconditionally request
+  `with_supports_both_keypress_states(true)` on every connection - so
+  describing that capability in terms of dak's own long-press feature would
+  have been misleading.
 
 ## v0.9.0 — Breaking: `~` no longer means "stay"; configurable brightness, `$`-actions, home-dir expansion
 
