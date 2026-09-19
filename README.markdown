@@ -1,6 +1,6 @@
 # DAK — Dynamic Ajazz Keyboard
 
-**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
+**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`) - see [Help me support more devices](#help-me-support-more-devices) for how far detection reaches beyond that one device, and how verified each of those other devices is. Loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
 
 Work in progress. Config structure will probably change in the future, but I will try to make it easy to update to new version.
 
@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.9.0**.
+The current version is **v0.9.1**.
 
 ## Usage
 
@@ -295,6 +295,15 @@ dak --map
 
 Each `buttons` entry maps a button `number` to the raw codes it sends when pressed and released, and whether the button has a screen (`screen` `true`/`false` with its `draw_id`). Each `encoders` entry maps an encoder `number` to its `cw`/`ccw` codes — one `turn_cw`/`turn_ccw` action per rotation notch — and, after the wizard replays a knob push, its `press`/`release` codes; an encoder without push codes still turns, but its knob push is ignored at runtime.
 
+`protocol_version` is optional (omit it, or set it to JSON `null`, to fall back to the
+default): it picks which of `mirajazz`'s connection protocol variants `dak` speaks to
+this device with (see [Help me support more devices](#help-me-support-more-devices)
+for the wider device family this matters for). `dak --map` fills it in with the
+recognized device kind's own default and prints the same value to the console while
+running; set it by hand to override that default for a specific unit, e.g. if a kind
+this project hasn't verified itself needs a different value than the one currently
+wired up for it.
+
 A device definition looks like this:
 
 ```json
@@ -305,6 +314,7 @@ A device definition looks like this:
   "key_count": 9,
   "encoder_count": 3,
   "screens": 6,
+  "protocol_version": 2,
   "buttons": [
     { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
     { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 }
@@ -346,6 +356,7 @@ A complete config combining both sections looks like:
       "key_count": 9,
       "encoder_count": 3,
       "screens": 6,
+      "protocol_version": 2,
       "buttons": [
         { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 }
       ],
@@ -362,24 +373,56 @@ rules, FreeBSD hidraw setup).
 
 ## Help me support more devices
 
-DAK has only actually been tested against a real **Ajazz AKP03E**. The Ajazz AKP03
-family reportedly comes in several button/screen/encoder layouts (AKP03, AKP03E,
-AKP03R, possibly others), and every one of them should work - `dak --map` exists
-specifically to walk through and capture whatever layout is actually connected rather
-than assuming one - but that's untested for anything other than the one model this was
-built against.
+DAK is built on [`mirajazz`](https://crates.io/crates/mirajazz), which targets the whole
+family of Ajazz- and Mirabox-branded "stream controller" keypads: the two brands sell the
+same OEM hardware under different USB vendor/product IDs, and `mirajazz` groups devices by
+an internal "protocol version" rather than by brand. DAK recognizes (via `dak --map` and
+normal startup) every device ID listed in the table below, taken from
+[`opendeck-akp03`](https://github.com/4ndv/opendeck-akp03)'s "Supported devices" list - the
+reference OpenDeck plugin the `mirajazz` author built for exactly this device family.
 
-If you're running DAK against a different Ajazz model (or even another AKP03E/AKP03R
-that reports different codes), please [open a GitHub
+**Only the Ajazz AKP03E (rev. 2) row is actually verified against real hardware by this
+project.** Every other row is wired up exactly as `opendeck-akp03` documents it (protocol
+version and image format included) but has not been tested by anyone working on DAK - best
+case it works out of the box, worst case it connects but renders images incorrectly, or
+fails to connect cleanly (an error, not a crash).
+
+| Device | USB ID | Verified? |
+| --- | --- | --- |
+| Ajazz AKP03 | `0300:1001` | No |
+| Ajazz AKP03E | `0300:1002` | No |
+| Ajazz AKP03R | `0300:1003` | No |
+| **Ajazz AKP03E (rev. 2)** | **`0300:3002`** | **Yes** |
+| Ajazz AKP03R (rev. 2) | `0300:3003` | No |
+| Mirabox N3 | `6602:1000` | No |
+| Mirabox N3 | `6602:1002` | No |
+| Mirabox N3 | `6603:1002` | No |
+| Mirabox N3 | `6603:1003` | No |
+| Soomfon Stream Controller SE | `1500:3001` | No |
+| Mars Gaming MSD-TWO | `0B00:1001` | No |
+| TreasLin N3 | `5548:1001` | No |
+| Redragon Skyrider SS-551 | `0200:2000` | No |
+
+`dak --map` exists specifically to walk through and capture whatever button/screen/encoder
+layout is actually connected, for any of the devices above, rather than assuming one.
+
+If you're running DAK against a device from the table above (verified or not), or one with
+a USB ID not listed at all, please [open a GitHub
 issue](https://github.com/theholm/dak/issues) with:
 
-1. The full JSON output of `dak --map`, and
+1. Your device's raw USB vendor/product ID (from `lsusb`, Windows Device Manager, or
+   similar) if `dak --map` doesn't recognize it at all, or the full JSON output of
+   `dak --map` if it does, and
 2. The output of a normal run with `-d device` enabled (`dak -d device`), pressing
    every button and turning/pushing every encoder at least once so its codes show up
-   in the log.
+   in the log, and
+3. Whether the button screens actually rendered correctly (for a device not yet marked
+   verified above) - the single most useful thing you can confirm that this project has
+   no way to check itself without owning the hardware.
 
-Both together let us build up a database of which models report which raw codes,
-without needing physical access to every device model ourselves.
+Both together let us build up a database of which models report which raw codes and which
+ones actually work end-to-end, without needing physical access to every device model
+ourselves.
 
 ## TODO
 

@@ -46,8 +46,8 @@ use dak::hardware;
 use hardware_common::{connect, lock_hardware, skip_without_hardware};
 
 /// Confirms [`hardware::discover`] finds at least one device, and that every
-/// discovered device actually matches the Ajazz vendor/product ID DAK targets -
-/// i.e. [`hardware::QUERY`] isn't accidentally matching unrelated HID hardware
+/// discovered device actually matches one of the known family members -
+/// i.e. [`hardware::QUERIES`] isn't accidentally matching unrelated HID hardware
 /// also attached to the test machine.
 #[tokio::test(flavor = "multi_thread")]
 async fn discovers_only_ajazz_devices() {
@@ -61,8 +61,12 @@ async fn discovers_only_ajazz_devices() {
         .expect("enumeration should succeed");
     assert!(!devices.is_empty());
     for device in &devices {
-        assert_eq!(device.vendor_id, 0x0300);
-        assert_eq!(device.product_id, 0x3002);
+        assert!(
+            hardware::Kind::from_vid_pid(device.vendor_id, device.product_id).is_some(),
+            "discovered device {:04x}:{:04x} does not match any known Kind",
+            device.vendor_id,
+            device.product_id
+        );
     }
 }
 
@@ -121,10 +125,13 @@ async fn uploads_and_clears_a_button_image() {
         .await
         .expect("clear_all_button_images should succeed");
 
-    let image = dak::text::render_text(&["HW".to_string()], hardware::IMAGE_FORMAT)
-        .expect("render_text should succeed");
+    let image = dak::text::render_text(
+        &["HW".to_string()],
+        hardware::Kind::Akp03ERev2.image_format(),
+    )
+    .expect("render_text should succeed");
     device
-        .set_button_image(0, hardware::IMAGE_FORMAT, image)
+        .set_button_image(0, hardware::Kind::Akp03ERev2.image_format(), image)
         .await
         .expect("set_button_image should succeed");
     device.flush().await.expect("flush should succeed");
@@ -154,10 +161,13 @@ async fn drive_through_button_device<D: ButtonDevice>(
 ) -> Result<(), D::Error> {
     assert_eq!(device.key_count(), key_count as u8);
 
-    let image = dak::text::render_text(&["HW".to_string()], hardware::IMAGE_FORMAT)
-        .expect("render_text should succeed");
+    let image = dak::text::render_text(
+        &["HW".to_string()],
+        hardware::Kind::Akp03ERev2.image_format(),
+    )
+    .expect("render_text should succeed");
     device
-        .set_button_image(0, hardware::IMAGE_FORMAT, image)
+        .set_button_image(0, hardware::Kind::Akp03ERev2.image_format(), image)
         .await?;
     device.flush().await?;
     device.clear_button_image(0).await?;

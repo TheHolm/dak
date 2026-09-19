@@ -2783,6 +2783,7 @@ mod tests {
             key_count: 9,
             encoder_count: 3,
             screens: 6,
+            protocol_version: None,
             buttons: vec![],
             encoders: vec![],
         };
@@ -2817,6 +2818,7 @@ mod tests {
             key_count: 9,
             encoder_count: 3,
             screens: 6,
+            protocol_version: None,
             buttons: vec![],
             encoders: vec![],
         };

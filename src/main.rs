@@ -11,18 +11,16 @@ extern crate mirajazz_freebsd as mirajazz;
 
 use clap::Parser;
 use mirajazz::{
-    device::{list_devices, Device, DeviceQuery},
+    device::{list_devices, Device},
     error::MirajazzError,
-    types::{
-        DeviceInput, HidDevice, HidDeviceInfo, ImageFormat, ImageMirroring, ImageMode,
-        ImageRotation,
-    },
+    types::{DeviceInput, HidDevice, HidDeviceInfo},
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use dak::actions::{self, Action};
 use dak::baseplane::{Baseplane, Reference};
+use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
@@ -49,19 +47,6 @@ struct Cli {
     #[arg(long)]
     map: bool,
 }
-
-const QUERY: DeviceQuery = DeviceQuery::new(65440, 1, 0x0300, 0x3002);
-
-/// Protocol version used to connect to every device.
-const PROTOCOL_VERSION: usize = 2;
-
-const IMAGE_FORMAT: ImageFormat = ImageFormat {
-    mode: ImageMode::JPEG,
-    size: (60, 60),
-    // The device's LCDs display images rotated 90 degrees clockwise.
-    rotation: ImageRotation::Rot90,
-    mirror: ImageMirroring::None,
-};
 
 /// Loads the config, matches the config's `devices` definitions against the discovered
 /// hardware, and drives every present device: each connects with its own key/encoder
@@ -113,7 +98,10 @@ async fn main() -> Result<(), MirajazzError> {
     // Discovered devices come back from an unordered set. Each config device definition
     // (keyed by a logical device id) is matched against this set: serial numbers tell
     // identical devices apart, a VID:PID fallback covers devices without serials.
-    let devices: Vec<HidDevice> = list_devices(&[QUERY]).await?.into_iter().collect();
+    let devices: Vec<HidDevice> = list_devices(&hardware::QUERIES)
+        .await?
+        .into_iter()
+        .collect();
     let mut assignments: Vec<(u8, Mapping, HidDeviceInfo)> = Vec::new();
     for (device_id, definition) in &config.devices.by_id {
         match devices.iter().position(|dev| {
@@ -228,10 +216,43 @@ async fn run_device(
         log.debug(Subsystem::Device, line);
     }
 
+    // Every device_info reaching this point already matched hardware::QUERIES during
+    // discovery in main(), so this should always resolve; treated as a hard error
+    // rather than assumed, in case that invariant is ever broken.
+    let kind = match hardware::Kind::from_vid_pid(device_info.vendor_id, device_info.product_id) {
+        Some(kind) => kind,
+        None => {
+            log.error(format!(
+                "device {device_number}: unrecognized vendor/product ID {:04x}:{:04x}",
+                device_info.vendor_id, device_info.product_id
+            ));
+            return Err(MirajazzError::DeviceNotFoundError);
+        }
+    };
+    log.debug(
+        Subsystem::Device,
+        format!(
+            "device {device_number}: recognized as {}",
+            kind.human_name()
+        ),
+    );
+
+    // The config definition's own protocol_version, when set, overrides the
+    // recognized kind's default - e.g. for a kind this project has not verified
+    // itself, if a different protocol version turns out to work better for the
+    // user's specific unit. See `Mapping::protocol_version`'s doc comment.
+    let protocol_version = definition
+        .protocol_version
+        .unwrap_or(kind.protocol_version());
+    log.debug(
+        Subsystem::Device,
+        format!("device {device_number}: protocol version {protocol_version}"),
+    );
+
     // Connect to the device using the counts its config definition declares.
     let device = Device::connect(
         &device_info,
-        PROTOCOL_VERSION,
+        protocol_version,
         definition.key_count as usize,
         definition.encoder_count as usize,
     )
@@ -289,7 +310,7 @@ async fn run_device(
     let mut runner = actions::SceneRunner::new(
         device_number,
         &device,
-        IMAGE_FORMAT,
+        kind.image_format(),
         exec_tx,
         refresh_tx,
         log,
@@ -944,6 +965,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use dak::actions::{ButtonDevice, SceneRunner};
+    use dak::hardware;
     use dak::log::Log;
 
     use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference};
@@ -1038,7 +1060,7 @@ mod tests {
         SceneRunner::new(
             1,
             mock,
-            super::IMAGE_FORMAT,
+            hardware::Kind::Akp03ERev2.image_format(),
             exec_tx,
             refresh_tx,
             Log::default(),
