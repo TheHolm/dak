@@ -5,6 +5,93 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.9.0 — Breaking: `~` no longer means "stay"; configurable brightness, `$`-actions, home-dir expansion
+
+### User-facing changes
+- **Breaking change:** a bare `~` action value no longer means "stay on the
+  current scene" - use a bare `@` instead. There is no migration warning:
+  an old config's `"~"` action now just becomes a literal (and almost
+  certainly failing) attempt to run `~` as a command, so update any `"~"`
+  action to `"@"` by hand.
+- New optional `defaults` config keys `button_brightness`/
+  `encoder_brightness` (both default `50`, range `0`-`100`), applied to
+  every device's screen/encoder-LED brightness when it connects.
+  `encoder_brightness` is unverified against real hardware: no Ajazz
+  AKP03E/AKP03R unit with functioning encoder LEDs was available during
+  development.
+- Paths and commands (`image`/`text`/`image_exec`/`text_exec`/`launch`
+  params, and plain command actions) now expand a leading `~` to your home
+  directory, same as a shell: `~` becomes `$HOME`, `~/rest` becomes
+  `$HOME/rest`.
+- New `$path <op> value` action for changing
+  `defaults.button_brightness`/`defaults.encoder_brightness` at runtime,
+  immediately, without touching `config.json` or persisting across a
+  reconnect, e.g. `"short_press": "$defaults.button_brightness := 100"`.
+  Only `:=` is implemented: it clamps an out-of-range number into `0`-`100`
+  and warns when it had to (`=`/`~=` are reserved syntax for a future
+  release). Trying to set anything else - the rest of `defaults`, anything
+  under `devices`/`scenes`, `version`, or a path that isn't a real config
+  field at all - is a config-load-time error.
+
+### Details
+Added:
+- `defaults.button_brightness`/`defaults.encoder_brightness`: `press::
+  PressDefaults` renamed to `press::Defaults` (its name no longer matched
+  what it held) and given the two new `u8` fields; `check_defaults`
+  extended to validate them (`0`-`100`, with `0` explicitly valid, unlike
+  the duration keys which still forbid it); `run_device` now calls
+  `device.set_brightness`/`set_led_brightness` from the config instead of
+  a hardcoded `50`.
+- `Action::SetConfig` variant, and a `$`-action parsing/validation
+  pipeline: `parse_set_config` (splits `$path <op> value`; the three
+  operators - `:=`, `~=`, `=` - are checked longest-first so `:=`'s own
+  `=` character is never mis-split as the bare `=` operator), `AssignOp`,
+  `AssignedValue` (`Number(i64)`/`Text(String)` kept deliberately distinct,
+  so a quoted `"123"` is never coerced into the number `123`),
+  `classify_config_path` (settable vs. read-only vs. unknown - `devices.*`/
+  `scenes.*` are read-only wholesale, since both sections are dynamically
+  shaped with no fixed field list to check deeper than the section name),
+  and `Constraint` (`NumberRange` used today, `MaxLength` reserved for a
+  future string-typed settable parameter). The parsed numeric literal is
+  a signed `i64`, specifically so a negative literal (`-10`) clamps up to
+  the minimum instead of being rejected as unparsable.
+- `ButtonDevice` trait gained `set_brightness`/`set_led_brightness`
+  (implemented for the real `Device` and all 3 existing test mocks) and
+  `SceneRunner` gained `set_button_brightness`/`set_encoder_brightness`
+  passthroughs, so the new action reaches the device through the same
+  testable seam as every other scene operation - no new shared/mutable
+  state needed, since it's an immediate device call, never persisted or
+  reapplied by a later `Stay`/scene switch.
+- `expand_tilde` helper, applied at both config-load-time validation
+  (`check_file_exists`/`check_executable`) and at the point paths/commands
+  are actually built for runtime (`scene_operations`, `parse_command_line`
+  - the latter covers `image_exec`/`text_exec`/`launch` and
+  `Action::Command` uniformly, since they all funnel through it).
+- A new `AGENTS.md` convention documenting the `X.Y.Z` version-bump policy
+  itself: `X` only on explicit user request, `Y` for new features, `Z` for
+  fixes/changes that add no new functionality.
+
+Changed:
+- `parse_action`/`check_action_value`/`check_action_values`: a bare `@`
+  (empty scene reference) is now valid ("stay"), removing the old "empty
+  scene reference" error for that case; the "at most one scene-changing
+  action per event" counter simplifies to `item.starts_with('@')`,
+  dropping the separate `~` check.
+
+Testing:
+- ~60 new/updated tests across `src/actions.rs`, `src/main.rs`,
+  `tests/scene_runner.rs`, `tests/validation.rs`, `tests/scene_operations.rs`,
+  `tests/action_types.rs`, plus a new `SetHome`/`ENV_LOCK` guard in
+  `tests/common/mod.rs` (mirroring the one already private to
+  `src/actions.rs`'s own unit tests) for deterministic `$HOME`-dependent
+  integration tests.
+- Verified end-to-end against real Ajazz AKP03E/AKP03R hardware (a Linux
+  test VM): `cargo build`/`fmt --check`/`clippy`/`test` all clean, plus a
+  live run demonstrating the clamp-and-warn behavior
+  (`$defaults.button_brightness := 500` clamps to `100` with the expected
+  warning) and confirming the shipped example config still runs correctly
+  against the real device with the new `@`/tilde-expansion behavior.
+
 ## v0.8.2 — Prebuilt packages now available for every release
 
 ### User-facing changes
