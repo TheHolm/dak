@@ -1,6 +1,6 @@
 # DAK — Dynamic Ajazz Keyboard
 
-**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`) - see [Help me support more devices](#help-me-support-more-devices) for how far detection reaches beyond that one device, and how verified each of those other devices is. Loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
+**DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`). Several other Ajazz/Mirabox-branded devices are wired up the same way and have a good chance of working out of the box even though nobody has confirmed them yet - see [Help me support more devices](#help-me-support-more-devices) for the full list and how verified each one is. Project is loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
 
 Work in progress. Config structure will probably change in the future, but I will try to make it easy to update to new version.
 
@@ -61,7 +61,7 @@ An explicit `-c`/`--config` path is always used as-is and disables the search. I
 of the searched locations contains a `config.json`, the program reports the missing
 file and exits. Run `dak --help` for the exact, generated usage text.
 
-All runtime behavior is driven by `config.json` instead of the hard-coded demo once shipped in `main.rs`:
+All runtime behavior is driven by `config.json`:
 
 - **Scenes** — buttons can display images, static text files, or the output of async commands (`image_exec` / `text_exec` with a 5-second timeout); scenes switch on key/encoder input, from the scene timer, or on demand.
 - **Per-key actions** — `short_press`, `long_press`, `double_click`, `pressed` and `released` bindings, with actions inherited from the previously active scene.
@@ -180,21 +180,14 @@ Action values have five forms:
   - anything else — the path of a command to execute, followed by its parameters
   - an array of any of the above, run without waiting on each other - see below
 
-> **Breaking change:** in earlier versions a bare `~` meant "stay on the same
-> scene". As of this version `~` is no longer special at all - use a bare `@`
-> instead. This freed `~` up for shell-style home-directory expansion (see
-> below), which would otherwise have been ambiguous with the old `~` = "stay"
-> convention. There is no migration warning: an old config's bare `"~"` action
-> now just becomes a literal (and almost certainly failing) attempt to run `~`
-> as a command - update any `"~"` action to `"@"` by hand.
-
 Commands are executed asynchronously, so a running command does not block button input or the timer.
 
-A leading `~` in any path or command/argument - `params`, or a command/`launch`
-value, including every word of an `image_exec`/`text_exec`/`launch` command line and
-`Action::Command` values - is expanded to your home directory, same as a shell:
-`~` alone becomes `$HOME`, and `~/rest` becomes `$HOME/rest`. `~` anywhere but the
-very start of a word is left untouched, and there is no `~user` support.
+A leading `~` in a command line - the `params` of an `image_exec`/`text_exec`, a
+`launch` value, or a plain command action (the fourth form above) - is expanded to
+your home directory, same as a shell: `~` alone becomes `$HOME`, and `~/rest` becomes
+`$HOME/rest`. This applies to every word of the line, the program and each argument
+alike, not just the first. `~` anywhere but the very start of a word is left
+untouched, and there is no `~user` support.
 
 `$<path> <op> <value>` sets a config parameter at runtime, immediately, without
 touching `config.json` and without persisting across a reconnect - it is a live
@@ -423,6 +416,15 @@ issue](https://github.com/theholm/dak/issues) with:
 Both together let us build up a database of which models report which raw codes and which
 ones actually work end-to-end, without needing physical access to every device model
 ourselves.
+
+**Side/secondary screens are not supported.** Some Mirabox devices (e.g. the Mirabox
+293S/293SV3 family) have an extra small LCD screen that isn't tied to any button or
+encoder. `mirajazz` (the library DAK is built on) has no working way to address such a
+screen - image writes are only ever keyed by button index, and while its source has
+leftover scaffolding suggesting a screen concept was once planned (an unused `ImageRect`
+type and `MirajazzError::NoScreen` variant), nothing in the library actually sends to one.
+Until `mirajazz` gains real support for this, DAK cannot drive these secondary screens
+either.
 
 ## TODO
 
