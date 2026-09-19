@@ -155,6 +155,46 @@ fn scene_operations_extract_text() {
     );
 }
 
+/// A `~/rest` `image`/`text` params path is expanded to `$HOME/rest` in the resulting
+/// operation, not kept literal - `scene_operations` is what actually opens the file at
+/// runtime, so it must see the resolved path.
+#[test]
+fn scene_operations_expands_tilde_in_image_and_text_params() {
+    let _guard = common::ENV_LOCK.lock().unwrap();
+    let home = common::temp_dir();
+    let _set_home = common::SetHome::new(&home);
+
+    let path = write_scenes_config(
+        r#"{
+            "on_start": {
+                "setup": {
+                    "1b01": { "type": "image", "params": "~/pics/button.png" },
+                    "1b02": { "type": "text", "params": "~/notes.txt" }
+                }
+            }
+        }"#,
+    );
+    let config = ::dak::actions::load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(path);
+
+    let operations = scene_operations("on_start", &config.scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![
+            SceneOp::SetImage {
+                reference: Reference::button(1, 1),
+                path: home.join("pics/button.png").to_string_lossy().into_owned(),
+                refresh_seconds: 0,
+            },
+            SceneOp::Text {
+                reference: Reference::button(1, 2),
+                path: home.join("notes.txt").to_string_lossy().into_owned(),
+                refresh_seconds: 0,
+            },
+        ]
+    );
+}
+
 /// text_exec buttons are parsed into TextExec operations with the program split
 /// from its collapsed params command line.
 #[test]

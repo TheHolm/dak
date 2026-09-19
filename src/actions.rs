@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
-use crate::press::PressDefaults;
+use crate::press::Defaults;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -29,8 +29,9 @@ pub struct LoadedConfig {
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
     pub devices: ConfiguredDevices,
-    /// The timing knobs from the `defaults` section, with built-in defaults applied.
-    pub defaults: PressDefaults,
+    /// The settings from the `defaults` section (press-detection timing knobs plus
+    /// connect-time brightness), with built-in defaults applied.
+    pub defaults: Defaults,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -259,10 +260,17 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     })
 }
 
-/// Validates the optional `defaults` section: an object whose keys hold positive
-/// millisecond durations for the press-detection knobs. Missing keys fall back to
-/// [`PressDefaults::default`].
-fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
+/// Validates the optional `defaults` section: an object holding the press-detection
+/// timing knobs (positive millisecond durations) and the connect-time brightness
+/// levels (0-100 percent). Missing keys fall back to [`Defaults::default`].
+fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
+    const KNOWN_KEYS: &[&str] = &[
+        "short_press_duration",
+        "double_click_gap",
+        "button_brightness",
+        "encoder_brightness",
+    ];
+
     let map = match defaults.as_object() {
         Some(map) => map,
         None => {
@@ -270,36 +278,68 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
                 "config \"defaults\" must be an object, got {}",
                 value_type(defaults)
             ));
-            return PressDefaults::default();
+            return Defaults::default();
         }
     };
 
-    let mut result = PressDefaults::default();
+    let mut result = Defaults::default();
     for (key, value) in map {
-        if key != "short_press_duration" && key != "double_click_gap" {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
             errors.push(format!(
-                "defaults: unknown key \"{key}\", expected \"short_press_duration\" and \"double_click_gap\""
+                "defaults: unknown key \"{key}\", expected one of {}",
+                KNOWN_KEYS
+                    .iter()
+                    .map(|key| format!("\"{key}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             continue;
         }
-        let Some(number) = value.as_u64() else {
-            errors.push(format!(
-                "defaults.{key} must be a positive number of milliseconds, got {}",
-                value_type(value)
-            ));
-            continue;
-        };
-        if number == 0 {
-            errors.push(format!(
-                "defaults.{key} must be a positive number of milliseconds"
-            ));
-            continue;
-        }
+
         match key.as_str() {
-            "short_press_duration" => {
-                result.short_press_duration = Duration::from_millis(number);
+            "short_press_duration" | "double_click_gap" => {
+                let Some(number) = value.as_u64() else {
+                    errors.push(format!(
+                        "defaults.{key} must be a positive number of milliseconds, got {}",
+                        value_type(value)
+                    ));
+                    continue;
+                };
+                if number == 0 {
+                    errors.push(format!(
+                        "defaults.{key} must be a positive number of milliseconds"
+                    ));
+                    continue;
+                }
+                match key.as_str() {
+                    "short_press_duration" => {
+                        result.short_press_duration = Duration::from_millis(number);
+                    }
+                    "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+                    _ => unreachable!("checked above"),
+                }
             }
-            "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+            "button_brightness" | "encoder_brightness" => {
+                let Some(number) = value.as_u64() else {
+                    errors.push(format!(
+                        "defaults.{key} must be a number between 0 and 100, got {}",
+                        value_type(value)
+                    ));
+                    continue;
+                };
+                if number > 100 {
+                    errors.push(format!(
+                        "defaults.{key} must be a number between 0 and 100, got {number}"
+                    ));
+                    continue;
+                }
+                let percent = number as u8;
+                match key.as_str() {
+                    "button_brightness" => result.button_brightness = percent,
+                    "encoder_brightness" => result.encoder_brightness = percent,
+                    _ => unreachable!("checked above"),
+                }
+            }
             _ => unreachable!("unknown keys are rejected above"),
         }
     }
@@ -654,8 +694,8 @@ fn check_timer(
 
 /// Validates an action value: either a single string (see [`check_action_value`]) or an
 /// array of them, run without waiting on each other. An array may contain at most one
-/// scene-changing action (`~` or `@scene`, checked here); every other array element is
-/// validated as a command exactly like the single-string form. `[]` is the sole way to
+/// scene-changing action (a bare `@` or `@scene`, checked here); every other array
+/// element is validated exactly like the single-string form. `[]` is the sole way to
 /// spell "bound but no action" for the array form (matching `""` for the string form);
 /// an empty string *inside* a non-empty array is rejected instead of silently ignored.
 fn check_action_values(
@@ -693,20 +733,26 @@ fn check_action_values(
             ));
             continue;
         }
-        if item == "~" || item.starts_with('@') {
+        if item.starts_with('@') {
             scene_changing += 1;
         }
         check_action_value(scenes, scene_name, path, item, errors, warnings);
     }
     if scene_changing > 1 {
         errors.push(format!(
-            "scene \"{scene_name}\": {path} has {scene_changing} scene-changing actions (~ or @scene); at most one is allowed per event"
+            "scene \"{scene_name}\": {path} has {scene_changing} scene-changing actions (@ or @scene); at most one is allowed per event"
         ));
     }
 }
 
-/// Validates a single action value: `~` stays, `@scene` must reference an existing scene,
-/// anything else is treated as a command whose executable is checked.
+/// Validates a single action value: a bare `@` stays, `@scene` must reference an
+/// existing scene, a `$path := value` action must target a settable parameter with a
+/// value of the right type and in range, and anything else is treated as a command
+/// whose executable is checked.
+///
+/// Breaking change: `~` is no longer special-cased here (it used to mean "stay") - a
+/// literal `"~"` value now falls through to the command branch below, same as any other
+/// string that isn't `@`/`$`-prefixed.
 fn check_action_value(
     scenes: &Value,
     scene_name: &str,
@@ -715,19 +761,18 @@ fn check_action_value(
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    if value == "~" {
-        return;
-    }
     if let Some(reference) = value.strip_prefix('@') {
         if reference.is_empty() {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} is an empty scene reference"
-            ));
+            // A bare "@": stay on the current scene. Nothing to validate.
         } else if !scenes.as_object().unwrap().contains_key(reference) {
             errors.push(format!(
                 "scene \"{scene_name}\": {path} references undefined scene \"@{reference}\""
             ));
         }
+        return;
+    }
+    if value.starts_with('$') {
+        check_set_config_action(scene_name, path, value, errors, warnings);
         return;
     }
 
@@ -737,13 +782,101 @@ fn check_action_value(
     }
 }
 
+/// Validates a `$path <op> value` action: `value` must parse as `$<dotted path> <op>
+/// <number or "quoted string">` for one of the three [`AssignOp`] operators; `path`
+/// must name a currently-settable parameter (only `defaults.button_brightness`/
+/// `defaults.encoder_brightness` for now); and the right-hand-side literal must be the
+/// type [`SettableDefault::constraint`] expects for that parameter.
+///
+/// A well-formed path that names a real but immutable config field/section (anything
+/// else under `defaults`, or anything under `devices`/`scenes`) is a distinct
+/// "read-only parameter" error; a path that doesn't correspond to any real config field
+/// at all is a distinct "unknown parameter" error - see [`classify_config_path`]. A
+/// wrong-type value (e.g. a quoted string for a numeric parameter) is a distinct error
+/// under every operator, since clamping/truncation is a range/length concept, not a
+/// type coercion - `"100"` never satisfies a numeric parameter the way `100` does.
+///
+/// Only `:=` ([`AssignOp::ClampWarn`]) is implemented: an out-of-range number is
+/// clamped into its [`Constraint`], with a warning when clamping actually changed the
+/// value (an in-range number is silently fine). `=`/`~=` are recognized but rejected
+/// with a distinct "not implemented yet" error - see [`AssignOp`]'s doc comments for
+/// their intended future behavior.
+fn check_set_config_action(
+    scene_name: &str,
+    path: &str,
+    value: &str,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Some((config_path, op, assigned)) = parse_set_config(value) else {
+        errors.push(format!(
+            "scene \"{scene_name}\": {path} is a malformed \"$\" assignment \"{value}\", expected \"$path := value\" with value a number or a \"quoted string\""
+        ));
+        return;
+    };
+
+    let param = match classify_config_path(&config_path) {
+        ParamClass::Settable(param) => param,
+        ParamClass::ReadOnly => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path} tries to set read-only parameter \"{config_path}\""
+            ));
+            return;
+        }
+        ParamClass::Unknown => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path} sets unknown parameter \"{config_path}\""
+            ));
+            return;
+        }
+    };
+
+    match op {
+        AssignOp::Strict => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path} uses \"=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
+            ));
+            return;
+        }
+        AssignOp::ClampSilent => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path} uses \"~=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
+            ));
+            return;
+        }
+        AssignOp::ClampWarn => {}
+    }
+
+    match (param.constraint(), assigned) {
+        (Constraint::NumberRange { min, max }, AssignedValue::Number(number)) => {
+            let clamped = number.clamp(min, max);
+            if clamped != number {
+                warnings.push(format!(
+                    "scene \"{scene_name}\": {path} sets \"{config_path}\" to {number} via \":=\", out of range {min}-{max} - clamped to {clamped}"
+                ));
+            }
+        }
+        (Constraint::NumberRange { .. }, AssignedValue::Text(text)) => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {path} sets \"{config_path}\" to a string (\"{text}\"), but it requires a number"
+            ));
+        }
+        (Constraint::MaxLength(_), _) => {
+            unreachable!(
+                "no settable string parameter exists yet - see Constraint::MaxLength's doc comment"
+            )
+        }
+    }
+}
+
 /// Adds a warning if the program does not exist or is not executable.
 fn check_executable(scene_name: &str, path: &str, executable: &str, warnings: &mut Vec<String>) {
-    if !Path::new(executable).exists() {
+    let resolved = expand_tilde(executable);
+    if !Path::new(&resolved).exists() {
         warnings.push(format!(
             "scene \"{scene_name}\": {path} program not found: \"{executable}\""
         ));
-    } else if !is_executable(executable) {
+    } else if !is_executable(&resolved) {
         warnings.push(format!(
             "scene \"{scene_name}\": {path} program is not executable: \"{executable}\""
         ));
@@ -752,11 +885,33 @@ fn check_executable(scene_name: &str, path: &str, executable: &str, warnings: &m
 
 /// Adds a warning if the referenced file does not exist.
 fn check_file_exists(scene_name: &str, path: &str, file: &str, warnings: &mut Vec<String>) {
-    if !Path::new(file).exists() {
+    if !Path::new(&expand_tilde(file)).exists() {
         warnings.push(format!(
             "scene \"{scene_name}\": {path} file not found: \"{file}\""
         ));
     }
+}
+
+/// Expands a leading `~` (home directory) in a path-like string, mirroring shell tilde
+/// expansion: a bare `"~"` becomes `$HOME`, and `"~/rest"` becomes `"$HOME/rest"`.
+///
+/// Only a literal leading `~` is recognized - no `~user` support, and `~` anywhere but
+/// the very start of `value` is left untouched (matching shell behavior, where `~` only
+/// expands at the start of a word). Left unchanged (including a leading `~`) when `$HOME`
+/// isn't set, or when `value` doesn't start with `~` at all.
+pub fn expand_tilde(value: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return value.to_string();
+    };
+    if value == "~" {
+        return PathBuf::from(home).to_string_lossy().into_owned();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        let mut path = PathBuf::from(home);
+        path.push(rest);
+        return path.to_string_lossy().into_owned();
+    }
+    value.to_string()
 }
 
 /// Whether the file exists and has at least one execute permission bit set.
@@ -898,12 +1053,12 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         match kind {
             "image" => operations.push(SceneOp::SetImage {
                 reference,
-                path: params,
+                path: expand_tilde(&params),
                 refresh_seconds,
             }),
             "text" => operations.push(SceneOp::Text {
                 reference,
-                path: params,
+                path: expand_tilde(&params),
                 refresh_seconds,
             }),
             "text_exec" => {
@@ -992,7 +1147,9 @@ fn params_command(
 /// [`CommandSpec`] that is run with tokio's process API. Single-quoted and
 /// double-quoted segments are kept as one argument (quotes removed) and a backslash
 /// escapes the following character outside quotes. An unterminated quote or an empty
-/// line is reported as an error.
+/// line is reported as an error. A leading `~` in the program name or in any argument
+/// is expanded to `$HOME` via [`expand_tilde`], so `~/scripts/foo.sh --config
+/// ~/my.json` resolves both paths.
 pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
     let mut words = Vec::new();
     let mut current = String::new();
@@ -1035,8 +1192,8 @@ pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
 
     let mut words = words.into_iter();
     Ok(CommandSpec {
-        program: words.next().unwrap(),
-        args: words.collect(),
+        program: expand_tilde(&words.next().unwrap()),
+        args: words.map(|arg| expand_tilde(&arg)).collect(),
     })
 }
 
@@ -1074,6 +1231,12 @@ pub trait ButtonDevice: Send + Sync {
 
     /// Number of buttons the device physically has.
     fn key_count(&self) -> u8;
+
+    /// Sets the device's button/screen LCD brightness (0-100 percent).
+    async fn set_brightness(&self, percent: u8) -> Result<(), Self::Error>;
+
+    /// Sets the device's encoder LED-ring brightness (0-100 percent).
+    async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error>;
 }
 
 impl ButtonDevice for Device {
@@ -1098,6 +1261,14 @@ impl ButtonDevice for Device {
 
     fn key_count(&self) -> u8 {
         Device::key_count(self) as u8
+    }
+
+    async fn set_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+        Device::set_brightness(self, percent).await
+    }
+
+    async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+        Device::set_led_brightness(self, percent).await
     }
 }
 
@@ -1181,6 +1352,21 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             .debug(Subsystem::Scene, format!("Entering scene \"{scene_name}\""));
         let operations = scene_operations(scene_name, scenes)?;
         self.apply_scene_operations(&operations).await
+    }
+
+    /// Sets this device's button/screen LCD brightness (0-100 percent), e.g. from a
+    /// `$defaults.button_brightness := N` action. Takes effect immediately; not
+    /// persisted anywhere (config.json is untouched) and not reapplied by a later
+    /// `Stay`/scene switch, which never touch brightness.
+    pub async fn set_button_brightness(&self, percent: u8) -> Result<(), D::Error> {
+        self.device.set_brightness(percent).await
+    }
+
+    /// Sets this device's encoder LED-ring brightness (0-100 percent), e.g. from a
+    /// `$defaults.encoder_brightness := N` action. Same immediate, non-persisted
+    /// semantics as [`SceneRunner::set_button_brightness`].
+    pub async fn set_encoder_brightness(&self, percent: u8) -> Result<(), D::Error> {
+        self.device.set_led_brightness(percent).await
     }
 
     /// Applies scene operations to the device; unsupported operations are skipped with a notice.
@@ -1977,22 +2163,233 @@ pub async fn set_image_from_file<D: ButtonDevice>(
     Ok(())
 }
 
-/// The outcome of an action value: stay on the scene, switch to another scene,
-/// or run a command.
+/// A config `defaults` field settable at runtime via a `$path := value` action.
+///
+/// Currently the only two settable parameters; everything else in the config (all of
+/// `devices`/`scenes`, the rest of `defaults`, and `version`) is read-only - see
+/// [`classify_config_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettableDefault {
+    ButtonBrightness,
+    EncoderBrightness,
+}
+
+impl SettableDefault {
+    /// The dotted config path a `$`-action names this parameter by, e.g.
+    /// `"defaults.button_brightness"`.
+    pub fn path(&self) -> &'static str {
+        match self {
+            SettableDefault::ButtonBrightness => "defaults.button_brightness",
+            SettableDefault::EncoderBrightness => "defaults.encoder_brightness",
+        }
+    }
+
+    /// The value constraint `:=`/`~=` clamp or truncate into (and `=` will hard-error
+    /// against, once implemented). Both of today's settable parameters are numeric
+    /// brightness percentages, matching `mirajazz::Device::set_brightness`/
+    /// `set_led_brightness`'s own internal `percent.clamp(0, 100)`.
+    fn constraint(&self) -> Constraint {
+        match self {
+            SettableDefault::ButtonBrightness | SettableDefault::EncoderBrightness => {
+                Constraint::NumberRange { min: 0, max: 100 }
+            }
+        }
+    }
+}
+
+/// The value constraint a settable parameter's assignment operator checks against -
+/// what `:=`/`~=` clamp or truncate into, and what `=` will hard-error against once
+/// implemented (see [`AssignOp`]).
+enum Constraint {
+    /// A number must fall within `min..=max` (inclusive on both ends).
+    NumberRange { min: i64, max: i64 },
+    /// A string must be at most `max_len` characters. Reserved for a future
+    /// string-typed settable parameter; [`SettableDefault::constraint`] never returns
+    /// this today, since both current settable parameters are numeric.
+    #[allow(dead_code)]
+    MaxLength(usize),
+}
+
+/// The right-hand-side literal of a `$path <op> value` action, before it's matched
+/// against the type a specific [`SettableDefault`] expects.
+///
+/// Kept distinct from [`AssignedValue::Number`] on purpose: a quoted `"123"` is text,
+/// not the number `123`, so a settable parameter that requires a number rejects a
+/// quoted numeral instead of silently coercing it - see [`check_action_value`].
+#[derive(Debug, Clone, PartialEq)]
+enum AssignedValue {
+    /// A signed integer literal, e.g. `-10`, `0`, `100` - signed so a negative value
+    /// can be clamped up to a constraint's `min` instead of being rejected outright as
+    /// unparsable.
+    Number(i64),
+    Text(String),
+}
+
+/// The assignment operator of a `$path <op> value` action.
+///
+/// Only [`AssignOp::ClampWarn`] (`:=`) is implemented today; the other two are
+/// recognized by [`parse_set_config`] (so a config author's choice of operator is
+/// remembered and can be reported back with a clear "not implemented yet" error
+/// instead of a generic "malformed" one) but rejected by [`check_set_config_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignOp {
+    /// `=` - **not yet implemented.** Will hard-error instead of clamping/truncating
+    /// when the value violates the target's [`Constraint`]. For a constant literal
+    /// (today's only supported right-hand side) that check could happen entirely at
+    /// config-load time, same as `:=`'s out-of-range case used to before this operator
+    /// family existed; once real runtime variables exist, the same check will instead
+    /// need to happen when the action actually fires, since the value won't be known
+    /// until then.
+    Strict,
+    /// `:=` - clamps a number into its [`Constraint`]'s range, or (once a string-typed
+    /// settable parameter exists) truncates a string to its max length, and warns
+    /// when it had to.
+    ClampWarn,
+    /// `~=` - **not yet implemented.** Will apply the same clamping/truncation as
+    /// `ClampWarn`, but silently - no warning even when the value was out of range.
+    ClampSilent,
+}
+
+/// How a `$`-action's dotted path resolves against the config schema.
+enum ParamClass {
+    /// A real, currently-settable parameter.
+    Settable(SettableDefault),
+    /// A real config field or section that isn't (yet) settable at runtime.
+    ReadOnly,
+    /// Not a real config path at all (typo, or a section/field that doesn't exist).
+    Unknown,
+}
+
+/// Classifies a `$`-action's dotted path against the config schema.
+///
+/// `devices.*`/`scenes.*` are read-only wholesale rather than field-by-field: both
+/// sections are dynamically shaped (device ids, scene names, control references are
+/// all config-author-chosen), so there is no fixed field list to check deeper than the
+/// section name - anything under either is real but immutable. `defaults.*` has an
+/// exact, fixed field list, so it's checked field-by-field instead: the two brightness
+/// keys are settable, `short_press_duration`/`double_click_gap` are read-only, and any
+/// other `defaults.*` field is unknown (no such field exists).
+fn classify_config_path(path: &str) -> ParamClass {
+    match path {
+        "defaults.button_brightness" => ParamClass::Settable(SettableDefault::ButtonBrightness),
+        "defaults.encoder_brightness" => ParamClass::Settable(SettableDefault::EncoderBrightness),
+        "defaults.short_press_duration"
+        | "defaults.double_click_gap"
+        | "version"
+        | "scenes"
+        | "devices"
+        | "defaults" => ParamClass::ReadOnly,
+        _ if path.starts_with("devices.") || path.starts_with("scenes.") => ParamClass::ReadOnly,
+        _ => ParamClass::Unknown,
+    }
+}
+
+/// Splits a `$path <op> value` action string into its dotted path, assignment
+/// operator, and parsed right-hand-side literal.
+///
+/// Recognizes all three operators (`:=`, `~=`, `=`, checked in that order so `:=`'s own
+/// `=` character is never mis-split as the bare `=` operator, and likewise for `~=`)
+/// even though only `:=` is implemented ([`AssignOp`]) - that way a config using `=`/
+/// `~=` gets a clear "not implemented yet" error from [`check_set_config_action`]
+/// instead of a generic "malformed" one.
+///
+/// Returns `None` when `value` doesn't start with `$`, has no operator at all, has an
+/// empty path or right-hand side, or a right-hand side that is neither a bare signed
+/// integer (e.g. `-10`, `100`) nor a `"double-quoted string"` (no escape support inside
+/// quotes yet). Doesn't check the path against the config schema at all - that's
+/// [`classify_config_path`]'s job, called separately by both [`check_action_value`]
+/// (which needs to report path-specific errors) and [`parse_action`] (which just needs
+/// *a* parsed value or none).
+fn parse_set_config(value: &str) -> Option<(String, AssignOp, AssignedValue)> {
+    let rest = value.strip_prefix('$')?;
+    let (path, op, rhs) = if let Some((path, rhs)) = rest.split_once(":=") {
+        (path, AssignOp::ClampWarn, rhs)
+    } else if let Some((path, rhs)) = rest.split_once("~=") {
+        (path, AssignOp::ClampSilent, rhs)
+    } else if let Some((path, rhs)) = rest.split_once('=') {
+        (path, AssignOp::Strict, rhs)
+    } else {
+        return None;
+    };
+    let path = path.trim();
+    let rhs = rhs.trim();
+    if path.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    let parsed = if let Some(inner) = rhs
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        AssignedValue::Text(inner.to_string())
+    } else if let Ok(number) = rhs.parse::<i64>() {
+        AssignedValue::Number(number)
+    } else {
+        return None;
+    };
+    Some((path.to_string(), op, parsed))
+}
+
+/// The outcome of an action value: stay on the scene, switch to another scene, run a
+/// command, or set a runtime-settable config parameter.
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Stay,
     SwitchScene { scene: String },
     Command { command: String },
+    SetConfig { param: SettableDefault, value: u8 },
 }
 
-/// Classifies an action value: `~` stays, `@name` switches scene, anything else is a command.
+/// Classifies an action value: a bare `@` stays, `@name` switches scene, a well-formed
+/// `$path := value` targeting a settable parameter with `:=` (today's only
+/// implemented operator - see [`AssignOp`]) sets it, anything else (including a
+/// malformed or not-yet-implemented `$`-action - config validation is the real gate
+/// against those ever reaching here) is a command.
+///
+/// A `:=` number is clamped into its target's [`Constraint`] here exactly like
+/// [`check_set_config_action`] already validated at config-load time (e.g. `:=
+/// 9999999999999` on a `0`-`100` parameter becomes `100`), so the value actually sent
+/// to the device always matches what was validated/warned about.
+///
+/// Note the breaking change from earlier versions: `~` no longer means "stay" (that's
+/// now a bare `@`, freeing `~` up for the home-directory expansion [`expand_tilde`]
+/// applies to paths/commands elsewhere) - a literal `"~"` action value is now just a
+/// (typically failing) attempt to run `~` as a command.
 pub fn parse_action(value: &str) -> Action {
-    if value == "~" {
-        Action::Stay
-    } else if let Some(scene) = value.strip_prefix('@') {
-        Action::SwitchScene {
-            scene: scene.to_string(),
+    if let Some(scene) = value.strip_prefix('@') {
+        if scene.is_empty() {
+            Action::Stay
+        } else {
+            Action::SwitchScene {
+                scene: scene.to_string(),
+            }
+        }
+    } else if value.starts_with('$') {
+        match parse_set_config(value) {
+            Some((path, AssignOp::ClampWarn, AssignedValue::Number(number))) => {
+                match classify_config_path(&path) {
+                    ParamClass::Settable(param) => {
+                        let Constraint::NumberRange { min, max } = param.constraint() else {
+                            unreachable!(
+                                "no settable string parameter exists yet - see \
+                                 Constraint::MaxLength's doc comment"
+                            )
+                        };
+                        // Safe: every constraint in use today has a `max` that fits in
+                        // a u8 (0-100), so the clamped value always does too.
+                        let clamped = number.clamp(min, max) as u8;
+                        Action::SetConfig {
+                            param,
+                            value: clamped,
+                        }
+                    }
+                    _ => Action::Command {
+                        command: value.to_string(),
+                    },
+                }
+            }
+            _ => Action::Command {
+                command: value.to_string(),
+            },
         }
     } else {
         Action::Command {
@@ -2610,5 +3007,271 @@ mod tests {
         assert_eq!(tracker.generations.get(&3).copied(), Some(generation + 1));
         assert!(!tracker.is_current(3, generation));
         done_rx.recv().await;
+    }
+
+    /// A bare `"~"` expands to `$HOME` exactly.
+    #[test]
+    fn expand_tilde_expands_bare_tilde() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_dir();
+        let _set_home = SetHome::new(&home);
+        assert_eq!(
+            super::expand_tilde("~"),
+            home.to_string_lossy().into_owned()
+        );
+    }
+
+    /// A `"~/rest"` expands to `$HOME/rest`.
+    #[test]
+    fn expand_tilde_expands_tilde_slash_prefix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_dir();
+        let _set_home = SetHome::new(&home);
+        assert_eq!(
+            super::expand_tilde("~/foo/bar.png"),
+            home.join("foo/bar.png").to_string_lossy().into_owned()
+        );
+    }
+
+    /// `~` anywhere but the very start of the string is left untouched, matching shell
+    /// semantics (only a leading `~` expands).
+    #[test]
+    fn expand_tilde_leaves_non_leading_tilde_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_dir();
+        let _set_home = SetHome::new(&home);
+        assert_eq!(super::expand_tilde("/foo/~bar"), "/foo/~bar");
+        assert_eq!(super::expand_tilde("foo~bar"), "foo~bar");
+    }
+
+    /// An absolute path with no leading `~` is returned unchanged.
+    #[test]
+    fn expand_tilde_leaves_absolute_paths_untouched() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_dir();
+        let _set_home = SetHome::new(&home);
+        assert_eq!(super::expand_tilde("/etc/passwd"), "/etc/passwd");
+    }
+
+    /// `parse_command_line` expands a leading `~` in both the program name and every
+    /// argument.
+    #[test]
+    fn parse_command_line_expands_tilde_in_program_and_args() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = temp_dir();
+        let _set_home = SetHome::new(&home);
+        let command = super::parse_command_line("~/bin/text2gif -t ~/greeting.txt").unwrap();
+        assert_eq!(
+            command.program,
+            home.join("bin/text2gif").to_string_lossy().into_owned()
+        );
+        assert_eq!(
+            command.args,
+            vec![
+                "-t".to_string(),
+                home.join("greeting.txt").to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    /// A bare `"@"` classifies as `Stay`; the old `"~"` convention no longer does
+    /// (breaking change) and is now just a literal (typically failing) command.
+    #[test]
+    fn parse_action_bare_at_is_stay_and_tilde_is_a_command() {
+        assert_eq!(super::parse_action("@"), super::Action::Stay);
+        assert_eq!(
+            super::parse_action("~"),
+            super::Action::Command {
+                command: "~".to_string()
+            }
+        );
+    }
+
+    /// `"@SceneName"` classifies as a scene switch.
+    #[test]
+    fn parse_action_at_name_switches_scene() {
+        assert_eq!(
+            super::parse_action("@Main"),
+            super::Action::SwitchScene {
+                scene: "Main".to_string()
+            }
+        );
+    }
+
+    /// A well-formed `$`-assignment targeting a settable parameter classifies as
+    /// `SetConfig`.
+    #[test]
+    fn parse_action_classifies_valid_set_config() {
+        assert_eq!(
+            super::parse_action("$defaults.button_brightness := 80"),
+            super::Action::SetConfig {
+                param: super::SettableDefault::ButtonBrightness,
+                value: 80,
+            }
+        );
+        assert_eq!(
+            super::parse_action("$defaults.encoder_brightness := 5"),
+            super::Action::SetConfig {
+                param: super::SettableDefault::EncoderBrightness,
+                value: 5,
+            }
+        );
+    }
+
+    /// `:=` clamps an out-of-range number into its target's constraint (`0`-`100` for
+    /// both of today's settable parameters) instead of rejecting it - a negative
+    /// number clamps up to `0`, and one above the max clamps down to `100`, matching
+    /// [`super::check_set_config_action`]'s validation-time warning for the same value.
+    #[test]
+    fn parse_action_clamps_out_of_range_numbers_for_settable_default() {
+        assert_eq!(
+            super::parse_action("$defaults.button_brightness := -10"),
+            super::Action::SetConfig {
+                param: super::SettableDefault::ButtonBrightness,
+                value: 0,
+            }
+        );
+        assert_eq!(
+            super::parse_action("$defaults.button_brightness := 9999999999999"),
+            super::Action::SetConfig {
+                param: super::SettableDefault::ButtonBrightness,
+                value: 100,
+            }
+        );
+    }
+
+    /// A `$`-assignment targeting a read-only/unknown parameter, one with the wrong
+    /// value type, or one using a not-yet-implemented operator (`=`/`~=`), falls back
+    /// to being treated as a literal command at runtime - config validation is the
+    /// real gate against these ever being used.
+    #[test]
+    fn parse_action_falls_back_to_command_for_invalid_set_config() {
+        for value in [
+            "$defaults.short_press_duration := 100", // read-only
+            "$devices.1.key_count := 5",             // read-only
+            "$foo.bar := 1",                         // unknown
+            "$defaults.button_brightness := \"80\"", // wrong type
+            "$defaults.button_brightness = 80",      // not-yet-implemented operator "="
+            "$defaults.button_brightness ~= 80",     // not-yet-implemented operator "~="
+        ] {
+            assert_eq!(
+                super::parse_action(value),
+                super::Action::Command {
+                    command: value.to_string()
+                },
+                "for {value}"
+            );
+        }
+    }
+
+    /// [`super::classify_config_path`] recognizes the two settable paths, treats the
+    /// rest of `defaults` and all of `devices`/`scenes` as read-only, and anything else
+    /// as unknown.
+    #[test]
+    fn classify_config_path_covers_settable_readonly_and_unknown() {
+        assert!(matches!(
+            super::classify_config_path("defaults.button_brightness"),
+            super::ParamClass::Settable(super::SettableDefault::ButtonBrightness)
+        ));
+        assert!(matches!(
+            super::classify_config_path("defaults.encoder_brightness"),
+            super::ParamClass::Settable(super::SettableDefault::EncoderBrightness)
+        ));
+        for path in [
+            "defaults.short_press_duration",
+            "defaults.double_click_gap",
+            "version",
+            "scenes",
+            "devices",
+            "defaults",
+            "devices.1.key_count",
+            "scenes.on_start.setup",
+        ] {
+            assert!(
+                matches!(
+                    super::classify_config_path(path),
+                    super::ParamClass::ReadOnly
+                ),
+                "expected {path} to be read-only"
+            );
+        }
+        for path in [
+            "foo.bar",
+            "defaults.nonexistent",
+            "default.button_brightness",
+        ] {
+            assert!(
+                matches!(
+                    super::classify_config_path(path),
+                    super::ParamClass::Unknown
+                ),
+                "expected {path} to be unknown"
+            );
+        }
+    }
+
+    /// [`super::parse_set_config`] splits a well-formed `$path <op> value` action,
+    /// distinguishing a quoted string from a bare number - `"123"` is never treated as
+    /// the number `123` - and recognizes all three assignment operators (`:=`, `~=`,
+    /// `=`, checked in that order so `:=`'s own `=` character is never mis-split as the
+    /// bare `=` operator), even though only `:=` is implemented ([`super::AssignOp`]).
+    #[test]
+    fn parse_set_config_distinguishes_numbers_strings_and_operators() {
+        assert_eq!(
+            super::parse_set_config("$defaults.button_brightness := 80"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignedValue::Number(80)
+            ))
+        );
+        assert_eq!(
+            super::parse_set_config("$defaults.button_brightness := \"80\""),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignedValue::Text("80".to_string())
+            ))
+        );
+        assert_eq!(
+            super::parse_set_config("$defaults.button_brightness ~= 80"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampSilent,
+                super::AssignedValue::Number(80)
+            ))
+        );
+        assert_eq!(
+            super::parse_set_config("$defaults.button_brightness = 80"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::Strict,
+                super::AssignedValue::Number(80)
+            ))
+        );
+        assert_eq!(
+            super::parse_set_config("$defaults.button_brightness := -10"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignedValue::Number(-10)
+            )),
+            "a negative number is a valid literal, clamped later - not malformed"
+        );
+    }
+
+    /// Malformed `$`-assignments (no operator at all, empty path/value, an unquoted
+    /// non-numeric value, or no leading `$` at all) are rejected.
+    #[test]
+    fn parse_set_config_rejects_malformed_input() {
+        for value in [
+            "defaults.button_brightness := 80",    // no leading $
+            "$defaults.button_brightness 80",      // no operator at all
+            "$ := 80",                             // empty path
+            "$defaults.button_brightness := ",     // empty value
+            "$defaults.button_brightness := high", // unquoted non-numeric
+        ] {
+            assert_eq!(super::parse_set_config(value), None, "for {value}");
+        }
     }
 }

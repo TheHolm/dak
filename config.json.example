@@ -2,7 +2,9 @@
   "version": "1.0",
   "defaults": {
     "short_press_duration": 300,
-    "double_click_gap": 300
+    "double_click_gap": 300,
+    "button_brightness": 50,
+    "encoder_brightness": 50
   },
   "scenes": {
     "on_start": {
@@ -13,8 +15,9 @@
         "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
       },
       "actions": {
-        "1b01": { "short_press": "~", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1b01": { "short_press": "@", "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "1b02": { "short_press": "@Test", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+        "1b04": { "long_press": "$defaults.button_brightness := 100" },
         "timer": { "1": "@Main" }
       }
     },
@@ -32,8 +35,8 @@
       },
       "actions": {
         "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
-        "1e01": { "turn_cw": "~", "turn_ccw": "@Test", "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
-        "timer": { "1": "~" }
+        "1e01": { "turn_cw": "@", "turn_ccw": "@Test", "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "timer": { "1": "@" }
       }
     }
   },

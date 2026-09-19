@@ -51,3 +51,41 @@ pub fn assert_validation_error(scenes_json: &str, expected: &str) {
 pub fn error_texts(err: Vec<String>) -> String {
     err.join("\n")
 }
+
+/// Serialises the tests that mutate `HOME`, so their environment changes never
+/// interleave with each other while the shared process-global variable is in use.
+///
+/// Mirrors `src/actions.rs`'s own unit-test-only `ENV_LOCK`/`SetHome` pair: each
+/// integration test binary compiles as its own crate, so this module needs its own
+/// copy rather than sharing that `#[cfg(test)]`-only one (which isn't reachable from
+/// outside the `dak` crate anyway).
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Temporarily sets `HOME` to `home`, restoring the previous value when dropped.
+/// Callers must hold [`ENV_LOCK`] for the guard's entire lifetime.
+pub struct SetHome(Option<std::ffi::OsString>);
+
+impl SetHome {
+    pub fn new(home: &std::path::Path) -> Self {
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        SetHome(old)
+    }
+}
+
+impl Drop for SetHome {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(old) => std::env::set_var("HOME", old),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Creates a unique empty temp directory, e.g. for use as a fake `$HOME`.
+pub fn temp_dir() -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = format!("/tmp/dak_test_home_{}_{n}", std::process::id());
+    fs::create_dir_all(&dir).unwrap();
+    PathBuf::from(dir)
+}

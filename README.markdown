@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.8.2**.
+The current version is **v0.9.0**.
 
 ## Usage
 
@@ -82,7 +82,7 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
-- `"defaults"` — optional press-detection timing knobs (see [Defaults](#defaults))
+- `"defaults"` — optional press-detection timing knobs and connect-time brightness levels (see [Defaults](#defaults))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
@@ -111,17 +111,21 @@ JSON itself has no comment syntax, so `dak` strips comments before parsing: both
 
 ### Defaults
 
-The optional top-level `defaults` section tunes how the complex button presses are detected. All keys are optional and fall back to their built-in values when missing:
+The optional top-level `defaults` section tunes how the complex button presses are detected, plus the brightness levels applied when a device connects. All keys are optional and fall back to their built-in values when missing:
 
 ```json
 "defaults": {
   "short_press_duration": 300,
-  "double_click_gap": 300
+  "double_click_gap": 300,
+  "button_brightness": 50,
+  "encoder_brightness": 50
 }
 ```
 
 - `short_press_duration` (default `300`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
 - `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
+- `button_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's button/screen LCDs when it connects.
+- `encoder_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's encoder LED ring when it connects. Not verified against real hardware: no Ajazz AKP03E/AKP03R unit with functioning encoder LEDs was available during development, and a brute-force sweep across the underlying LED-color command's index space produced no visible response on the unit that was available - see the [TODO](#todo) section.
 
 Complex events are decided on the release edge, per pressable control: buttons and
 pushed encoders share the same detection, so a pushed encoder's knob behaves exactly
@@ -169,19 +173,68 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
-Action values have four forms:
-  - `~` — stay on the same scene
+Action values have five forms:
+  - a bare `@` — stay on the same scene (re-applies its `setup`)
   - `@<scene>` (e.g. `@Main`) — jump to the named scene
+  - `$<path> <op> <value>` — set a runtime-settable config parameter; see below
   - anything else — the path of a command to execute, followed by its parameters
   - an array of any of the above, run without waiting on each other - see below
 
+> **Breaking change:** in earlier versions a bare `~` meant "stay on the same
+> scene". As of this version `~` is no longer special at all - use a bare `@`
+> instead. This freed `~` up for shell-style home-directory expansion (see
+> below), which would otherwise have been ambiguous with the old `~` = "stay"
+> convention. There is no migration warning: an old config's bare `"~"` action
+> now just becomes a literal (and almost certainly failing) attempt to run `~`
+> as a command - update any `"~"` action to `"@"` by hand.
+
 Commands are executed asynchronously, so a running command does not block button input or the timer.
+
+A leading `~` in any path or command/argument - `params`, or a command/`launch`
+value, including every word of an `image_exec`/`text_exec`/`launch` command line and
+`Action::Command` values - is expanded to your home directory, same as a shell:
+`~` alone becomes `$HOME`, and `~/rest` becomes `$HOME/rest`. `~` anywhere but the
+very start of a word is left untouched, and there is no `~user` support.
+
+`$<path> <op> <value>` sets a config parameter at runtime, immediately, without
+touching `config.json` and without persisting across a reconnect - it is a live
+device control, not a config edit. `<path>` is a dotted config path and `<value>`
+is a bare number (e.g. `-10`, `100`) or a `"quoted string"` (no calculations, no
+variables - just a constant). **Only two paths are currently settable**:
+`defaults.button_brightness` and `defaults.encoder_brightness` (both `0`-`100`,
+matching `mirajazz`'s own internal clamp), e.g.:
+
+```json
+"short_press": "$defaults.button_brightness := 100"
+```
+
+Trying to set anything else - the rest of `defaults`, anything under `devices` or
+`scenes`, `version`, or a path that doesn't correspond to any real config field at
+all - is a config-load-time error (a distinct "read-only parameter" error for a
+real-but-immutable field/section, vs. "unknown parameter" for one that doesn't exist),
+not something discovered only at runtime. Assigning the wrong *type* - e.g. a quoted
+`"100"` where a number is required - is also always an error, regardless of `<op>`:
+clamping/truncation (below) is a range/length concept, not a type coercion, so a
+string is never silently treated as the number it looks like.
+
+`<op>` is one of three assignment operators, of which only `:=` is implemented today:
+
+- `:=` (**implemented**) - clamps a number into its target's valid range (or, once a
+  string-typed settable parameter exists, truncates a string to its max length) and
+  **warns** when it had to. `$defaults.button_brightness := -10` sets it to `0`;
+  `$defaults.button_brightness := 200` sets it to `100`; either way a warning is
+  printed. A value already in range is set with no warning at all.
+- `=` (**not implemented yet** - reserved syntax, rejected with a clear error pointing
+  at `:=`) - will hard-error the whole config/action instead of clamping/truncating
+  when the value is out of range.
+- `~=` (**not implemented yet** - reserved syntax, rejected the same way as `=`) - will
+  apply the same clamping/truncation as `:=`, but silently, with no warning.
 
 An event's value (and the `timer` value) may be a plain string, as above, or an array
 of them, e.g. `"short_press": ["/usr/bin/notify-send hi", "@Main"]`, to trigger more
 than one action from a single event. Every entry runs without waiting on the others to
 finish - a command never blocks anything else in the list, and there can be at most one
-scene-changing entry (`~` or `@scene`) per list, enforced when the config loads. `[]` is
+scene-changing entry (`@` or `@scene`) per list, enforced when the config loads. `[]` is
 the array form's way to spell "bound but no action" (matching `""` for the plain-string
 form); an empty string *inside* a non-empty array is rejected instead of silently
 skipped. A control listed in `actions` with no events at all (e.g. `"1b01": {}`) is
@@ -191,7 +244,7 @@ Example scenes (paths and commands below are illustrative placeholders - adjust
 them to your own system and OS; `text2gif`/`aplay` are just example commands, not
 tools `dak` ships or requires). `Main`'s clock button (`1b03`) uses `refresh` to
 keep itself updated every second on its own, instead of the whole-scene
-`"timer": {"1": "~"}` trick older configs needed (still shown on `on_start` and
+`"timer": {"1": "@"}` trick older configs needed (still shown on `on_start` and
 `Test`, and still the only option for anything a per-button `refresh` cannot
 express, like switching scenes on a schedule). `Test`'s `1b01` button demonstrates
 the array form: one `short_press` plays a sound and returns to `on_start`, instead
@@ -207,7 +260,7 @@ of needing two separate buttons:
       "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
-      "1b01": { "short_press": "~", "long_press": "", "double_click": "", "pressed": "", "released": "" },
+      "1b01": { "short_press": "@", "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "1b02": { "short_press": "@Test", "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "timer": { "1": "@Main" }
     }
@@ -226,7 +279,7 @@ of needing two separate buttons:
     },
     "actions": {
       "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
-      "timer": { "1": "~" }
+      "timer": { "1": "@" }
     }
   }
 }
@@ -373,6 +426,30 @@ without needing physical access to every device model ourselves.
    stop it explicitly. There's no existing signal for "is anyone actually looking at
    this button" beyond scene switches and button presses, so this may not be worth the
    added complexity - noted as a "maybe", not a commitment.
+7. Encoder LED *color* control from config (`mirajazz`'s `Device::set_led_colors`,
+   distinct from the `encoder_brightness` default added in v0.9.0, which only
+   controls overall LED brightness). Not implemented yet for two reasons: it can't be
+   verified against real hardware (no Ajazz AKP03E/AKP03R unit with functioning
+   encoder LEDs was available during development - `set_led_colors` and
+   `set_led_brightness` both return success even on a unit with no LEDs wired up at
+   all, so a successful call proves nothing), and the mapping between the LED-color
+   array's index order and the physical/logical encoder numbering used elsewhere
+   (`turn_cw`/`turn_ccw`/push references) is unconfirmed - a brute-force sweep setting
+   one color-array index at a time across a wide range found no visible correlation
+   before the sweep was cut short by the device repeatedly dropping off USB when
+   hammered with this command. Needs a real unit with working encoder LEDs to
+   properly map and add this safely.
+8. Implement the `=` and `~=` assignment operators for `$path <op> value` actions
+   (today only `:=` works; the other two are recognized syntactically but rejected
+   with a "not implemented yet" error). `=` should hard-error the whole config/action
+   when the value is out of range, instead of `:=`'s clamp-and-warn; `~=` should clamp
+   the same way `:=` does, but silently. Both are trivial for today's constant
+   right-hand sides, but the real motivation is once actual runtime variables exist
+   (see item 3): `=` then needs to hard-fail *at the moment the action fires*, not at
+   config-load time, since the value won't be known until then. Also needs a
+   string-typed settable parameter to exercise the max-length-truncation half of
+   `Constraint::MaxLength` (unused today - every current settable parameter is
+   numeric), to confirm `:=`/`~=` truncate a too-long string instead of rejecting it.
 
 ## License
 

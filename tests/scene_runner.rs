@@ -36,6 +36,10 @@ enum Call {
     ClearImage(u8),
     /// The staged images were sent to the LCDs.
     Flush,
+    /// `set_brightness` was called with this percent.
+    SetBrightness(u8),
+    /// `set_led_brightness` was called with this percent.
+    SetLedBrightness(u8),
 }
 
 #[derive(Default)]
@@ -57,6 +61,8 @@ impl MockButtonDevice {
                 Call::SetImage(..) => "SetImage",
                 Call::ClearImage(..) => "ClearImage",
                 Call::Flush => "Flush",
+                Call::SetBrightness(_) => "SetBrightness",
+                Call::SetLedBrightness(_) => "SetLedBrightness",
             })
             .collect()
     }
@@ -67,7 +73,7 @@ impl MockButtonDevice {
             .iter()
             .filter_map(|call| match call {
                 Call::SetImage(key, _) | Call::ClearImage(key) => Some(*key),
-                Call::Flush => None,
+                Call::Flush | Call::SetBrightness(_) | Call::SetLedBrightness(_) => None,
             })
             .collect()
     }
@@ -107,6 +113,22 @@ impl ButtonDevice for MockButtonDevice {
     fn key_count(&self) -> u8 {
         9
     }
+
+    async fn set_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::SetBrightness(percent));
+        Ok(())
+    }
+
+    async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(Call::SetLedBrightness(percent));
+        Ok(())
+    }
 }
 
 /// The error type of [`FailingButtonDevice`]: a fixed message describing the failure.
@@ -121,13 +143,14 @@ impl std::fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
-/// A device mock whose image writes and flushes can fail on demand, for exercising
-/// the error-logging branches of the scene runner. Every operation is recorded so
-/// tests can assert the failing branch actually ran.
+/// A device mock whose image writes, flushes, and brightness calls can fail on
+/// demand, for exercising the error-logging branches of the scene runner. Every
+/// operation is recorded so tests can assert the failing branch actually ran.
 #[derive(Default)]
 struct FailingButtonDevice {
     fail_set_image: AtomicBool,
     fail_flush: AtomicBool,
+    fail_brightness: AtomicBool,
     attempts: Mutex<Vec<&'static str>>,
 }
 
@@ -145,6 +168,11 @@ impl FailingButtonDevice {
     /// Makes every future `flush` call fail.
     fn fail_flushes(&self, yes: bool) {
         self.fail_flush.store(yes, Ordering::SeqCst);
+    }
+
+    /// Makes every future `set_brightness`/`set_led_brightness` call fail.
+    fn fail_brightness_calls(&self, yes: bool) {
+        self.fail_brightness.store(yes, Ordering::SeqCst);
     }
 }
 
@@ -181,6 +209,24 @@ impl ButtonDevice for FailingButtonDevice {
 
     fn key_count(&self) -> u8 {
         9
+    }
+
+    async fn set_brightness(&self, _percent: u8) -> Result<(), Self::Error> {
+        self.attempts.lock().unwrap().push("SetBrightness");
+        if self.fail_brightness.load(Ordering::SeqCst) {
+            Err(WriteError("device brightness write refused"))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn set_led_brightness(&self, _percent: u8) -> Result<(), Self::Error> {
+        self.attempts.lock().unwrap().push("SetLedBrightness");
+        if self.fail_brightness.load(Ordering::SeqCst) {
+            Err(WriteError("device LED brightness write refused"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -268,6 +314,73 @@ async fn set_image_op_stages_zero_based_key_and_flushes() {
     assert_eq!(image.dimensions(), (4, 4));
     assert_eq!(image.to_rgb8().get_pixel(2, 2).0, [200, 100, 50]);
     let _ = std::fs::remove_file(&image_path);
+}
+
+/// `SceneRunner::set_button_brightness` delegates straight to the device's
+/// `set_brightness`, with no image staging/flushing involved.
+#[tokio::test]
+async fn set_button_brightness_delegates_to_device() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    runner.set_button_brightness(80).await.unwrap();
+
+    assert_eq!(mock.calls(), vec![Call::SetBrightness(80)]);
+}
+
+/// `SceneRunner::set_encoder_brightness` delegates to `set_led_brightness` instead,
+/// distinctly from `set_button_brightness` above.
+#[tokio::test]
+async fn set_encoder_brightness_delegates_to_device() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    runner.set_encoder_brightness(15).await.unwrap();
+
+    assert_eq!(mock.calls(), vec![Call::SetLedBrightness(15)]);
+}
+
+/// Both brightness setters propagate the device's error instead of swallowing it,
+/// mirroring how every other `SceneRunner` operation reports device failures.
+#[tokio::test]
+async fn brightness_setters_propagate_device_errors() {
+    let device = FailingButtonDevice::default();
+    device.fail_brightness_calls(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    assert!(runner.set_button_brightness(80).await.is_err());
+    assert!(runner.set_encoder_brightness(15).await.is_err());
+    assert_eq!(device.attempts(), vec!["SetBrightness", "SetLedBrightness"]);
 }
 
 /// A `text` operation renders the file's first lines and stages the button image.
