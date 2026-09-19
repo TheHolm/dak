@@ -5,9 +5,10 @@ mod common;
 use dak::actions::{load_config, load_config_from_path};
 
 use crate::common::{
-    assert_validation_error, error_texts, write_config_with_defaults, write_scenes_config,
-    write_temp_config,
+    assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
+    write_scenes_config, write_temp_config, SetHome, ENV_LOCK,
 };
+use std::os::unix::fs::PermissionsExt;
 
 /// A minimal valid config loads successfully.
 #[test]
@@ -25,7 +26,7 @@ fn loads_config_with_comments() {
     let path = write_temp_config(
         r#"// file-global comment
 {
-  "scenes": { /* scenes section */ "on_start": { "actions": { "1b01": { "pressed": "~" } } } },
+  "scenes": { /* scenes section */ "on_start": { "actions": { "1b01": { "pressed": "@" } } } },
   "devices": {
     "1": { // picked by hand
       "device_id": "0300:3002",
@@ -52,7 +53,7 @@ fn loads_config_with_comments() {
 #[test]
 fn comment_markers_inside_strings_are_not_comments() {
     let path =
-        write_scenes_config(r#"{"on_start": { "actions": { "1b01": { "pressed": "~" } } } }"#);
+        write_scenes_config(r#"{"on_start": { "actions": { "1b01": { "pressed": "@" } } } }"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert!(config.is_ok());
@@ -368,12 +369,12 @@ fn parses_documented_config_structure() {
                     "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" }
                 },
                 "actions": {
-                    "1b01": { "pressed": "~" },
+                    "1b01": { "pressed": "@" },
                     "timer": { "1": "@Main" }
                 }
             },
             "Main": {
-                "actions": { "timer": { "1": "~" } }
+                "actions": { "timer": { "1": "@" } }
             }
         }"#,
     );
@@ -791,13 +792,13 @@ fn rejects_empty_string_array_element() {
     );
 }
 
-/// An array with more than one scene-changing action (`~` or `@scene`) is rejected: at
+/// An array with more than one scene-changing action (`@` or `@scene`) is rejected: at
 /// most one scene transition is allowed per event.
 #[test]
 fn rejects_multiple_scene_changing_actions_in_a_list() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"1b01": {"pressed": ["~", "@on_start"]}}}}"#,
-        "pressed has 2 scene-changing actions (~ or @scene); at most one is allowed per event",
+        r#"{"on_start": {"actions": {"1b01": {"pressed": ["@", "@on_start"]}}}}"#,
+        "pressed has 2 scene-changing actions (@ or @scene); at most one is allowed per event",
     );
 }
 
@@ -855,7 +856,7 @@ fn rejects_undefined_scene_reference() {
             "on_start": {
                 "actions": {
                     "1b01": { "pressed": "@Missing" },
-                    "timer": { "1": "~" }
+                    "timer": { "1": "@" }
                 }
             }
         }"#,
@@ -871,13 +872,14 @@ fn rejects_undefined_scene_reference() {
     assert!(errors.contains("actions.\"1b01\".pressed"), "{errors}");
 }
 
-/// A bare `@` scene reference is rejected.
+/// A bare `@` action value is valid: it stays on the current scene, same as `~` did
+/// before the breaking change that moved "stay" from `~` to `@`.
 #[test]
-fn rejects_empty_scene_reference() {
-    assert_validation_error(
-        r#"{"on_start": {"actions": {"1b01": {"pressed": "@"}}}}"#,
-        "is an empty scene reference",
-    );
+fn accepts_bare_at_as_stay() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {"1b01": {"pressed": "@"}}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{config:?}");
 }
 
 // -- timer validation --
@@ -889,7 +891,7 @@ fn rejects_timer_with_multiple_entries() {
         r#"{
             "on_start": {
                 "actions": {
-                    "timer": { "1": "~", "2": "~" }
+                    "timer": { "1": "@", "2": "@" }
                 }
             }
         }"#,
@@ -910,7 +912,7 @@ fn rejects_invalid_timer_seconds() {
         r#"{
             "on_start": {
                 "actions": {
-                    "timer": { "soon": "~" }
+                    "timer": { "soon": "@" }
                 }
             }
         }"#,
@@ -980,7 +982,7 @@ fn reports_errors_from_all_scenes() {
         r#"{
             "one": { "bogus": 1 },
             "two": {
-                "actions": { "timer": { "soon": "~" } }
+                "actions": { "timer": { "soon": "@" } }
             }
         }"#,
     );
@@ -1022,7 +1024,7 @@ fn rejects_legacy_numeric_button_keys() {
 #[test]
 fn rejects_invalid_action_reference() {
     assert_validation_error(
-        r#"{"on_start": {"actions": {"0b01": {"pressed": "~"}}}}"#,
+        r#"{"on_start": {"actions": {"0b01": {"pressed": "@"}}}}"#,
         "scene \"on_start\": actions.\"0b01\" is not a valid control reference",
     );
 }
@@ -1102,4 +1104,219 @@ fn accepts_clear_on_encoder() {
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert!(config.is_ok(), "{:?}", config.err());
+}
+
+// -- `$path := value` config-assignment actions --
+
+/// A `$defaults.button_brightness := N` action with a valid number loads with no
+/// errors.
+#[test]
+fn accepts_valid_set_config_button_brightness() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := 80"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A `$defaults.encoder_brightness := N` action with a valid number loads with no
+/// errors, distinctly from `button_brightness` above.
+#[test]
+fn accepts_valid_set_config_encoder_brightness() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.encoder_brightness := 15"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// `$`-assignments targeting a real-but-immutable config field/section are rejected as
+/// "read-only", distinctly from a genuinely nonexistent path (tested separately below).
+#[test]
+fn rejects_read_only_set_config_targets() {
+    for (target, expected_path) in [
+        (
+            "$defaults.short_press_duration := 100",
+            "defaults.short_press_duration",
+        ),
+        (
+            "$defaults.double_click_gap := 100",
+            "defaults.double_click_gap",
+        ),
+        ("$devices.1.key_count := 5", "devices.1.key_count"),
+        ("$scenes.on_start.setup := 1", "scenes.on_start.setup"),
+        ("$version := 100", "version"),
+    ] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{target}"}}}}}}}}"#),
+            &format!("tries to set read-only parameter \"{expected_path}\""),
+        );
+    }
+}
+
+/// A `$`-assignment to a path that doesn't correspond to any real config field at all
+/// is a distinct "unknown parameter" error, not "read-only".
+#[test]
+fn rejects_unknown_set_config_target() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$foo.bar := 1"}}}}"#,
+        "sets unknown parameter \"foo.bar\"",
+    );
+}
+
+/// A quoted string right-hand-side for a numeric-only settable parameter is rejected
+/// as a wrong-type error - `"100"` is never treated as the number `100`.
+#[test]
+fn rejects_string_value_for_numeric_default() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := \"100\""}}}}"#,
+        "requires a number",
+    );
+}
+
+/// `:=` clamps an out-of-range number into its settable parameter's constraint
+/// (`0`-`100` for both of today's parameters, matching `mirajazz::Device`'s own
+/// internal `percent.clamp(0, 100)`) instead of rejecting the config outright, and
+/// warns that it did.
+#[test]
+fn clamps_out_of_range_value_for_settable_default_with_warning() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := 200"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("out of range 0-100") && w.contains("clamped to 100")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// A negative number clamps up to the constraint's `min` (`0`), not just down to its
+/// `max` - `-10` becomes `0`, with the same warning treatment as the too-large case
+/// above.
+#[test]
+fn clamps_negative_value_for_settable_default_up_to_minimum() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := -10"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|w| w.contains("out of range 0-100") && w.contains("clamped to 0")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// A value already within range produces no clamp warning at all.
+#[test]
+fn in_range_set_config_value_has_no_clamp_warning() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := 80"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        !config.warnings.iter().any(|w| w.contains("clamped")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// The `=` and `~=` assignment operators are recognized (not "malformed") but rejected
+/// with a distinct "not implemented yet" error, pointing at `:=` as the alternative -
+/// see the README's TODO entry for their planned future behavior.
+#[test]
+fn rejects_not_yet_implemented_assignment_operators() {
+    for (value, operator) in [
+        ("$defaults.button_brightness = 80", "\"=\""),
+        ("$defaults.button_brightness ~= 80", "\"~=\""),
+    ] {
+        assert_validation_error(
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{value}"}}}}}}}}"#),
+            &format!(
+                "uses {operator} on \"defaults.button_brightness\", which is not implemented yet"
+            ),
+        );
+    }
+}
+
+/// A malformed `$`-assignment (no assignment operator at all) is rejected with its own
+/// distinct error.
+#[test]
+fn rejects_malformed_set_config_action() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness 80"}}}}"#,
+        "malformed \"$\" assignment",
+    );
+}
+
+// -- home-directory (`~`) expansion --
+
+/// A `~/relative.png` `image` params path resolves against the real `$HOME` and
+/// produces no "file not found" warning, confirming `check_file_exists` expands it
+/// before checking.
+#[test]
+fn tilde_path_in_image_params_resolves_against_home() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let home = temp_dir();
+    let _set_home = SetHome::new(&home);
+    std::fs::write(
+        home.join("button.png"),
+        b"not a real image, just needs to exist",
+    )
+    .unwrap();
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "~/button.png"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        !config.warnings.iter().any(|w| w.contains("file not found")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// A `~/bin/tool` `image_exec` program path resolves against the real `$HOME` and
+/// produces no "program not found" warning, confirming `check_executable` (via
+/// `parse_command_line`) expands it before checking.
+#[test]
+fn tilde_path_in_exec_program_resolves_against_home() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let home = temp_dir();
+    let _set_home = SetHome::new(&home);
+    std::fs::create_dir_all(home.join("bin")).unwrap();
+    let tool = home.join("bin/tool");
+    std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "image_exec", "params": "~/bin/tool"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        !config
+            .warnings
+            .iter()
+            .any(|w| w.contains("program not found") || w.contains("not executable")),
+        "{:?}",
+        config.warnings
+    );
 }

@@ -726,9 +726,9 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
 /// or runs a command on its own background task.
 ///
 /// Switching scenes re-arms the new scene's timer and remembers the old scene, so its
-/// button actions remain available through inheritance; the `~` "stay" action re-applies
-/// the current scene and re-arms its timer so periodic updates (e.g. a clock) keep
-/// refreshing. Scene changes run through `runner`, which also owns the device.
+/// button actions remain available through inheritance; the bare `@` "stay" action
+/// re-applies the current scene and re-arms its timer so periodic updates (e.g. a
+/// clock) keep refreshing. Scene changes run through `runner`, which also owns the device.
 ///
 /// The parameter list is deliberately kept flat over bundling the shared state into one
 /// struct: each device has exactly one input loop, so a context type adds indirection
@@ -792,6 +792,23 @@ async fn run_action<D: actions::ButtonDevice>(
             }
             rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
         }
+        Action::SetConfig { param, value } => {
+            log.debug(
+                Subsystem::Actions,
+                format!("set {} to {value}", param.path()),
+            );
+            let result = match param {
+                actions::SettableDefault::ButtonBrightness => {
+                    runner.set_button_brightness(value).await
+                }
+                actions::SettableDefault::EncoderBrightness => {
+                    runner.set_encoder_brightness(value).await
+                }
+            };
+            if let Err(error) = result {
+                log.warn(format!("failed to set {}: {error}", param.path()));
+            }
+        }
     }
 }
 
@@ -802,7 +819,7 @@ async fn run_action<D: actions::ButtonDevice>(
 ///
 /// Commands run without waiting on each other (each is spawned onto its own task by
 /// `run_action` and never awaited inline); at most one entry may be a scene-changing
-/// action (`~`/`@scene`), enforced at config-load time, so there is never a second
+/// action (`@`/`@scene`), enforced at config-load time, so there is never a second
 /// `enter_scene` call competing with this loop's own scene-mutating state.
 #[allow(clippy::too_many_arguments)]
 async fn run_actions<D: actions::ButtonDevice>(
@@ -936,12 +953,27 @@ mod tests {
     #[derive(Default)]
     struct MockButtonDevice {
         calls: Mutex<Vec<&'static str>>,
+        /// The last value passed to `set_brightness`, if any.
+        last_button_brightness: Mutex<Option<u8>>,
+        /// The last value passed to `set_led_brightness`, if any.
+        last_encoder_brightness: Mutex<Option<u8>>,
     }
 
     impl MockButtonDevice {
-        /// Every `clear`/`flush`/`set` the runner attempted, in order.
+        /// Every `clear`/`flush`/`set`/`set_brightness`/`set_led_brightness` the runner
+        /// attempted, in order.
         fn calls(&self) -> Vec<&'static str> {
             self.calls.lock().unwrap().clone()
+        }
+
+        /// The last value passed to `set_brightness`, if any.
+        fn last_button_brightness(&self) -> Option<u8> {
+            *self.last_button_brightness.lock().unwrap()
+        }
+
+        /// The last value passed to `set_led_brightness`, if any.
+        fn last_encoder_brightness(&self) -> Option<u8> {
+            *self.last_encoder_brightness.lock().unwrap()
         }
     }
 
@@ -970,6 +1002,18 @@ mod tests {
 
         fn key_count(&self) -> u8 {
             9
+        }
+
+        async fn set_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("set_brightness");
+            *self.last_button_brightness.lock().unwrap() = Some(percent);
+            Ok(())
+        }
+
+        async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("set_led_brightness");
+            *self.last_encoder_brightness.lock().unwrap() = Some(percent);
+            Ok(())
         }
     }
 
@@ -1318,8 +1362,8 @@ mod tests {
         assert!(late.is_err(), "the aborted timer must not fire: {late:?}");
     }
 
-    /// A `~` action re-applies the current scene: its setup runs on the device again
-    /// and the scene name is untouched, with no previous scene recorded.
+    /// A bare `@` action re-applies the current scene: its setup runs on the device
+    /// again and the scene name is untouched, with no previous scene recorded.
     #[tokio::test]
     async fn run_action_stay_reapplies_the_current_scene() {
         let mock = MockButtonDevice::default();
@@ -1340,7 +1384,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "~",
+            "@",
             &mut state.timer_handle,
             &state.timer_tx,
         )
@@ -1450,7 +1494,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "~",
+            "@",
             &mut state.timer_handle,
             &state.timer_tx,
         )
@@ -1460,10 +1504,10 @@ mod tests {
         assert_eq!(mock.calls(), vec!["set", "flush"]);
     }
 
-    /// A `~` action whose scene has a button that fails to draw (here, an `image` setup
-    /// entry pointing at a missing file) leaves the scene name and `previous_scene`
-    /// untouched: staying never counts as leaving. The failing button draws the red
-    /// "Error" label instead of stopping the reapply.
+    /// A bare `@` action whose scene has a button that fails to draw (here, an `image`
+    /// setup entry pointing at a missing file) leaves the scene name and
+    /// `previous_scene` untouched: staying never counts as leaving. The failing button
+    /// draws the red "Error" label instead of stopping the reapply.
     #[tokio::test]
     async fn run_action_stay_keeps_scene_when_reapply_fails() {
         let mock = MockButtonDevice::default();
@@ -1484,7 +1528,7 @@ mod tests {
             &mut current_scene,
             &mut previous_scene,
             &scenes,
-            "~",
+            "@",
             &mut state.timer_handle,
             &state.timer_tx,
         )
@@ -1501,6 +1545,63 @@ mod tests {
             "the failing operation draws the red \"Error\" label (staged + flushed by \
              draw_error_label) and the batch's own trailing flush still runs afterward"
         );
+    }
+
+    /// A `$defaults.button_brightness := N` action dispatches straight to the device's
+    /// `set_brightness`, and leaves the current/previous scene untouched (it isn't a
+    /// scene-changing action).
+    #[tokio::test]
+    async fn run_action_set_config_calls_set_brightness() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.button_brightness := 80",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(mock.last_button_brightness(), Some(80));
+        assert_eq!(mock.last_encoder_brightness(), None);
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// A `$defaults.encoder_brightness := N` action dispatches to `set_led_brightness`
+    /// instead, distinctly from `button_brightness` above.
+    #[tokio::test]
+    async fn run_action_set_config_calls_set_led_brightness() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.encoder_brightness := 15",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(mock.last_encoder_brightness(), Some(15));
+        assert_eq!(mock.last_button_brightness(), None);
     }
 
     /// An `@scene` action still switches even when the target scene has a button that

@@ -11,7 +11,7 @@ use crate::common::write_scenes_config;
 /// Action values classify as Stay (`~`), SwitchScene (`@name`) or Command.
 #[test]
 fn parse_action_classifies_actions() {
-    assert_eq!(parse_action("~"), Action::Stay);
+    assert_eq!(parse_action("@"), Action::Stay);
     assert_eq!(
         parse_action("@Main"),
         Action::SwitchScene {
@@ -34,7 +34,7 @@ fn action_for_event_reads_pressed_action() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1b01": { "pressed": "~" },
+                    "1b01": { "pressed": "@" },
                     "1b02": { "pressed": "@Test" },
                     "1b03": { "pressed": "/usr/bin/date +%H:%M" }
                 }
@@ -55,7 +55,7 @@ fn action_for_event_reads_pressed_action() {
             "pressed",
             &config.scenes
         ),
-        vec!["~"]
+        vec!["@"]
     );
     assert_eq!(
         action_for_event(
@@ -111,7 +111,7 @@ fn action_for_event_inherits_from_previous_scene() {
             },
             "Main": {
                 "actions": {
-                    "timer": { "1": "~" }
+                    "timer": { "1": "@" }
                 }
             },
             "Test": {
@@ -240,7 +240,7 @@ fn action_for_event_reads_released_action() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1b01": { "pressed": "~", "released": "@Test" },
+                    "1b01": { "pressed": "@", "released": "@Test" },
                     "1b02": { "released": "/usr/bin/date +%H:%M" }
                 }
             },
@@ -271,7 +271,7 @@ fn action_for_event_reads_released_action() {
             "pressed",
             &config.scenes
         ),
-        vec!["~"]
+        vec!["@"]
     );
     assert_eq!(
         action_for_event(
@@ -388,7 +388,7 @@ fn timer_for_scene_returns_seconds_and_action() {
             },
             "Main": {
                 "actions": {
-                    "timer": { "1": "~" }
+                    "timer": { "1": "@" }
                 }
             }
         }"#,
@@ -402,7 +402,7 @@ fn timer_for_scene_returns_seconds_and_action() {
     );
     assert_eq!(
         timer_for_scene("Main", &config.scenes),
-        Some((1, vec!["~"]))
+        Some((1, vec!["@"]))
     );
 }
 
@@ -413,7 +413,7 @@ fn timer_for_scene_returns_none_without_timer() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1b01": { "pressed": "~" }
+                    "1b01": { "pressed": "@" }
                 }
             }
         }"#,
@@ -452,7 +452,7 @@ fn action_for_event_reads_encoder_turn_actions() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1e01": { "turn_cw": "~", "turn_ccw": "@Test" }
+                    "1e01": { "turn_cw": "@", "turn_ccw": "@Test" }
                 }
             },
             "Test": {
@@ -471,7 +471,7 @@ fn action_for_event_reads_encoder_turn_actions() {
             "turn_cw",
             &config.scenes
         ),
-        vec!["~"]
+        vec!["@"]
     );
     assert_eq!(
         action_for_event(
@@ -515,7 +515,7 @@ fn action_for_event_reads_encoder_push_actions() {
         r#"{
             "on_start": {
                 "actions": {
-                    "1e01": { "pressed": "~", "released": "@Test" },
+                    "1e01": { "pressed": "@", "released": "@Test" },
                     "1e02": { "short_press": "/usr/bin/aplay beep.wav" }
                 }
             },
@@ -535,7 +535,7 @@ fn action_for_event_reads_encoder_push_actions() {
             "pressed",
             &config.scenes
         ),
-        vec!["~"]
+        vec!["@"]
     );
     assert_eq!(
         action_for_event(
