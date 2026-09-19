@@ -29,6 +29,14 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   protocol version for a specific unit by hand - e.g. for one of the twelve
   newly-recognized-but-unverified kinds above, if a different value turns
   out to work better than the one currently wired up for it.
+- Normal startup no longer prints a single "N device(s) present: 1, 2, ..."
+  summary line before connecting; instead each device prints its own
+  "Connected to <name> s/n <serial> as device #<n> using protocol version
+  <version>" line once it has actually connected (the old line was printed
+  before connecting even started, so it claimed less than it looked like).
+  A config device definition that has no matching hardware now also names
+  what it was looking for ("device #<n> (<name> s/n <serial>, expecting
+  <vid:pid>) defined in config was not found") instead of just its number.
 
 ### Details
 Added:
@@ -97,6 +105,16 @@ Added:
   `with_supports_both_keypress_states(true)` on every connection - so
   describing that capability in terms of dak's own long-press feature would
   have been misleading.
+- `main.rs::main`'s single `"N device(s) present: ..."` summary line
+  (printed before any device had actually connected) is gone; the
+  now-otherwise-unused `Baseplane::from_present`/`baseplane` local (its
+  only call site) went with it. `run_device` prints its own
+  `"Connected to <name> s/n <serial> as device #<n> using protocol version
+  <version>"` line (`log.info`, so still on by default) once it has
+  actually connected, alongside the existing `log.debug(Subsystem::Device,
+  ...)` breadcrumbs for `-d device` users. The unmatched-config-device
+  warning also names what it was looking for now, instead of just its
+  logical device id.
 
 ## v0.9.0 — Breaking: `~` no longer means "stay"; configurable brightness, `$`-actions, home-dir expansion
 

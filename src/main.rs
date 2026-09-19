@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use dak::actions::{self, Action};
-use dak::baseplane::{Baseplane, Reference};
+use dak::baseplane::Reference;
 use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
@@ -120,7 +120,8 @@ async fn main() -> Result<(), MirajazzError> {
                 assignments.push((*device_id, definition.clone(), devices[index].clone()));
             }
             None => log.warn(format!(
-                "device {device_id} defined in config was not found"
+                "device #{device_id} ({} s/n {}, expecting {}) defined in config was not found",
+                definition.device_name, definition.serial, definition.device_id
             )),
         }
     }
@@ -144,18 +145,6 @@ async fn main() -> Result<(), MirajazzError> {
         log.error("no device defined in config was found");
         return Err(MirajazzError::DeviceNotFoundError);
     }
-
-    let baseplane = Baseplane::from_present(assignments.iter().map(|(id, _, _)| *id));
-    log.info(format!(
-        "{} device(s) present: {}",
-        baseplane.present_numbers().len(),
-        baseplane
-            .present_numbers()
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
 
     // Drive every present device, each on its own task with its own input loop, scene
     // state and timer. Ctrl-C reaches every loop, so every device runs its cleanup.
@@ -265,6 +254,11 @@ async fn run_device(
         Subsystem::Device,
         format!("Connected to '{}'", device.serial_number()),
     );
+    log.info(format!(
+        "Connected to {} s/n {} as device #{device_number} using protocol version {protocol_version}",
+        device_info.name,
+        device.serial_number()
+    ));
 
     device.set_brightness(defaults.button_brightness).await?;
     // Not verified to have any visible effect: see `Defaults::encoder_brightness`'s
