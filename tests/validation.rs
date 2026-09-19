@@ -177,7 +177,7 @@ fn absent_defaults_uses_builtin_durations() {
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     let config = config.unwrap();
-    assert_eq!(config.defaults, dak::press::PressDefaults::default());
+    assert_eq!(config.defaults, dak::press::Defaults::default());
 }
 
 /// An empty `defaults` section is fine too: every key falls back to its built-in value.
@@ -187,7 +187,7 @@ fn empty_defaults_uses_builtin_durations() {
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     let config = config.unwrap();
-    assert_eq!(config.defaults, dak::press::PressDefaults::default());
+    assert_eq!(config.defaults, dak::press::Defaults::default());
 }
 
 /// Valid `defaults` values override the built-in timings and load fine.
@@ -255,7 +255,7 @@ fn rejects_unknown_defaults_key() {
     let errors = error_texts(config.unwrap_err());
     assert!(
         errors.contains(
-            "defaults: unknown key \"long_press_duration\", expected \"short_press_duration\" and \"double_click_gap\""
+            "defaults: unknown key \"long_press_duration\", expected one of \"short_press_duration\", \"double_click_gap\", \"button_brightness\", \"encoder_brightness\""
         ),
         "{errors}"
     );
@@ -274,6 +274,71 @@ fn rejects_invalid_defaults_values() {
         let errors = error_texts(config.unwrap_err());
         assert!(
             errors.contains("must be a positive number of milliseconds"),
+            "for {defaults}: {errors}"
+        );
+    }
+}
+
+/// Valid `button_brightness`/`encoder_brightness` values override the built-in 50%
+/// and load fine.
+#[test]
+fn valid_brightness_defaults_load_and_apply() {
+    let path = write_config_with_defaults(
+        r#"{"button_brightness": 80, "encoder_brightness": 10}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults.button_brightness, 80);
+    assert_eq!(config.defaults.encoder_brightness, 10);
+}
+
+/// A missing single brightness key inside an otherwise valid `defaults` falls back to
+/// its built-in 50%, independently of the other brightness key.
+#[test]
+fn partial_brightness_defaults_fall_back_per_key() {
+    let path = write_config_with_defaults(
+        r#"{"button_brightness": 5}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults.button_brightness, 5);
+    assert_eq!(config.defaults.encoder_brightness, 50);
+}
+
+/// `0` is a valid brightness (turns the LCDs/LEDs off), unlike the duration keys which
+/// reject `0`.
+#[test]
+fn zero_brightness_default_is_valid() {
+    let path = write_config_with_defaults(
+        r#"{"button_brightness": 0, "encoder_brightness": 0}"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults.button_brightness, 0);
+    assert_eq!(config.defaults.encoder_brightness, 0);
+}
+
+/// Out-of-range and non-numeric `button_brightness`/`encoder_brightness` values in
+/// `defaults` are rejected.
+#[test]
+fn rejects_invalid_brightness_defaults_values() {
+    for defaults in [
+        r#"{"button_brightness": 101}"#,
+        r#"{"encoder_brightness": 255}"#,
+        r#"{"button_brightness": "bright"}"#,
+    ] {
+        let path = write_config_with_defaults(defaults, r#"{"on_start": {"actions": {}}}"#);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains("must be a number between 0 and 100"),
             "for {defaults}: {errors}"
         );
     }

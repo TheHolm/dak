@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
-use crate::press::PressDefaults;
+use crate::press::Defaults;
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -29,8 +29,9 @@ pub struct LoadedConfig {
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
     pub devices: ConfiguredDevices,
-    /// The timing knobs from the `defaults` section, with built-in defaults applied.
-    pub defaults: PressDefaults,
+    /// The settings from the `defaults` section (press-detection timing knobs plus
+    /// connect-time brightness), with built-in defaults applied.
+    pub defaults: Defaults,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -259,10 +260,17 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     })
 }
 
-/// Validates the optional `defaults` section: an object whose keys hold positive
-/// millisecond durations for the press-detection knobs. Missing keys fall back to
-/// [`PressDefaults::default`].
-fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
+/// Validates the optional `defaults` section: an object holding the press-detection
+/// timing knobs (positive millisecond durations) and the connect-time brightness
+/// levels (0-100 percent). Missing keys fall back to [`Defaults::default`].
+fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
+    const KNOWN_KEYS: &[&str] = &[
+        "short_press_duration",
+        "double_click_gap",
+        "button_brightness",
+        "encoder_brightness",
+    ];
+
     let map = match defaults.as_object() {
         Some(map) => map,
         None => {
@@ -270,36 +278,68 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> PressDefaults {
                 "config \"defaults\" must be an object, got {}",
                 value_type(defaults)
             ));
-            return PressDefaults::default();
+            return Defaults::default();
         }
     };
 
-    let mut result = PressDefaults::default();
+    let mut result = Defaults::default();
     for (key, value) in map {
-        if key != "short_press_duration" && key != "double_click_gap" {
+        if !KNOWN_KEYS.contains(&key.as_str()) {
             errors.push(format!(
-                "defaults: unknown key \"{key}\", expected \"short_press_duration\" and \"double_click_gap\""
+                "defaults: unknown key \"{key}\", expected one of {}",
+                KNOWN_KEYS
+                    .iter()
+                    .map(|key| format!("\"{key}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             continue;
         }
-        let Some(number) = value.as_u64() else {
-            errors.push(format!(
-                "defaults.{key} must be a positive number of milliseconds, got {}",
-                value_type(value)
-            ));
-            continue;
-        };
-        if number == 0 {
-            errors.push(format!(
-                "defaults.{key} must be a positive number of milliseconds"
-            ));
-            continue;
-        }
+
         match key.as_str() {
-            "short_press_duration" => {
-                result.short_press_duration = Duration::from_millis(number);
+            "short_press_duration" | "double_click_gap" => {
+                let Some(number) = value.as_u64() else {
+                    errors.push(format!(
+                        "defaults.{key} must be a positive number of milliseconds, got {}",
+                        value_type(value)
+                    ));
+                    continue;
+                };
+                if number == 0 {
+                    errors.push(format!(
+                        "defaults.{key} must be a positive number of milliseconds"
+                    ));
+                    continue;
+                }
+                match key.as_str() {
+                    "short_press_duration" => {
+                        result.short_press_duration = Duration::from_millis(number);
+                    }
+                    "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+                    _ => unreachable!("checked above"),
+                }
             }
-            "double_click_gap" => result.double_click_gap = Duration::from_millis(number),
+            "button_brightness" | "encoder_brightness" => {
+                let Some(number) = value.as_u64() else {
+                    errors.push(format!(
+                        "defaults.{key} must be a number between 0 and 100, got {}",
+                        value_type(value)
+                    ));
+                    continue;
+                };
+                if number > 100 {
+                    errors.push(format!(
+                        "defaults.{key} must be a number between 0 and 100, got {number}"
+                    ));
+                    continue;
+                }
+                let percent = number as u8;
+                match key.as_str() {
+                    "button_brightness" => result.button_brightness = percent,
+                    "encoder_brightness" => result.encoder_brightness = percent,
+                    _ => unreachable!("checked above"),
+                }
+            }
             _ => unreachable!("unknown keys are rejected above"),
         }
     }

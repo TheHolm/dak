@@ -10,24 +10,40 @@
 
 use std::time::{Duration, Instant};
 
-/// The timing knobs for complex press events, read from the config `defaults` section.
+/// Default settings read from the config `defaults` section: the timing knobs for
+/// complex press events, plus the brightness levels applied to a device at connect.
 ///
-/// Durations are expressed in milliseconds. Values follow [`Default`] when a config
-/// omits the whole `defaults` section or individual keys.
+/// Durations are expressed in milliseconds, brightness as a 0-100 percent. Values
+/// follow [`Default`] when a config omits the whole `defaults` section or individual
+/// keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PressDefaults {
+pub struct Defaults {
     /// A press held at most this long is a short press; longer presses are long.
     pub short_press_duration: Duration,
     /// A second press arriving within this long after the previous release is a
     /// double click.
     pub double_click_gap: Duration,
+    /// Percent brightness (0-100) applied to a device's button/screen LCDs at
+    /// connect, via `Device::set_brightness`.
+    pub button_brightness: u8,
+    /// Percent brightness (0-100) applied to a device's encoder LED ring at
+    /// connect, via `Device::set_led_brightness`.
+    ///
+    /// Not verified against real hardware: no Ajazz AKP03E/AKP03R unit with
+    /// functioning encoder LEDs was available during development. A brute-force
+    /// sweep across the LED-color command's index space produced no visible
+    /// response on the unit that was available, so whether this setting has any
+    /// observable effect on real encoder LEDs remains unconfirmed.
+    pub encoder_brightness: u8,
 }
 
-impl Default for PressDefaults {
+impl Default for Defaults {
     fn default() -> Self {
         Self {
             short_press_duration: Duration::from_millis(300),
             double_click_gap: Duration::from_millis(300),
+            button_brightness: 50,
+            encoder_brightness: 50,
         }
     }
 }
@@ -86,7 +102,7 @@ pub struct ClickDetector {
 
 impl ClickDetector {
     /// Builds a detector for the timing knobs in `defaults`.
-    pub fn new(defaults: PressDefaults) -> Self {
+    pub fn new(defaults: Defaults) -> Self {
         Self {
             short_press_duration: defaults.short_press_duration,
             double_click_gap: defaults.double_click_gap,
@@ -287,9 +303,10 @@ mod tests {
     /// press is long, and a 90 ms gap rejects a 100 ms gap double click.
     #[test]
     fn custom_knobs_change_boundaries() {
-        let defaults = PressDefaults {
+        let defaults = Defaults {
             short_press_duration: Duration::from_millis(100),
             double_click_gap: Duration::from_millis(90),
+            ..Defaults::default()
         };
         let t0 = Instant::now();
         let mut detector = ClickDetector::new(defaults);
@@ -314,7 +331,7 @@ mod tests {
         );
     }
 
-    fn defaults() -> PressDefaults {
-        PressDefaults::default()
+    fn defaults() -> Defaults {
+        Defaults::default()
     }
 }

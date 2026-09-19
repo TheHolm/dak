@@ -2,7 +2,9 @@
   "version": "1.0",
   "defaults": {
     "short_press_duration": 300,
-    "double_click_gap": 300
+    "double_click_gap": 300,
+    "button_brightness": 50,
+    "encoder_brightness": 50
   },
   "scenes": {
     "on_start": {

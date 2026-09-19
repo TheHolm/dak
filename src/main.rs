@@ -25,7 +25,7 @@ use dak::actions::{self, Action};
 use dak::baseplane::{Baseplane, Reference};
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
-use dak::press::{ClickDetector, ClickEvent, PressDecision, PressDefaults, ReleaseDecision};
+use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
 #[derive(Debug, Parser)]
@@ -212,7 +212,7 @@ async fn run_device(
     device_info: HidDeviceInfo,
     scenes: Value,
     log: Log,
-    defaults: PressDefaults,
+    defaults: Defaults,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -245,7 +245,14 @@ async fn run_device(
         format!("Connected to '{}'", device.serial_number()),
     );
 
-    device.set_brightness(50).await?;
+    device.set_brightness(defaults.button_brightness).await?;
+    // Not verified to have any visible effect: see `Defaults::encoder_brightness`'s
+    // doc comment for why (no unit with functioning encoder LEDs was available to
+    // confirm this against). Sent unconditionally anyway, same as `set_brightness`
+    // above, since it costs nothing when the device has no encoders or LEDs.
+    device
+        .set_led_brightness(defaults.encoder_brightness)
+        .await?;
     device.clear_all_button_images().await?;
 
     log.debug(
@@ -611,7 +618,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
     click_detector: &mut ClickDetector,
     click_tx: &mpsc::Sender<(Reference, ClickEvent)>,
     pending_shorts: &mut HashMap<Reference, PendingShortPress>,
-    defaults: PressDefaults,
+    defaults: Defaults,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
 ) {
@@ -922,7 +929,7 @@ mod tests {
     use dak::actions::{ButtonDevice, SceneRunner};
     use dak::log::Log;
 
-    use super::{Cli, ClickDetector, ClickEvent, PressDefaults, Reference};
+    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference};
 
     /// A tiny recording keypad for the dispatch-layer tests: scene `setup` operations
     /// that reach the device are recorded so a test can see which scene was applied.
@@ -1006,12 +1013,12 @@ mod tests {
         pending_shorts: HashMap<Reference, super::PendingShortPress>,
         timer_handle: Option<tokio::task::JoinHandle<()>>,
         timer_tx: mpsc::Sender<Vec<String>>,
-        defaults: PressDefaults,
+        defaults: Defaults,
     }
 
     impl EdgeState {
         /// A fresh loop state with the given press-detection knobs.
-        fn new(defaults: PressDefaults) -> EdgeState {
+        fn new(defaults: Defaults) -> EdgeState {
             let (click_tx, click_rx) = mpsc::channel(8);
             let (timer_tx, _timer_rx) = mpsc::channel(1);
             EdgeState {
@@ -1110,18 +1117,20 @@ mod tests {
 
     /// A quick press/release: the double-click gap is short but the short-press
     /// threshold is high, so quick presses are single clicks.
-    fn quickly_clicking_defaults() -> PressDefaults {
-        PressDefaults {
+    fn quickly_clicking_defaults() -> Defaults {
+        Defaults {
             short_press_duration: Duration::from_millis(700),
             double_click_gap: Duration::from_millis(80),
+            ..Defaults::default()
         }
     }
 
     /// A short press threshold, for turning a held press into a long press quickly.
-    fn long_press_defaults() -> PressDefaults {
-        PressDefaults {
+    fn long_press_defaults() -> Defaults {
+        Defaults {
             short_press_duration: Duration::from_millis(60),
             double_click_gap: Duration::from_millis(600),
+            ..Defaults::default()
         }
     }
 
@@ -1323,7 +1332,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1355,7 +1364,7 @@ mod tests {
         let scenes = json!({ "on_start": { "actions": {} } });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1399,7 +1408,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1433,7 +1442,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1467,7 +1476,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1511,7 +1520,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1548,7 +1557,7 @@ mod tests {
         let scenes = json!({ "on_start": { "actions": {} } });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_action(
             Log::default(),
@@ -1593,7 +1602,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_bound_action(
             Log::default(),
@@ -1641,7 +1650,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         let result = tokio::time::timeout(
             Duration::from_millis(500),
@@ -1682,7 +1691,7 @@ mod tests {
         });
         let mut current_scene = String::from("on_start");
         let mut previous_scene = None;
-        let mut state = EdgeState::new(PressDefaults::default());
+        let mut state = EdgeState::new(Defaults::default());
 
         super::run_bound_action(
             Log::default(),

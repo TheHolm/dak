@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.8.2**.
+The current version is **v0.9.0**.
 
 ## Usage
 
@@ -82,7 +82,7 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
-- `"defaults"` — optional press-detection timing knobs (see [Defaults](#defaults))
+- `"defaults"` — optional press-detection timing knobs and connect-time brightness levels (see [Defaults](#defaults))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
@@ -111,17 +111,21 @@ JSON itself has no comment syntax, so `dak` strips comments before parsing: both
 
 ### Defaults
 
-The optional top-level `defaults` section tunes how the complex button presses are detected. All keys are optional and fall back to their built-in values when missing:
+The optional top-level `defaults` section tunes how the complex button presses are detected, plus the brightness levels applied when a device connects. All keys are optional and fall back to their built-in values when missing:
 
 ```json
 "defaults": {
   "short_press_duration": 300,
-  "double_click_gap": 300
+  "double_click_gap": 300,
+  "button_brightness": 50,
+  "encoder_brightness": 50
 }
 ```
 
 - `short_press_duration` (default `300`, milliseconds) — a press released at most this long after it started is a `short_press`; a press held any longer is a `long_press`.
 - `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
+- `button_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's button/screen LCDs when it connects.
+- `encoder_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's encoder LED ring when it connects. Not verified against real hardware: no Ajazz AKP03E/AKP03R unit with functioning encoder LEDs was available during development, and a brute-force sweep across the underlying LED-color command's index space produced no visible response on the unit that was available - see the [TODO](#todo) section.
 
 Complex events are decided on the release edge, per pressable control: buttons and
 pushed encoders share the same detection, so a pushed encoder's knob behaves exactly
@@ -373,6 +377,25 @@ without needing physical access to every device model ourselves.
    stop it explicitly. There's no existing signal for "is anyone actually looking at
    this button" beyond scene switches and button presses, so this may not be worth the
    added complexity - noted as a "maybe", not a commitment.
+7. Encoder LED *color* control from config (`mirajazz`'s `Device::set_led_colors`,
+   distinct from the `encoder_brightness` default added in v0.9.0, which only
+   controls overall LED brightness). Not implemented yet for two reasons: it can't be
+   verified against real hardware (no Ajazz AKP03E/AKP03R unit with functioning
+   encoder LEDs was available during development - `set_led_colors` and
+   `set_led_brightness` both return success even on a unit with no LEDs wired up at
+   all, so a successful call proves nothing), and the mapping between the LED-color
+   array's index order and the physical/logical encoder numbering used elsewhere
+   (`turn_cw`/`turn_ccw`/push references) is unconfirmed - a brute-force sweep setting
+   one color-array index at a time across a wide range found no visible correlation
+   before the sweep was cut short by the device repeatedly dropping off USB when
+   hammered with this command. Needs a real unit with working encoder LEDs to
+   properly map and add this safely.
+8. Some way to control screen/encoder brightness *from scenes*, not just once at
+   connect time: today's `button_brightness`/`encoder_brightness` `defaults` keys
+   (added in v0.9.0) are read once at startup and never revisited, so there's no way
+   to e.g. dim the screens on an idle scene or brighten them on a specific button
+   press. Needs a new action/setup type (or an extension of an existing one) that can
+   call `Device::set_brightness`/`set_led_brightness` at runtime.
 
 ## License
 
