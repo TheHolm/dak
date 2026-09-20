@@ -9,7 +9,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.9.1**.
+The current version is **v0.10.0**.
 
 ## Usage
 
@@ -78,10 +78,11 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 
 ## Config structure
 
-`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to four keys:
+`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to five keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
+- `"variables"` — optional declared variables that actions read and assign (see [Variables](#variables))
 - `"defaults"` — optional press-detection timing knobs and connect-time brightness levels (see [Defaults](#defaults))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
@@ -135,6 +136,106 @@ like an extra button:
 - a second press landing inside `double_click_gap` of the previous release is a `double_click` firing on that second release, no matter how long the second press is held, and its first click never fires `short_press`;
 - anything else is a `short_press`, which only fires once `double_click_gap` has passed without a second press — so the first click of a double click is never reported as a short press too.
 
+### Variables
+
+The optional top-level `variables` section declares named values that actions and scene
+`params` read and assign. Variables are global: one set shared by every device and every
+scene, initialized once at startup. Every variable must be declared explicitly;
+referencing an undeclared one is a config-load error.
+
+```json
+"variables": {
+  "count": { "type": "int", "min": 0, "max": 100, "value": 10 },
+  "label": { "type": "str", "max_length": 8, "value": "hello" },
+  "plain": { "type": "int" }
+}
+```
+
+- the key is the variable name: it must start with a letter and contain only letters,
+  digits and underscores. `var`, `defaults`, `version`, `scenes` and `devices` are
+  reserved and cannot be declared.
+- `"type"` (required) is `"int"` (a 32-bit signed integer) or `"str"` (a
+  variable-length unicode string).
+- `"min"`/`"max"` (int only, optional, inclusive) default to the full 32-bit range and
+  bound an assigned value.
+- `"max_length"` (str only, optional) defaults to `255` and may be at most `65535`; an
+  assigned string is truncated to it.
+- `"value"` (optional) is the value the variable starts with, `0`/`""` when omitted. A
+  value outside its declared range/type is a hard config error.
+- unknown keys and type-inappropriate parameters (`"min"` on a `str`, ...) are hard
+  config errors.
+
+#### Reading a variable
+
+A `$` starts a reference. `$name` reads a declared variable; `$var.name` is the same
+thing written with its explicit scope (the `var` scope is the default, so both work).
+`$defaults.<name>` reads a `defaults` parameter: `button_brightness`,
+`encoder_brightness`, `short_press_duration` (milliseconds) and `double_click_gap`
+(milliseconds) - the values [Defaults](#defaults) describes, reflecting any runtime
+changes.
+
+References are substituted in every action string, in `setup` `params` and in the
+`timer` seconds key, resolved when the value is actually used, so they always see the
+current value. An int renders as its decimal digits; a str is inserted verbatim (no
+quotes added).
+
+A name is greedy (`$name_kun` reads `name_kun`). Escape the next character with a
+backslash to end it: `$name\-kun` is the value of `name` followed by `-kun`, and
+`$name\ kun` keeps the space. `\$` is a literal dollar sign and `\\` a literal backslash;
+any other backslash is left alone for the command tokenizer. A `$` not followed by a
+variable name is a config error.
+
+Because `$` now always starts a reference, a literal `$` in a command must be written
+`\$`. This is a breaking change for commands that used a shell `$VAR`: write `\$VAR` so
+`dak` passes it through, or run the command through a shell explicitly.
+
+#### Assigning to a variable
+
+An action value of the form `$<target> <op> <rhs>` assigns:
+
+- `<target>` is a declared variable (or `var.name`) or one of the writable `defaults`
+  parameters (`defaults.button_brightness`, `defaults.encoder_brightness`). The
+  read-only `defaults` timing constants cannot be assigned.
+- `<op>` is `:=` (clamp/truncate and warn), `~=` (same, silently) or `=` (reject an
+  out-of-range/over-long value).
+- `<rhs>` is an integer literal, a `"quoted string"`, another variable (`$b`) or a
+  `$(command)` substitution.
+
+An int is clamped into `min..=max`, a str is truncated to `max_length`, and a wrong-type
+right-hand side is always a config error (`"100"` is a string, not the number `100`).
+
+`$(command)` runs when the action fires and converts the output to the target's type: an
+int target parses the first non-empty line (trimmed) and clamps it; a str target takes
+the whole output with trailing newlines stripped and truncates it. For `=`, an
+unconvertible output, a non-zero exit or a timeout is an error and the variable is left
+unchanged; for `:=`/`~=` the target's default (a variable's declared `value`, or the
+configured brightness default) is used, with a warning for `:=`.
+
+Assignments write runtime state only: `config.json` is never modified.
+
+#### Commands and the shell
+
+A command - an action command, an `image_exec`/`text_exec`/`launch` `params`, or a
+`$(command)` - runs directly when it contains no unquoted shell operator, and through
+`sh -c` when it contains one of `` | & ; < > ` ( ) `` or a newline. Pipelines and
+redirection therefore work when you write them, while a plain command never grows a
+shell.
+
+#### Actions run in parallel
+
+Actions in an array are not ordered against each other: each command and each `$(command)`
+assignment runs on its own task. So
+
+```json
+"pressed": ["$b = $(echo 1)", "$a = $(echo $b)"]
+```
+
+assigns the **old** value of `$b` to `$a`, because both commands read `$b` before either
+finishes. Do not rely on the order of independent assignments in one action list.
+
+See `examples/EXAMPLES.md` for complete worked examples, including an encoder that
+changes screen brightness using `bc`.
+
 ### Scenes
 
 A scene name can be any text. The special `on_start` scene is reserved and is executed when the program starts.
@@ -165,22 +266,27 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
+  - `{"type":"text_value","params":"text"}` — display `text` directly (after `$` references are expanded), without reading a file or running a program. This is the simplest way to show a variable's value, e.g. `{"type":"text_value","params":"$defaults.button_brightness%"}`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
-  - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
+  - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `text_value`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
 - `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
-Action values have five forms:
+Action values have these forms:
   - a bare `@` — stay on the same scene (re-applies its `setup`)
   - `@<scene>` (e.g. `@Main`) — jump to the named scene
-  - `$<path> <op> <value>` — set a runtime-settable config parameter; see below
+  - `$<target> <op> <rhs>` — assign to a variable or a writable `defaults` parameter; see [Variables](#variables)
   - anything else — the path of a command to execute, followed by its parameters
   - an array of any of the above, run without waiting on each other - see below
 
-Commands are executed asynchronously, so a running command does not block button input or the timer.
+A `$` reference anywhere in a value is substituted before the value is used; see
+[Variables](#variables) for the reference syntax, the escaping rules, and the breaking
+change to commands that used a literal `$`.
+
+Commands are executed asynchronously, so a running command does not block button input or the timer. `dak` runs a command directly when it needs no shell, and through `sh -c` when it contains an unquoted shell operator - see [Commands and the shell](#commands-and-the-shell).
 
 A leading `~` in a command line - the `params` of an `image_exec`/`text_exec`, a
 `launch` value, or a plain command action (the fourth form above) - is expanded to
@@ -189,39 +295,11 @@ your home directory, same as a shell: `~` alone becomes `$HOME`, and `~/rest` be
 alike, not just the first. `~` anywhere but the very start of a word is left
 untouched, and there is no `~user` support.
 
-`$<path> <op> <value>` sets a config parameter at runtime, immediately, without
-touching `config.json` and without persisting across a reconnect - it is a live
-device control, not a config edit. `<path>` is a dotted config path and `<value>`
-is a bare number (e.g. `-10`, `100`) or a `"quoted string"` (no calculations, no
-variables - just a constant). **Only two paths are currently settable**:
-`defaults.button_brightness` and `defaults.encoder_brightness` (both `0`-`100`,
-matching `mirajazz`'s own internal clamp), e.g.:
-
-```json
-"short_press": "$defaults.button_brightness := 100"
-```
-
-Trying to set anything else - the rest of `defaults`, anything under `devices` or
-`scenes`, `version`, or a path that doesn't correspond to any real config field at
-all - is a config-load-time error (a distinct "read-only parameter" error for a
-real-but-immutable field/section, vs. "unknown parameter" for one that doesn't exist),
-not something discovered only at runtime. Assigning the wrong *type* - e.g. a quoted
-`"100"` where a number is required - is also always an error, regardless of `<op>`:
-clamping/truncation (below) is a range/length concept, not a type coercion, so a
-string is never silently treated as the number it looks like.
-
-`<op>` is one of three assignment operators, of which only `:=` is implemented today:
-
-- `:=` (**implemented**) - clamps a number into its target's valid range (or, once a
-  string-typed settable parameter exists, truncates a string to its max length) and
-  **warns** when it had to. `$defaults.button_brightness := -10` sets it to `0`;
-  `$defaults.button_brightness := 200` sets it to `100`; either way a warning is
-  printed. A value already in range is set with no warning at all.
-- `=` (**not implemented yet** - reserved syntax, rejected with a clear error pointing
-  at `:=`) - will hard-error the whole config/action instead of clamping/truncating
-  when the value is out of range.
-- `~=` (**not implemented yet** - reserved syntax, rejected the same way as `=`) - will
-  apply the same clamping/truncation as `:=`, but silently, with no warning.
+Assignment to a variable or a writable default happens immediately, without touching
+`config.json` and without persisting across a reconnect - e.g.
+`"$defaults.button_brightness := 100"` sets the device's brightness, and
+`"$name := $other"` copies one variable into another. See [Variables](#variables) for
+the full syntax, targets, operators and right-hand sides.
 
 An event's value (and the `timer` value) may be a plain string, as above, or an array
 of them, e.g. `"short_press": ["/usr/bin/notify-send hi", "@Main"]`, to trigger more
@@ -231,7 +309,9 @@ scene-changing entry (`@` or `@scene`) per list, enforced when the config loads.
 the array form's way to spell "bound but no action" (matching `""` for the plain-string
 form); an empty string *inside* a non-empty array is rejected instead of silently
 skipped. A control listed in `actions` with no events at all (e.g. `"1b01": {}`) is
-almost certainly a mistake and is warned about, though it is not an error.
+almost certainly a mistake and is warned about, though it is not an error. Because the
+entries run in parallel, do not rely on the order of assignments within one array - see
+[Actions run in parallel](#actions-run-in-parallel).
 
 Example scenes (paths and commands below are illustrative placeholders - adjust
 them to your own system and OS; `text2gif`/`aplay` are just example commands, not
@@ -442,12 +522,13 @@ either.
    `enter_scene`/`apply_scene_operations`, and gate scene-application
    skip/no-op warnings behind the `scene` debug subsystem instead of always
    printing them via `log.warn`.
-3. Variables: some way to pass data into actions. An external program could set a
-   variable, which is then usable as a parameter (or part of one) in a later action -
-   e.g. a `text_exec` capturing a value that a subsequent command's params
-   interpolates. Needs a way to set a variable (a new action/setup type? a control
-   command dak listens for?) and a substitution syntax for using one in `params`/an
-   action value.
+3. Variables landed in v0.10.0 (declarations, `$name` substitution, the three
+   assignment operators, and `$(command)` output capture - see [Variables](#variables)).
+   Still to come: per-scene variables (set only for the duration of one scene),
+   arithmetic/expression right-hand sides (calculations are delegated to external tools
+   like `bc` for now), explicit `str(...)`/`int(...)` type conversions, an `env.` scope
+   for environment variables, and a per-scene "compute" section that runs commands to
+   populate variables.
 4. A built-in Lua (or similar) scripting language for advanced control - may be a bad
    idea: it's a much bigger surface (a whole embedded interpreter, its own error
    handling, a new config/script relationship to design) than anything else on this
@@ -484,18 +565,6 @@ either.
    before the sweep was cut short by the device repeatedly dropping off USB when
    hammered with this command. Needs a real unit with working encoder LEDs to
    properly map and add this safely.
-8. Implement the `=` and `~=` assignment operators for `$path <op> value` actions
-   (today only `:=` works; the other two are recognized syntactically but rejected
-   with a "not implemented yet" error). `=` should hard-error the whole config/action
-   when the value is out of range, instead of `:=`'s clamp-and-warn; `~=` should clamp
-   the same way `:=` does, but silently. Both are trivial for today's constant
-   right-hand sides, but the real motivation is once actual runtime variables exist
-   (see item 3): `=` then needs to hard-fail *at the moment the action fires*, not at
-   config-load time, since the value won't be known until then. Also needs a
-   string-typed settable parameter to exercise the max-length-truncation half of
-   `Constraint::MaxLength` (unused today - every current settable parameter is
-   numeric), to confirm `:=`/`~=` truncate a too-long string instead of rejecting it.
-
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](LICENSE) for the full license text. This program is free software: you can redistribute it and/or modify it under the terms of the AGPL as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.

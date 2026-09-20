@@ -2,12 +2,17 @@ use serde_json::{self, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::press::Defaults;
+use crate::variables::{
+    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
+    VarRef, VarType, VarValue, Variables,
+};
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -32,6 +37,9 @@ pub struct LoadedConfig {
     /// The settings from the `defaults` section (press-detection timing knobs plus
     /// connect-time brightness), with built-in defaults applied.
     pub defaults: Defaults,
+    /// The validated `variables` section, keyed by variable name. Empty when the config
+    /// declares no variables.
+    pub variables: BTreeMap<String, VarDef>,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -206,9 +214,14 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes" && key != "devices" && key != "defaults" && key != "version" {
+        if key != "scenes"
+            && key != "devices"
+            && key != "defaults"
+            && key != "variables"
+            && key != "version"
+        {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\" and \"version\""
+                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\", \"variables\" and \"version\""
             ));
         }
     }
@@ -240,13 +253,21 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     let scenes = map.get("scenes").expect("checked above");
-    check_scenes(scenes, &mut warnings, &mut errors);
     let devices = map.get("devices").expect("checked above");
     let by_id = check_devices(devices, &mut errors);
     let defaults = map
         .get("defaults")
         .map(|defaults| check_defaults(defaults, &mut errors))
         .unwrap_or_default();
+    let variables = map
+        .get("variables")
+        .map(|variables| check_variables(variables, &mut errors))
+        .unwrap_or_default();
+
+    // References are validated against the declarations with each variable at its initial
+    // value; only existence/type matter here, not the (runtime) values themselves.
+    let runtime_variables = Variables::new(variables.clone(), &defaults);
+    check_scenes(&runtime_variables, scenes, &mut warnings, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -256,6 +277,7 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         scenes: scenes.clone(),
         devices: ConfiguredDevices { by_id },
         defaults,
+        variables,
         warnings,
     })
 }
@@ -347,7 +369,12 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
 }
 
 /// Validates the `scenes` section: an object whose keys are scene names.
-fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+fn check_scenes(
+    variables: &Variables,
+    scenes: &Value,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
     let map = match scenes.as_object() {
         Some(map) => map,
         None => {
@@ -358,7 +385,39 @@ fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<Str
     };
 
     for (scene_name, scene) in map {
-        check_scene(scenes, scene_name, scene, warnings, errors);
+        check_scene(variables, scenes, scene_name, scene, warnings, errors);
+    }
+}
+
+/// Validates every `$` reference in `text`, pushing an error for each malformed or
+/// undeclared one, and returns the references found (empty when the text has none or is
+/// malformed).
+///
+/// Callers use the result to decide whether a value is fully known at load time: a value
+/// containing a reference can only be resolved at runtime, so checks against literal
+/// content (a scene name, an executable path) are skipped for it.
+fn check_references(
+    scene_name: &str,
+    path: &str,
+    text: &str,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+) -> Vec<VarRef> {
+    match references_in(text) {
+        Ok(refs) => {
+            for reference in &refs {
+                if variables.kind_of(reference).is_none() {
+                    errors.push(format!(
+                        "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+                    ));
+                }
+            }
+            refs
+        }
+        Err(error) => {
+            errors.push(format!("scene \"{scene_name}\": {path}: {error}"));
+            Vec::new()
+        }
     }
 }
 
@@ -430,6 +489,7 @@ pub fn discovered_device_matches(
 /// (`type`/`params` dictionaries), the reserved `actions` key holds per-key action
 /// bindings. No other scene keys are allowed.
 fn check_scene(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     scene: &Value,
@@ -446,8 +506,8 @@ fn check_scene(
 
     for (key, value) in map {
         match key.as_str() {
-            "setup" => check_setup(scene_name, value, warnings, errors),
-            "actions" => check_actions(scenes, scene_name, value, errors, warnings),
+            "setup" => check_setup(variables, scene_name, value, warnings, errors),
+            "actions" => check_actions(variables, scenes, scene_name, value, errors, warnings),
             other => errors.push(format!(
                 "scene \"{scene_name}\": unknown key \"{other}\", expected \"setup\" or \"actions\""
             )),
@@ -458,6 +518,7 @@ fn check_scene(
 /// Validates the `setup` dictionary of a scene: numbered button entries with a known
 /// `type` and a `params` string suited to that type.
 fn check_setup(
+    variables: &Variables,
     scene_name: &str,
     setup: &Value,
     warnings: &mut Vec<String>,
@@ -474,13 +535,14 @@ fn check_setup(
     };
 
     for (key, value) in map {
-        check_button_op(scene_name, key, value, warnings, errors);
+        check_button_op(variables, scene_name, key, value, warnings, errors);
     }
 }
 
 /// Validates one numbered button entry of a scene: a dictionary with a known `type`
 /// and a `params` string suited to that type.
 fn check_button_op(
+    variables: &Variables,
     scene_name: &str,
     key: &str,
     value: &Value,
@@ -547,6 +609,17 @@ fn check_button_op(
         None => "",
     };
 
+    // References in params are validated here; a value that contains one can only be
+    // resolved at runtime, so literal checks (file/program existence) are skipped for it.
+    let param_refs = check_references(
+        scene_name,
+        &format!("{location} params"),
+        params,
+        variables,
+        errors,
+    );
+    let dynamic_params = !param_refs.is_empty();
+
     // "refresh" (seconds) is optional and defaults to 0, meaning "apply once on scene
     // entry, never again". A nonzero value only makes sense for the types that redraw
     // something: "clear" has nothing left to redraw, and "launch" fires a detached
@@ -577,8 +650,15 @@ fn check_button_op(
                 errors.push(format!(
                     "scene \"{scene_name}\": {location} {kind} params must be a path"
                 ));
-            } else {
+            } else if !dynamic_params {
                 check_file_exists(scene_name, &location, params, warnings);
+            }
+        }
+        "text_value" => {
+            if params.is_empty() {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {location} text_value params must be text"
+                ));
             }
         }
         "image_exec" | "text_exec" | "launch" => {
@@ -587,12 +667,19 @@ fn check_button_op(
                     "scene \"{scene_name}\": {location} {kind} params must be a program command line"
                 ));
             } else {
-                match parse_command_line(params) {
-                    Ok(command) => {
-                        check_executable(scene_name, &location, &command.program, warnings);
-                    }
-                    Err(error) => {
-                        errors.push(format!("scene \"{scene_name}\": {location}: {error}"))
+                if !command_needs_shell(params) {
+                    match parse_command_line(params) {
+                        Ok(command) => {
+                            // The program itself may be a reference resolved only at
+                            // runtime; only check a literal program path.
+                            if matches!(references_in(&command.program), Ok(refs) if refs.is_empty())
+                            {
+                                check_executable(scene_name, &location, &command.program, warnings);
+                            }
+                        }
+                        Err(error) => {
+                            errors.push(format!("scene \"{scene_name}\": {location}: {error}"))
+                        }
                     }
                 }
             }
@@ -600,7 +687,7 @@ fn check_button_op(
         "clear" => {}
         other => {
             errors.push(format!(
-                "scene \"{scene_name}\": {location} unknown type \"{other}\", expected image, image_exec, text, text_exec, launch or clear"
+                "scene \"{scene_name}\": {location} unknown type \"{other}\", expected image, image_exec, text, text_value, text_exec, launch or clear"
             ));
         }
     }
@@ -609,6 +696,7 @@ fn check_button_op(
 /// Validates the `actions` dictionary of a scene: key entries must be object of string events,
 /// and the special `timer` key is validated separately.
 fn check_actions(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     actions: &Value,
@@ -625,7 +713,7 @@ fn check_actions(
 
     for (key, action) in map {
         if key == "timer" {
-            check_timer(scenes, scene_name, action, errors, warnings);
+            check_timer(variables, scenes, scene_name, action, errors, warnings);
             continue;
         }
 
@@ -652,13 +740,16 @@ fn check_actions(
 
         for (event, value) in events {
             let path = format!("actions.\"{key}\".{event}");
-            check_action_values(scenes, scene_name, &path, value, errors, warnings);
+            check_action_values(
+                variables, scenes, scene_name, &path, value, errors, warnings,
+            );
         }
     }
 }
 
 /// Validates the `timer` entry: it must be a single-entry `{ seconds: action }` object.
 fn check_timer(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     timer: &Value,
@@ -684,12 +775,31 @@ fn check_timer(
     }
 
     let (seconds, value) = entries.iter().next().unwrap();
-    if seconds.parse::<u64>().is_err() {
-        errors.push(format!(
-            "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
-        ));
+    let seconds_refs = check_references(scene_name, "actions.timer", seconds, variables, errors);
+    if seconds_refs.is_empty() {
+        if seconds.parse::<u64>().is_err() {
+            errors.push(format!(
+                "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
+            ));
+        }
+    } else {
+        for reference in &seconds_refs {
+            if matches!(variables.kind_of(reference), Some(kind) if kind != VarType::Int) {
+                errors.push(format!(
+                    "scene \"{scene_name}\": actions.timer key \"{seconds}\" uses non-integer \"{reference}\", but timer seconds must be an int"
+                ));
+            }
+        }
     }
-    check_action_values(scenes, scene_name, "actions.timer", value, errors, warnings);
+    check_action_values(
+        variables,
+        scenes,
+        scene_name,
+        "actions.timer",
+        value,
+        errors,
+        warnings,
+    );
 }
 
 /// Validates an action value: either a single string (see [`check_action_value`]) or an
@@ -699,6 +809,7 @@ fn check_timer(
 /// spell "bound but no action" for the array form (matching `""` for the string form);
 /// an empty string *inside* a non-empty array is rejected instead of silently ignored.
 fn check_action_values(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     path: &str,
@@ -707,7 +818,7 @@ fn check_action_values(
     warnings: &mut Vec<String>,
 ) {
     if let Some(value) = value.as_str() {
-        check_action_value(scenes, scene_name, path, value, errors, warnings);
+        check_action_value(variables, scenes, scene_name, path, value, errors, warnings);
         return;
     }
     let Some(items) = value.as_array() else {
@@ -736,7 +847,7 @@ fn check_action_values(
         if item.starts_with('@') {
             scene_changing += 1;
         }
-        check_action_value(scenes, scene_name, path, item, errors, warnings);
+        check_action_value(variables, scenes, scene_name, path, item, errors, warnings);
     }
     if scene_changing > 1 {
         errors.push(format!(
@@ -750,10 +861,15 @@ fn check_action_values(
 /// value of the right type and in range, and anything else is treated as a command
 /// whose executable is checked.
 ///
+/// Every `$` reference is validated against the declarations first. A value that contains
+/// one is only fully known at runtime, so the literal checks (scene existence, executable
+/// path) are skipped for it.
+///
 /// Breaking change: `~` is no longer special-cased here (it used to mean "stay") - a
 /// literal `"~"` value now falls through to the command branch below, same as any other
 /// string that isn't `@`/`$`-prefixed.
 fn check_action_value(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     path: &str,
@@ -762,9 +878,12 @@ fn check_action_value(
     warnings: &mut Vec<String>,
 ) {
     if let Some(reference) = value.strip_prefix('@') {
+        let refs = check_references(scene_name, path, value, variables, errors);
         if reference.is_empty() {
             // A bare "@": stay on the current scene. Nothing to validate.
-        } else if !scenes.as_object().unwrap().contains_key(reference) {
+        } else if refs.is_empty() && !scenes.as_object().unwrap().contains_key(reference) {
+            // A literal scene name must exist; a `$`-reference can only be resolved at
+            // runtime, so its target scene is checked when the action fires.
             errors.push(format!(
                 "scene \"{scene_name}\": {path} references undefined scene \"@{reference}\""
             ));
@@ -772,100 +891,263 @@ fn check_action_value(
         return;
     }
     if value.starts_with('$') {
-        check_set_config_action(scene_name, path, value, errors, warnings);
+        check_set_config_action(variables, scene_name, path, value, errors, warnings);
         return;
     }
 
-    let executable = value.split_whitespace().next().unwrap_or_default();
-    if !executable.is_empty() {
-        check_executable(scene_name, path, executable, warnings);
+    // A command's executable is only checkable when it is not built from references and
+    // does not use a shell.
+    let refs = check_references(scene_name, path, value, variables, errors);
+    if refs.is_empty() && !command_needs_shell(value) {
+        let executable = value.split_whitespace().next().unwrap_or_default();
+        if !executable.is_empty() {
+            check_executable(scene_name, path, executable, warnings);
+        }
     }
 }
 
-/// Validates a `$path <op> value` action: `value` must parse as `$<dotted path> <op>
-/// <number or "quoted string">` for one of the three [`AssignOp`] operators; `path`
-/// must name a currently-settable parameter (only `defaults.button_brightness`/
-/// `defaults.encoder_brightness` for now); and the right-hand-side literal must be the
-/// type [`SettableDefault::constraint`] expects for that parameter.
+/// Validates a `$target <op> rhs` assignment action.
 ///
-/// A well-formed path that names a real but immutable config field/section (anything
-/// else under `defaults`, or anything under `devices`/`scenes`) is a distinct
-/// "read-only parameter" error; a path that doesn't correspond to any real config field
-/// at all is a distinct "unknown parameter" error - see [`classify_config_path`]. A
-/// wrong-type value (e.g. a quoted string for a numeric parameter) is a distinct error
-/// under every operator, since clamping/truncation is a range/length concept, not a
-/// type coercion - `"100"` never satisfies a numeric parameter the way `100` does.
+/// The target must be a declared variable or a writable `defaults` parameter. A real but
+/// immutable config field/section is a "read-only parameter" error, a syntactically valid
+/// but undeclared variable is an "undefined variable" error, and anything else is an
+/// "unknown parameter" error.
 ///
-/// Only `:=` ([`AssignOp::ClampWarn`]) is implemented: an out-of-range number is
-/// clamped into its [`Constraint`], with a warning when clamping actually changed the
-/// value (an in-range number is silently fine). `=`/`~=` are recognized but rejected
-/// with a distinct "not implemented yet" error - see [`AssignOp`]'s doc comments for
-/// their intended future behavior.
+/// The right-hand side must have the target's type: a numeric target rejects a quoted
+/// string, and an int variable rejects a string, under every operator - clamping and
+/// truncation are range/length concepts, not type coercion. A literal that is out of
+/// range (or over-long) is clamped/truncated by `:=` (with a warning), silently by `~=`,
+/// and rejected by `=`. A variable right-hand side is type-checked here, but its value is
+/// only known when the action fires, so its range is checked then.
 fn check_set_config_action(
+    variables: &Variables,
     scene_name: &str,
     path: &str,
     value: &str,
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    let Some((config_path, op, assigned)) = parse_set_config(value) else {
+    let Some((target_path, op, rhs)) = parse_assignment(value) else {
         errors.push(format!(
-            "scene \"{scene_name}\": {path} is a malformed \"$\" assignment \"{value}\", expected \"$path := value\" with value a number or a \"quoted string\""
+            "scene \"{scene_name}\": {path} is a malformed \"$\" assignment \"{value}\", expected \"$target <op> value\" with value a literal, a $variable or a \"$(command)\""
         ));
         return;
     };
 
-    let param = match classify_config_path(&config_path) {
-        ParamClass::Settable(param) => param,
-        ParamClass::ReadOnly => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} tries to set read-only parameter \"{config_path}\""
-            ));
-            return;
+    match classify_target(&target_path, variables) {
+        TargetClass::ReadOnly(config_path) => errors.push(format!(
+            "scene \"{scene_name}\": {path} tries to set read-only parameter \"{config_path}\""
+        )),
+        TargetClass::Unknown(unknown) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets unknown parameter \"{unknown}\""
+        )),
+        TargetClass::UndefinedVariable(name) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets undefined variable \"${name}\""
+        )),
+        TargetClass::Variable(name) => {
+            let def = variables
+                .store()
+                .def(&name)
+                .cloned()
+                .expect("classified as a declared variable");
+            check_variable_assignment(
+                scene_name, path, &name, &def, op, &rhs, variables, errors, warnings,
+            );
         }
-        ParamClass::Unknown => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} sets unknown parameter \"{config_path}\""
-            ));
-            return;
+        TargetClass::Default(param) => {
+            check_default_assignment(
+                scene_name, path, param, op, &rhs, variables, errors, warnings,
+            );
         }
-    };
-
-    match op {
-        AssignOp::Strict => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} uses \"=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
-            ));
-            return;
-        }
-        AssignOp::ClampSilent => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} uses \"~=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
-            ));
-            return;
-        }
-        AssignOp::ClampWarn => {}
     }
+}
 
-    match (param.constraint(), assigned) {
-        (Constraint::NumberRange { min, max }, AssignedValue::Number(number)) => {
-            let clamped = number.clamp(min, max);
-            if clamped != number {
-                warnings.push(format!(
-                    "scene \"{scene_name}\": {path} sets \"{config_path}\" to {number} via \":=\", out of range {min}-{max} - clamped to {clamped}"
+/// Validates the right-hand side of an assignment to a declared user variable against
+/// the variable's declared type and, for literals, its range/length.
+fn check_variable_assignment(
+    scene_name: &str,
+    path: &str,
+    name: &str,
+    def: &VarDef,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let label = format!("${name}");
+    match rhs {
+        AssignRhs::Int(number) => {
+            if def.kind != VarType::Int {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets string variable \"${name}\" to the number {number}"
                 ));
+                return;
             }
+            check_number_range(
+                scene_name,
+                path,
+                &label,
+                op,
+                *number,
+                def.min as i64,
+                def.max as i64,
+                errors,
+                warnings,
+            );
         }
-        (Constraint::NumberRange { .. }, AssignedValue::Text(text)) => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} sets \"{config_path}\" to a string (\"{text}\"), but it requires a number"
-            ));
+        AssignRhs::Str(text) => {
+            if def.kind != VarType::Str {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets int variable \"${name}\" to a string (\"{text}\")"
+                ));
+                return;
+            }
+            check_string_length(
+                scene_name,
+                path,
+                &label,
+                op,
+                text.chars().count(),
+                def.max_length,
+                errors,
+                warnings,
+            );
         }
-        (Constraint::MaxLength(_), _) => {
-            unreachable!(
-                "no settable string parameter exists yet - see Constraint::MaxLength's doc comment"
-            )
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            None => errors.push(format!(
+                "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+            )),
+            Some(kind) if kind != def.kind => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets {} variable \"${name}\" to \"{reference}\", which is {}",
+                kind_label(def.kind),
+                kind_label(kind)
+            )),
+            Some(_) => {}
+        },
+        AssignRhs::Command(inner) => {
+            validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
         }
+    }
+}
+
+/// Validates a `$(command)` right-hand side: every reference inside it must resolve, and
+/// a literal program that needs no shell is checked for existence. The output's type is
+/// only known at action time, so no range/type check happens here.
+fn validate_command_rhs(
+    scene_name: &str,
+    path: &str,
+    inner: &str,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let refs = check_references(scene_name, path, inner, variables, errors);
+    if refs.is_empty() && !command_needs_shell(inner) {
+        match parse_command_line(inner) {
+            Ok(command) => check_executable(scene_name, path, &command.program, warnings),
+            Err(error) => errors.push(format!("scene \"{scene_name}\": {path}: {error}")),
+        }
+    }
+}
+
+/// Validates the right-hand side of an assignment to a writable `defaults` parameter,
+/// which is always numeric.
+fn check_default_assignment(
+    scene_name: &str,
+    path: &str,
+    param: SettableDefault,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Constraint::NumberRange { min, max } = param.constraint();
+    let label = param.path();
+    match rhs {
+        AssignRhs::Int(number) => {
+            check_number_range(scene_name, path, label, op, *number, min, max, errors, warnings);
+        }
+        AssignRhs::Str(text) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to a string (\"{text}\"), but it requires a number"
+        )),
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            None => errors.push(format!(
+                "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+            )),
+            Some(VarType::Int) => {}
+            Some(VarType::Str) => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a string, but it requires a number"
+            )),
+        },
+        AssignRhs::Command(inner) => {
+            validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
+        }
+    }
+}
+
+/// A human-readable type name for an assignment error message.
+fn kind_label(kind: VarType) -> &'static str {
+    match kind {
+        VarType::Int => "an int",
+        VarType::Str => "a string",
+    }
+}
+
+/// Applies an operator's range policy to a literal number: `=` rejects an out-of-range
+/// value, `:=` clamps with a warning, `~=` clamps silently.
+#[allow(clippy::too_many_arguments)]
+fn check_number_range(
+    scene_name: &str,
+    path: &str,
+    label: &str,
+    op: AssignOp,
+    number: i64,
+    min: i64,
+    max: i64,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let clamped = number.clamp(min, max);
+    if clamped == number {
+        return;
+    }
+    match op {
+        AssignOp::Strict => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to {number}, outside {min}..={max}; use \":=\" to clamp"
+        )),
+        AssignOp::ClampWarn => warnings.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to {number} via \":=\", out of range {min}-{max} - clamped to {clamped}"
+        )),
+        AssignOp::ClampSilent => {}
+    }
+}
+
+/// Applies an operator's length policy to a literal string, mirroring
+/// [`check_number_range`].
+#[allow(clippy::too_many_arguments)]
+fn check_string_length(
+    scene_name: &str,
+    path: &str,
+    label: &str,
+    op: AssignOp,
+    length: usize,
+    max_length: usize,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if length <= max_length {
+        return;
+    }
+    match op {
+        AssignOp::Strict => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to a {length}-character string, longer than {max_length}; use \":=\" to truncate"
+        )),
+        AssignOp::ClampWarn => warnings.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" via \":=\" to a {length}-character string, longer than {max_length} - truncated"
+        )),
+        AssignOp::ClampSilent => {}
     }
 }
 
@@ -926,7 +1208,7 @@ fn is_executable(path: &str) -> bool {
 }
 
 /// Human-readable type name of a JSON value, for error messages.
-fn value_type(value: &Value) -> &'static str {
+pub(crate) fn value_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "bool",
@@ -974,6 +1256,17 @@ pub enum SceneOp {
         path: String,
         refresh_seconds: u64,
     },
+    /// Render `text` directly on a button. Unlike [`SceneOp::Text`] the value is the text
+    /// itself (already expanded from any `$` references), not a file path, so a variable
+    /// can be shown without shelling out to `echo`. References are physical buttons
+    /// (1-based). `refresh_seconds` (0 = never) re-applies this operation on its own,
+    /// independent of any scene switch - and, like every refreshed entry, re-expands its
+    /// `text` from the current variable values each time.
+    TextValue {
+        reference: Reference,
+        text: String,
+        refresh_seconds: u64,
+    },
     /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
     /// scene switch.
@@ -1004,11 +1297,29 @@ pub enum SceneOp {
     Unsupported { kind: String },
 }
 
-/// Builds the ordered list of operations for a scene without touching the device.
+/// A raw scene `setup` entry, before variable/tilde expansion or command parsing.
+///
+/// Keeping the entry raw lets a `refresh` re-resolve it against the current variables
+/// every time it fires, instead of freezing the values it started with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSceneOp {
+    /// The scene the entry came from, for error messages.
+    pub scene: String,
+    /// The control the entry targets.
+    pub reference: Reference,
+    /// The entry's `type`.
+    pub kind: String,
+    /// The entry's raw `params` string (trimmed).
+    pub params: String,
+    /// The entry's `refresh` seconds (0 = never; unused by launch/clear).
+    pub refresh_seconds: u64,
+}
+
+/// Parses a scene's `setup` into raw entries without expanding or parsing anything.
 ///
 /// The scene's `setup` dictionary holds the numbered button entries; a scene without a
-/// `setup` key yields no operations.
-pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>, String> {
+/// `setup` key (or an undefined scene) yields no entries.
+pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawSceneOp>, String> {
     let mut operations = Vec::new();
 
     let scene = scenes
@@ -1050,45 +1361,89 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         // "type"/"params" already are.
         let refresh_seconds = object.get("refresh").and_then(Value::as_u64).unwrap_or(0);
 
-        match kind {
-            "image" => operations.push(SceneOp::SetImage {
-                reference,
-                path: expand_tilde(&params),
-                refresh_seconds,
-            }),
-            "text" => operations.push(SceneOp::Text {
-                reference,
-                path: expand_tilde(&params),
-                refresh_seconds,
-            }),
-            "text_exec" => {
-                let command = params_command(scene_name, key, "text_exec", &params)?;
-                operations.push(SceneOp::TextExec {
-                    reference,
-                    command,
-                    refresh_seconds,
-                });
-            }
-            "image_exec" => {
-                let command = params_command(scene_name, key, "image_exec", &params)?;
-                operations.push(SceneOp::ImageExec {
-                    reference,
-                    command,
-                    refresh_seconds,
-                });
-            }
-            "launch" => {
-                let command = params_command(scene_name, key, "launch", &params)?;
-                operations.push(SceneOp::Launch { reference, command });
-            }
-            "clear" => operations.push(SceneOp::Clear { reference }),
-            other => operations.push(SceneOp::Unsupported {
-                kind: other.to_string(),
-            }),
-        }
+        operations.push(RawSceneOp {
+            scene: scene_name.to_string(),
+            reference,
+            kind: kind.to_string(),
+            params,
+            refresh_seconds,
+        });
     }
 
     Ok(operations)
+}
+
+/// Resolves a raw scene entry into a [`SceneOp`], expanding references in `params` from
+/// `variables` and then expanding a leading `~` and parsing any command line.
+pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<SceneOp, String> {
+    let scene_name = raw.scene.as_str();
+    let reference = raw.reference;
+    let key = reference.to_string();
+    let params = variables
+        .expand(&raw.params)
+        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))?;
+    Ok(match raw.kind.as_str() {
+        "image" => SceneOp::SetImage {
+            reference,
+            path: expand_tilde(&params),
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text" => SceneOp::Text {
+            reference,
+            path: expand_tilde(&params),
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text_value" => SceneOp::TextValue {
+            reference,
+            text: params,
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text_exec" => SceneOp::TextExec {
+            reference,
+            command: params_command(scene_name, &key, "text_exec", &params)?,
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "image_exec" => SceneOp::ImageExec {
+            reference,
+            command: params_command(scene_name, &key, "image_exec", &params)?,
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "launch" => SceneOp::Launch {
+            reference,
+            command: params_command(scene_name, &key, "launch", &params)?,
+        },
+        "clear" => SceneOp::Clear { reference },
+        other => SceneOp::Unsupported {
+            kind: other.to_string(),
+        },
+    })
+}
+
+/// A variable store with no declarations and built-in defaults, for callers (and tests)
+/// that have no runtime state; references then fail to resolve.
+fn empty_variables() -> Variables {
+    Variables::new(BTreeMap::new(), &Defaults::default())
+}
+
+/// Builds the ordered list of operations for a scene with no variable state.
+///
+/// References in `params` cannot be resolved and are reported as errors; callers with a
+/// [`Variables`] should use [`scene_operations_with`] instead.
+pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>, String> {
+    scene_operations_with(scene_name, scenes, &empty_variables())
+}
+
+/// Builds the ordered list of operations for a scene, expanding references in `params`
+/// from `variables`.
+pub fn scene_operations_with(
+    scene_name: &str,
+    scenes: &Value,
+    variables: &Variables,
+) -> Result<Vec<SceneOp>, String> {
+    raw_scene_operations(scene_name, scenes)?
+        .iter()
+        .map(|raw| resolve_scene_op(raw, variables))
+        .collect()
 }
 
 /// Spawns `command` fully detached from this program: its own process group (so terminal
@@ -1136,8 +1491,7 @@ fn params_command(
             "scene \"{scene_name}\": key \"{key}\": {kind} params must be a program command line"
         ));
     }
-    parse_command_line(params)
-        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+    build_command(params).map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
 }
 
 /// Splits a whitespace-separated command line into a program and its arguments.
@@ -1195,6 +1549,50 @@ pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
         program: expand_tilde(&words.next().unwrap()),
         args: words.map(|arg| expand_tilde(&arg)).collect(),
     })
+}
+
+/// Whether an already-expanded command line needs a shell to run: it contains an
+/// unquoted shell operator (`|`, `&`, `;`, `<`, `>`, a backtick or parentheses) or a
+/// newline.
+///
+/// Operators inside single or double quotes are literal (so `/bin/sh -c 'a | b'` runs
+/// `sh` directly, for example), and a backslash escapes the next character outside
+/// quotes, exactly as [`parse_command_line`] treats them. A command without any operator
+/// runs directly, so no shell is involved.
+pub fn command_needs_shell(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '\\' => {
+                chars.next();
+            }
+            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Builds the command to run for an already-expanded command line: `sh -c "<text>"` when
+/// the line contains shell syntax (so pipes and redirection work), or a direct
+/// [`parse_command_line`] program plus arguments otherwise.
+pub fn build_command(text: &str) -> Result<CommandSpec, String> {
+    if command_needs_shell(text) {
+        Ok(CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), text.to_string()],
+        })
+    } else {
+        parse_command_line(text)
+    }
 }
 
 /// How long an async `text_exec`/`image_exec` program may run before it is killed.
@@ -1307,9 +1705,15 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// `refresh_seconds`, if any. Replaced (old task aborted) every time that button is
     /// explicitly re-applied, whether by its own tick or by a scene redefining it.
     refresh_handles: std::collections::HashMap<u8, tokio::task::JoinHandle<()>>,
+    /// The raw `setup` entry behind each button's active operation (1-based), so a
+    /// refresh tick can re-resolve it against the current variable values.
+    refresh_sources: std::collections::HashMap<u8, RawSceneOp>,
     /// Sender for refresh ticks: a spawned task sleeps for a button's `refresh_seconds`
     /// then sends its key here; the receiving end drives [`SceneRunner::refresh_button`].
     pub refresh_tx: mpsc::Sender<u8>,
+    /// The shared variable/default state, when attached (see
+    /// [`SceneRunner::set_variables`]); `setup` params are expanded against it.
+    variables: Option<Arc<Mutex<Variables>>>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
@@ -1338,11 +1742,34 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             screenless_buttons: screenless_buttons.clone(),
             active_setup: std::collections::HashMap::new(),
             refresh_handles: std::collections::HashMap::new(),
+            refresh_sources: std::collections::HashMap::new(),
             refresh_tx,
+            variables: None,
+        }
+    }
+
+    /// Attaches the shared variable/default state, so `setup` params are resolved (and,
+    /// for refreshing buttons, re-resolved on every tick) against the current values.
+    pub fn set_variables(&mut self, variables: Arc<Mutex<Variables>>) {
+        self.variables = Some(variables);
+    }
+
+    /// Resolves a raw scene entry against the attached variable state (or an empty one,
+    /// which makes any reference an error) for use in `enter_scene`/`refresh_button`.
+    fn resolve_op(&self, raw: &RawSceneOp) -> Result<SceneOp, String> {
+        match &self.variables {
+            Some(variables) => {
+                let state = variables.lock().expect("variables mutex poisoned");
+                resolve_scene_op(raw, &state)
+            }
+            None => resolve_scene_op(raw, &empty_variables()),
         }
     }
 
     /// Applies the numbered button operations of `scene_name` to the device.
+    ///
+    /// Each raw entry is resolved against the current variable values, and remembered so
+    /// its refresh ticks re-resolve it (rather than freezing the values it started with).
     pub async fn enter_scene(
         &mut self,
         scene_name: &str,
@@ -1350,7 +1777,14 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.log
             .debug(Subsystem::Scene, format!("Entering scene \"{scene_name}\""));
-        let operations = scene_operations(scene_name, scenes)?;
+        let raw_entries = raw_scene_operations(scene_name, scenes)?;
+        let mut operations = Vec::with_capacity(raw_entries.len());
+        for raw in &raw_entries {
+            operations.push(self.resolve_op(raw)?);
+        }
+        for raw in raw_entries {
+            self.refresh_sources.insert(raw.reference.number, raw);
+        }
         self.apply_scene_operations(&operations).await
     }
 
@@ -1407,8 +1841,16 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// `apply_one_operation` always cancels the previous handle before scheduling a new
     /// one).
     pub async fn refresh_button(&mut self, key: u8) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(operation) = self.active_setup.get(&key).cloned() else {
-            return Ok(());
+        // Re-resolve from the raw source each tick, so a reference in the params picks up
+        // the current variable values instead of the ones captured on scene entry. Falls
+        // back to the already-resolved operation when no raw source is known (e.g. when
+        // operations were applied directly rather than through `enter_scene`).
+        let operation = match self.refresh_sources.get(&key).cloned() {
+            Some(raw) => self.resolve_op(&raw)?,
+            None => match self.active_setup.get(&key).cloned() {
+                Some(operation) => operation,
+                None => return Ok(()),
+            },
         };
         self.apply_one_operation(&operation).await;
         self.device.flush().await?;
@@ -1485,6 +1927,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 operation,
                 SceneOp::SetImage { .. }
                     | SceneOp::Text { .. }
+                    | SceneOp::TextValue { .. }
                     | SceneOp::TextExec { .. }
                     | SceneOp::ImageExec { .. }
             )
@@ -1600,6 +2043,42 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         self.fail_button(
                             key,
                             format!("button {key}: failed to read text from \"{path}\": {message}"),
+                        )
+                        .await;
+                    }
+                }
+            }
+            SceneOp::TextValue {
+                reference: _, text, ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("render value on key {key}: \"{text}\""),
+                );
+                // See the `SetImage` branch above: errors are stringified immediately.
+                let render_result =
+                    crate::text::render_text(&crate::text::button_text(text), self.image_format)
+                        .map_err(|error| error.to_string());
+                match render_result {
+                    Ok(image) => {
+                        if let Err(error) = self
+                            .device
+                            .set_button_image(key.saturating_sub(1), self.image_format, image)
+                            .await
+                        {
+                            self.log
+                                .error(format!("button {key}: failed to draw value text: {error}"));
+                        } else {
+                            self.log.debug(
+                                Subsystem::Device,
+                                format!("set image on button {key} from text"),
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        self.fail_button(
+                            key,
+                            format!("button {key}: failed to render value text: {message}"),
                         )
                         .await;
                     }
@@ -1800,6 +2279,11 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         .error(format!("button {key}: failed to draw error label: {error}"));
                 }
             }
+            ExecEvent::Assignment(_) => {
+                // Command-substitution assignments need the shared variable state and
+                // the device, so the input loop applies them itself (see `run_device`);
+                // this method only handles per-button results.
+            }
         }
     }
 
@@ -1865,6 +2349,7 @@ fn operation_reference(operation: &SceneOp) -> Option<&Reference> {
     match operation {
         SceneOp::SetImage { reference, .. }
         | SceneOp::Text { reference, .. }
+        | SceneOp::TextValue { reference, .. }
         | SceneOp::TextExec { reference, .. }
         | SceneOp::ImageExec { reference, .. }
         | SceneOp::Launch { reference, .. }
@@ -1882,6 +2367,9 @@ fn refresh_seconds_of(operation: &SceneOp) -> u64 {
             refresh_seconds, ..
         }
         | SceneOp::Text {
+            refresh_seconds, ..
+        }
+        | SceneOp::TextValue {
             refresh_seconds, ..
         }
         | SceneOp::TextExec {
@@ -1963,6 +2451,16 @@ pub enum ExecOutputKind {
     Image,
 }
 
+/// A command-substitution assignment whose program has finished, ready to be applied by
+/// the input loop (which owns the shared state and the device).
+#[derive(Debug, PartialEq)]
+pub struct CompletedAssign {
+    /// The assignment's target.
+    pub target: AssignTarget,
+    /// The converted value, or a description of why a strict assignment failed.
+    pub outcome: Result<VarValue, String>,
+}
+
 /// Outcome reported by a spawned `exec` task once its program finished or failed.
 #[derive(Debug, PartialEq)]
 pub enum ExecEvent {
@@ -1986,6 +2484,10 @@ pub enum ExecEvent {
         /// Human-readable description of what went wrong.
         error: String,
     },
+    /// A command-substitution assignment finished; see [`CompletedAssign`]. The input
+    /// loop intercepts this before [`SceneRunner::handle_exec_event`], which only deals
+    /// with per-button results.
+    Assignment(CompletedAssign),
 }
 
 /// Spawns an asynchronous task that runs `command`, enforcing [`EXEC_TIMEOUT`].
@@ -2163,11 +2665,12 @@ pub async fn set_image_from_file<D: ButtonDevice>(
     Ok(())
 }
 
-/// A config `defaults` field settable at runtime via a `$path := value` action.
+/// A writable `defaults` parameter, settable at runtime by an assignment action.
 ///
-/// Currently the only two settable parameters; everything else in the config (all of
-/// `devices`/`scenes`, the rest of `defaults`, and `version`) is read-only - see
-/// [`classify_config_path`].
+/// The `defaults` address space behaves like variables that also drive the device: a
+/// write updates the stored value and pushes the matching hardware setting. Its other
+/// members (`short_press_duration`, `double_click_gap`) are read-only - see
+/// [`classify_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettableDefault {
     ButtonBrightness,
@@ -2184,171 +2687,228 @@ impl SettableDefault {
         }
     }
 
-    /// The value constraint `:=`/`~=` clamp or truncate into (and `=` will hard-error
-    /// against, once implemented). Both of today's settable parameters are numeric
-    /// brightness percentages, matching `mirajazz::Device::set_brightness`/
-    /// `set_led_brightness`'s own internal `percent.clamp(0, 100)`.
+    /// The inclusive numeric range the parameter accepts, matching
+    /// `mirajazz::Device::set_brightness`/`set_led_brightness`'s own internal
+    /// `percent.clamp(0, 100)`.
     fn constraint(&self) -> Constraint {
+        Constraint::NumberRange { min: 0, max: 100 }
+    }
+
+    /// The value a non-strict assignment resets the parameter to when a command's output
+    /// cannot be converted: the configured `defaults` value loaded at startup.
+    pub fn default_value(&self, defaults: &Defaults) -> i32 {
         match self {
-            SettableDefault::ButtonBrightness | SettableDefault::EncoderBrightness => {
-                Constraint::NumberRange { min: 0, max: 100 }
+            SettableDefault::ButtonBrightness => defaults.button_brightness as i32,
+            SettableDefault::EncoderBrightness => defaults.encoder_brightness as i32,
+        }
+    }
+}
+
+/// The numeric constraint an assignment clamps into (`:=`/`~=`) or hard-errors against
+/// (`=`).
+enum Constraint {
+    /// A number must fall within `min..=max` (inclusive on both ends).
+    NumberRange { min: i64, max: i64 },
+}
+
+/// The target of an assignment action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignTarget {
+    /// A user variable, by name.
+    Variable(String),
+    /// A writable `defaults` parameter.
+    Default(SettableDefault),
+}
+
+/// The right-hand side of an assignment action, before clamping/conversion.
+///
+/// A quoted `"123"` is text, not the number `123`: a numeric target rejects it rather
+/// than silently coercing it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignRhs {
+    /// A signed integer literal (signed so a negative value can clamp up to a minimum).
+    Int(i64),
+    /// A `"double-quoted string"` literal (no escape support inside the quotes yet).
+    Str(String),
+    /// Another variable, read at action time.
+    Variable(VarRef),
+    /// A `$(command)` substitution: the command runs at action time and its output is
+    /// converted to the target's type. Kept unexpanded, since references inside it are
+    /// resolved when the action fires.
+    Command(String),
+}
+
+/// The assignment operator of a `$target <op> value` action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    /// `=` - rejects an out-of-range/over-long value instead of clamping/truncating.
+    Strict,
+    /// `:=` - clamps a number or truncates a string into the target's constraints, and
+    /// warns when it had to.
+    ClampWarn,
+    /// `~=` - the same clamping/truncation as [`AssignOp::ClampWarn`], but silently.
+    ClampSilent,
+}
+
+/// How an assignment target classifies against the actual config, given the declarations.
+enum TargetClass {
+    /// A declared user variable.
+    Variable(String),
+    /// A writable `defaults` parameter.
+    Default(SettableDefault),
+    /// A real but immutable config field/section.
+    ReadOnly(String),
+    /// A syntactically valid variable name that is not declared.
+    UndefinedVariable(String),
+    /// Not a real config path or declared variable at all.
+    Unknown(String),
+}
+
+/// Classifies an assignment target path against the config schema and declarations.
+///
+/// `devices.*`/`scenes.*` (and the whole `version`/`scenes`/`devices`/`defaults` keys)
+/// are read-only wholesale rather than field-by-field, since their shapes are
+/// config-author-chosen. `defaults.*` has an exact, fixed field list: the two brightness
+/// keys are writable, the two timing keys are read-only, and anything else under
+/// `defaults` does not exist. Everything else is a variable reference (`$name` or
+/// `$var.name`), declared or not.
+fn classify_target(path: &str, variables: &Variables) -> TargetClass {
+    match path {
+        "defaults.button_brightness" => TargetClass::Default(SettableDefault::ButtonBrightness),
+        "defaults.encoder_brightness" => TargetClass::Default(SettableDefault::EncoderBrightness),
+        "defaults.short_press_duration" | "defaults.double_click_gap" => {
+            TargetClass::ReadOnly(path.to_string())
+        }
+        "version" | "scenes" | "devices" | "defaults" => TargetClass::ReadOnly(path.to_string()),
+        _ if path.starts_with("devices.") || path.starts_with("scenes.") => {
+            TargetClass::ReadOnly(path.to_string())
+        }
+        _ if path.starts_with("defaults.") => TargetClass::Unknown(path.to_string()),
+        _ => {
+            let name = path.strip_prefix("var.").unwrap_or(path);
+            if is_valid_name(name) && (path.starts_with("var.") || !is_reserved_name(name)) {
+                if variables.store().contains(name) {
+                    TargetClass::Variable(name.to_string())
+                } else {
+                    TargetClass::UndefinedVariable(name.to_string())
+                }
+            } else {
+                TargetClass::Unknown(path.to_string())
             }
         }
     }
 }
 
-/// The value constraint a settable parameter's assignment operator checks against -
-/// what `:=`/`~=` clamp or truncate into, and what `=` will hard-error against once
-/// implemented (see [`AssignOp`]).
-enum Constraint {
-    /// A number must fall within `min..=max` (inclusive on both ends).
-    NumberRange { min: i64, max: i64 },
-    /// A string must be at most `max_len` characters. Reserved for a future
-    /// string-typed settable parameter; [`SettableDefault::constraint`] never returns
-    /// this today, since both current settable parameters are numeric.
-    #[allow(dead_code)]
-    MaxLength(usize),
-}
-
-/// The right-hand-side literal of a `$path <op> value` action, before it's matched
-/// against the type a specific [`SettableDefault`] expects.
+/// Splits a `$target <op> rhs` action into its raw target path, assignment operator and
+/// parsed right-hand side.
 ///
-/// Kept distinct from [`AssignedValue::Number`] on purpose: a quoted `"123"` is text,
-/// not the number `123`, so a settable parameter that requires a number rejects a
-/// quoted numeral instead of silently coercing it - see [`check_action_value`].
-#[derive(Debug, Clone, PartialEq)]
-enum AssignedValue {
-    /// A signed integer literal, e.g. `-10`, `0`, `100` - signed so a negative value
-    /// can be clamped up to a constraint's `min` instead of being rejected outright as
-    /// unparsable.
-    Number(i64),
-    Text(String),
-}
-
-/// The assignment operator of a `$path <op> value` action.
-///
-/// Only [`AssignOp::ClampWarn`] (`:=`) is implemented today; the other two are
-/// recognized by [`parse_set_config`] (so a config author's choice of operator is
-/// remembered and can be reported back with a clear "not implemented yet" error
-/// instead of a generic "malformed" one) but rejected by [`check_set_config_action`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssignOp {
-    /// `=` - **not yet implemented.** Will hard-error instead of clamping/truncating
-    /// when the value violates the target's [`Constraint`]. For a constant literal
-    /// (today's only supported right-hand side) that check could happen entirely at
-    /// config-load time, same as `:=`'s out-of-range case used to before this operator
-    /// family existed; once real runtime variables exist, the same check will instead
-    /// need to happen when the action actually fires, since the value won't be known
-    /// until then.
-    Strict,
-    /// `:=` - clamps a number into its [`Constraint`]'s range, or (once a string-typed
-    /// settable parameter exists) truncates a string to its max length, and warns
-    /// when it had to.
-    ClampWarn,
-    /// `~=` - **not yet implemented.** Will apply the same clamping/truncation as
-    /// `ClampWarn`, but silently - no warning even when the value was out of range.
-    ClampSilent,
-}
-
-/// How a `$`-action's dotted path resolves against the config schema.
-enum ParamClass {
-    /// A real, currently-settable parameter.
-    Settable(SettableDefault),
-    /// A real config field or section that isn't (yet) settable at runtime.
-    ReadOnly,
-    /// Not a real config path at all (typo, or a section/field that doesn't exist).
-    Unknown,
-}
-
-/// Classifies a `$`-action's dotted path against the config schema.
-///
-/// `devices.*`/`scenes.*` are read-only wholesale rather than field-by-field: both
-/// sections are dynamically shaped (device ids, scene names, control references are
-/// all config-author-chosen), so there is no fixed field list to check deeper than the
-/// section name - anything under either is real but immutable. `defaults.*` has an
-/// exact, fixed field list, so it's checked field-by-field instead: the two brightness
-/// keys are settable, `short_press_duration`/`double_click_gap` are read-only, and any
-/// other `defaults.*` field is unknown (no such field exists).
-fn classify_config_path(path: &str) -> ParamClass {
-    match path {
-        "defaults.button_brightness" => ParamClass::Settable(SettableDefault::ButtonBrightness),
-        "defaults.encoder_brightness" => ParamClass::Settable(SettableDefault::EncoderBrightness),
-        "defaults.short_press_duration"
-        | "defaults.double_click_gap"
-        | "version"
-        | "scenes"
-        | "devices"
-        | "defaults" => ParamClass::ReadOnly,
-        _ if path.starts_with("devices.") || path.starts_with("scenes.") => ParamClass::ReadOnly,
-        _ => ParamClass::Unknown,
-    }
-}
-
-/// Splits a `$path <op> value` action string into its dotted path, assignment
-/// operator, and parsed right-hand-side literal.
-///
-/// Recognizes all three operators (`:=`, `~=`, `=`, checked in that order so `:=`'s own
-/// `=` character is never mis-split as the bare `=` operator, and likewise for `~=`)
-/// even though only `:=` is implemented ([`AssignOp`]) - that way a config using `=`/
-/// `~=` gets a clear "not implemented yet" error from [`check_set_config_action`]
-/// instead of a generic "malformed" one.
-///
-/// Returns `None` when `value` doesn't start with `$`, has no operator at all, has an
-/// empty path or right-hand side, or a right-hand side that is neither a bare signed
-/// integer (e.g. `-10`, `100`) nor a `"double-quoted string"` (no escape support inside
-/// quotes yet). Doesn't check the path against the config schema at all - that's
-/// [`classify_config_path`]'s job, called separately by both [`check_action_value`]
-/// (which needs to report path-specific errors) and [`parse_action`] (which just needs
-/// *a* parsed value or none).
-fn parse_set_config(value: &str) -> Option<(String, AssignOp, AssignedValue)> {
+/// The target runs from the `$` up to the first whitespace or operator character, so the
+/// operator is always the one the author wrote and never one appearing inside the
+/// right-hand side. The three operators (`:=`, `~=`, `=`) are checked in that order so
+/// `:=` is not mis-split as `=`. Returns `None` when there is no leading `$`, no operator,
+/// an empty target, or a malformed right-hand side (see [`parse_rhs`]).
+fn parse_assignment(value: &str) -> Option<(String, AssignOp, AssignRhs)> {
     let rest = value.strip_prefix('$')?;
-    let (path, op, rhs) = if let Some((path, rhs)) = rest.split_once(":=") {
-        (path, AssignOp::ClampWarn, rhs)
-    } else if let Some((path, rhs)) = rest.split_once("~=") {
-        (path, AssignOp::ClampSilent, rhs)
-    } else if let Some((path, rhs)) = rest.split_once('=') {
-        (path, AssignOp::Strict, rhs)
+    let target_end = rest
+        .find(|c: char| c.is_whitespace() || c == ':' || c == '~' || c == '=')
+        .unwrap_or(rest.len());
+    let target = rest[..target_end].trim();
+    if target.is_empty() {
+        return None;
+    }
+    let after = rest[target_end..].trim_start();
+    let (op, rhs) = if let Some(rhs) = after.strip_prefix(":=") {
+        (AssignOp::ClampWarn, rhs)
+    } else if let Some(rhs) = after.strip_prefix("~=") {
+        (AssignOp::ClampSilent, rhs)
+    } else if let Some(rhs) = after.strip_prefix('=') {
+        (AssignOp::Strict, rhs)
     } else {
         return None;
     };
-    let path = path.trim();
     let rhs = rhs.trim();
-    if path.is_empty() || rhs.is_empty() {
+    if rhs.is_empty() {
         return None;
     }
-    let parsed = if let Some(inner) = rhs
+    Some((target.to_string(), op, parse_rhs(rhs)?))
+}
+
+/// Parses an assignment's right-hand side: a single variable reference (`$b`), a
+/// `"double-quoted string"` literal, or a bare signed integer.
+fn parse_rhs(text: &str) -> Option<AssignRhs> {
+    if let Some(inner) = text
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        // Nested command substitution is not supported; reject rather than silently
+        // handing the inner `$(` to the shell.
+        if inner.is_empty() || inner.contains("$(") {
+            return None;
+        }
+        return Some(AssignRhs::Command(inner.to_string()));
+    }
+    if text.starts_with('$') {
+        return parse_lone_reference(text).map(AssignRhs::Variable);
+    }
+    if let Some(inner) = text
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     {
-        AssignedValue::Text(inner.to_string())
-    } else if let Ok(number) = rhs.parse::<i64>() {
-        AssignedValue::Number(number)
-    } else {
-        return None;
-    };
-    Some((path.to_string(), op, parsed))
+        return Some(AssignRhs::Str(inner.to_string()));
+    }
+    text.parse::<i64>().ok().map(AssignRhs::Int)
+}
+
+/// Classifies a raw target path into a typed target using syntax only, without any
+/// declarations: `parse_action` runs without a variable store, so a syntactically valid
+/// variable target is accepted here and checked against the declarations during config
+/// validation ([`classify_target`]).
+fn classify_assign_target_syntax(path: &str) -> Option<AssignTarget> {
+    match path {
+        "defaults.button_brightness" => {
+            Some(AssignTarget::Default(SettableDefault::ButtonBrightness))
+        }
+        "defaults.encoder_brightness" => {
+            Some(AssignTarget::Default(SettableDefault::EncoderBrightness))
+        }
+        _ => {
+            if let Some(name) = path.strip_prefix("var.") {
+                is_valid_name(name).then(|| AssignTarget::Variable(name.to_string()))
+            } else if is_valid_name(path) && !is_reserved_name(path) {
+                Some(AssignTarget::Variable(path.to_string()))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// The outcome of an action value: stay on the scene, switch to another scene, run a
-/// command, or set a runtime-settable config parameter.
+/// command, or assign to a variable/default.
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Stay,
-    SwitchScene { scene: String },
-    Command { command: String },
-    SetConfig { param: SettableDefault, value: u8 },
+    SwitchScene {
+        scene: String,
+    },
+    Command {
+        command: String,
+    },
+    Assign {
+        target: AssignTarget,
+        op: AssignOp,
+        rhs: AssignRhs,
+    },
 }
 
 /// Classifies an action value: a bare `@` stays, `@name` switches scene, a well-formed
-/// `$path := value` targeting a settable parameter with `:=` (today's only
-/// implemented operator - see [`AssignOp`]) sets it, anything else (including a
-/// malformed or not-yet-implemented `$`-action - config validation is the real gate
-/// against those ever reaching here) is a command.
+/// `$target <op> rhs` assignment (see [`parse_assignment`]) whose target is
+/// syntactically a variable or a writable default assigns, and anything else - including
+/// a malformed or read-only/unknown `$`-action, which config validation is the real gate
+/// against - is a command.
 ///
-/// A `:=` number is clamped into its target's [`Constraint`] here exactly like
-/// [`check_set_config_action`] already validated at config-load time (e.g. `:=
-/// 9999999999999` on a `0`-`100` parameter becomes `100`), so the value actually sent
-/// to the device always matches what was validated/warned about.
+/// Clamping/truncation is deferred to when the action fires (see [`apply_assignment`]),
+/// since a variable right-hand side is only known then.
 ///
 /// Note the breaking change from earlier versions: `~` no longer means "stay" (that's
 /// now a bare `@`, freeing `~` up for the home-directory expansion [`expand_tilde`]
@@ -2364,30 +2924,14 @@ pub fn parse_action(value: &str) -> Action {
             }
         }
     } else if value.starts_with('$') {
-        match parse_set_config(value) {
-            Some((path, AssignOp::ClampWarn, AssignedValue::Number(number))) => {
-                match classify_config_path(&path) {
-                    ParamClass::Settable(param) => {
-                        let Constraint::NumberRange { min, max } = param.constraint() else {
-                            unreachable!(
-                                "no settable string parameter exists yet - see \
-                                 Constraint::MaxLength's doc comment"
-                            )
-                        };
-                        // Safe: every constraint in use today has a `max` that fits in
-                        // a u8 (0-100), so the clamped value always does too.
-                        let clamped = number.clamp(min, max) as u8;
-                        Action::SetConfig {
-                            param,
-                            value: clamped,
-                        }
-                    }
-                    _ => Action::Command {
-                        command: value.to_string(),
-                    },
-                }
-            }
-            _ => Action::Command {
+        match parse_assignment(value) {
+            Some((target_path, op, rhs)) => match classify_assign_target_syntax(&target_path) {
+                Some(target) => Action::Assign { target, op, rhs },
+                None => Action::Command {
+                    command: value.to_string(),
+                },
+            },
+            None => Action::Command {
                 command: value.to_string(),
             },
         }
@@ -2395,6 +2939,391 @@ pub fn parse_action(value: &str) -> Action {
         Action::Command {
             command: value.to_string(),
         }
+    }
+}
+
+/// Resolves an action value to an [`Action`], expanding `$` references against the
+/// current state first.
+///
+/// An assignment is parsed structurally without expanding its left-hand side (only the
+/// assignment's own right-hand side is resolved, when it fires); every other value -
+/// a scene switch target, a command - is expanded as a whole.
+pub fn resolve_action(value: &str, variables: &Variables) -> Result<Action, String> {
+    if value.starts_with('$') && parse_assignment(value).is_some() {
+        return Ok(parse_action(value));
+    }
+    Ok(parse_action(&variables.expand(value)?))
+}
+
+/// One scalar value on its way into an assignment, kept in its source precision until it
+/// is clamped/truncated for the target.
+enum Scalar {
+    /// An integer, as parsed (before clamping to the target's `i32` range).
+    Int(i64),
+    /// A string.
+    Str(String),
+}
+
+/// Applies an assignment whose value is known now - a literal or another variable's
+/// current value. Returns the writable default and its new value when the target is one,
+/// so the caller can push it to the device; returns `None` for a variable target or a
+/// rejected assignment.
+///
+/// `warn` controls whether a clamp/truncation is reported here: a literal was already
+/// validated (and warned about) at config-load time, while a variable's value is only
+/// known now.
+pub fn apply_assignment(
+    target: &AssignTarget,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &mut Variables,
+    warn: bool,
+    log: Log,
+) -> Option<(SettableDefault, i32)> {
+    let scalar = match rhs {
+        AssignRhs::Int(number) => Scalar::Int(*number),
+        AssignRhs::Str(text) => Scalar::Str(text.clone()),
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            Some(VarType::Int) => {
+                match variables
+                    .read(reference)
+                    .ok()
+                    .and_then(|text| text.parse::<i64>().ok())
+                {
+                    Some(number) => Scalar::Int(number),
+                    None => {
+                        log.error(format!(
+                            "assignment reads int variable \"{reference}\", but its value is not an integer"
+                        ));
+                        return None;
+                    }
+                }
+            }
+            Some(VarType::Str) => match variables.read(reference) {
+                Ok(text) => Scalar::Str(text),
+                Err(error) => {
+                    log.error(error);
+                    return None;
+                }
+            },
+            None => {
+                log.error(format!(
+                    "assignment reads undefined variable \"{reference}\""
+                ));
+                return None;
+            }
+        },
+        AssignRhs::Command(_) => {
+            log.error(
+                "command-substitution assignments must be started on their own task (start_command_assignment)",
+            );
+            return None;
+        }
+    };
+
+    match target {
+        AssignTarget::Variable(name) => {
+            let Some(def) = variables.store().def(name).cloned() else {
+                log.error(format!("assignment to undeclared variable \"${name}\""));
+                return None;
+            };
+            match (def.kind, scalar) {
+                (VarType::Int, Scalar::Int(number)) => {
+                    let value = clamp_int(
+                        number,
+                        def.min as i64,
+                        def.max as i64,
+                        op,
+                        &format!("${name}"),
+                        warn,
+                        log,
+                    )?;
+                    variables
+                        .store_mut()
+                        .set(name, crate::variables::VarValue::Int(value));
+                }
+                (VarType::Str, Scalar::Str(text)) => {
+                    let value =
+                        truncate_str(text, def.max_length, op, &format!("${name}"), warn, log)?;
+                    variables
+                        .store_mut()
+                        .set(name, crate::variables::VarValue::Str(value));
+                }
+                (kind, _) => {
+                    log.error(format!(
+                        "assignment to ${name} has the wrong type, expected {}",
+                        match kind {
+                            VarType::Int => "an int",
+                            VarType::Str => "a string",
+                        }
+                    ));
+                    return None;
+                }
+            }
+            None
+        }
+        AssignTarget::Default(param) => {
+            let Scalar::Int(number) = scalar else {
+                log.error(format!("assignment to {} requires a number", param.path()));
+                return None;
+            };
+            let Constraint::NumberRange { min, max } = param.constraint();
+            let value = clamp_int(number, min, max, op, param.path(), warn, log)?;
+            match param {
+                SettableDefault::ButtonBrightness => variables.set_button_brightness(value),
+                SettableDefault::EncoderBrightness => variables.set_encoder_brightness(value),
+            }
+            Some((*param, value))
+        }
+    }
+}
+
+/// Clamps `number` into `min..=max`, applying the operator's policy: `=` rejects an
+/// out-of-range value, `:=` clamps (warning when `warn`), `~=` clamps silently. Returns
+/// `None` only when a strict assignment rejected the value.
+fn clamp_int(
+    number: i64,
+    min: i64,
+    max: i64,
+    op: AssignOp,
+    label: &str,
+    warn: bool,
+    log: Log,
+) -> Option<i32> {
+    if number < min || number > max {
+        let clamped = number.clamp(min, max);
+        match op {
+            AssignOp::Strict => {
+                log.error(format!(
+                    "assignment to {label} rejected out-of-range value {number} (allowed {min}..={max})"
+                ));
+                return None;
+            }
+            AssignOp::ClampWarn => {
+                if warn {
+                    log.warn(format!(
+                        "assignment to {label} clamped out-of-range value {number} to {clamped}"
+                    ));
+                }
+            }
+            AssignOp::ClampSilent => {}
+        }
+        return Some(clamped as i32);
+    }
+    Some(number as i32)
+}
+
+/// Truncates `text` to at most `max_length` characters, applying the operator's policy
+/// like [`clamp_int`]. Returns `None` only when a strict assignment rejected the value.
+fn truncate_str(
+    text: String,
+    max_length: usize,
+    op: AssignOp,
+    label: &str,
+    warn: bool,
+    log: Log,
+) -> Option<String> {
+    if text.chars().count() > max_length {
+        match op {
+            AssignOp::Strict => {
+                log.error(format!(
+                    "assignment to {label} rejected a value longer than {max_length} characters"
+                ));
+                return None;
+            }
+            AssignOp::ClampWarn => {
+                if warn {
+                    log.warn(format!(
+                        "assignment to {label} truncated a value longer than {max_length} characters"
+                    ));
+                }
+            }
+            AssignOp::ClampSilent => {}
+        }
+        return Some(text.chars().take(max_length).collect());
+    }
+    Some(text)
+}
+
+/// The conversion a command-substitution assignment applies to its program's output.
+enum Conversion {
+    /// Parse the first non-empty line as an integer, then clamp to `min..=max`; `default`
+    /// is used on a non-strict conversion failure.
+    Int { min: i32, max: i32, default: i32 },
+    /// Use the whole output (trailing newlines stripped), truncated to `max_length`;
+    /// `default` is used on a non-strict conversion failure.
+    Str { max_length: usize, default: String },
+}
+
+/// Prepares a `$(command)` assignment: resolves the target's conversion parameters and
+/// expands and builds the command to run. Called at dispatch time, so any variable read
+/// inside the command sees the value as of the moment the action was triggered.
+fn prepare_command_assignment(
+    target: &AssignTarget,
+    inner: &str,
+    state: &Variables,
+) -> Result<(Conversion, CommandSpec, String), String> {
+    let (conversion, label) = match target {
+        AssignTarget::Variable(name) => {
+            let def = state
+                .store()
+                .def(name)
+                .ok_or_else(|| format!("assignment to undeclared variable \"${name}\""))?;
+            let conversion = match def.kind {
+                VarType::Int => Conversion::Int {
+                    min: def.min,
+                    max: def.max,
+                    default: def.initial.as_int().unwrap_or(0),
+                },
+                VarType::Str => Conversion::Str {
+                    max_length: def.max_length,
+                    default: def.initial.as_str().unwrap_or("").to_string(),
+                },
+            };
+            (conversion, format!("${name}"))
+        }
+        AssignTarget::Default(param) => {
+            let Constraint::NumberRange { min, max } = param.constraint();
+            (
+                Conversion::Int {
+                    min: min as i32,
+                    max: max as i32,
+                    default: param.default_value(state.loaded_defaults()),
+                },
+                param.path().to_string(),
+            )
+        }
+    };
+    let expanded = state.expand(inner)?;
+    let spec = build_command(&expanded)?;
+    Ok((conversion, spec, label))
+}
+
+/// Starts a `$(command)` assignment on its own task, so the input loop is never blocked by
+/// the command and sibling actions keep running in parallel.
+///
+/// The command is expanded and built here (reading the current values of any referenced
+/// variables), then the task runs it, converts its output, and reports the result through
+/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply.
+pub fn start_command_assignment(
+    target: AssignTarget,
+    op: AssignOp,
+    inner: &str,
+    variables: &Arc<Mutex<Variables>>,
+    exec_tx: mpsc::Sender<ExecEvent>,
+    log: Log,
+) {
+    let prepared = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        prepare_command_assignment(&target, inner, &state)
+    };
+    let (conversion, spec, label) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log.error(error);
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let outcome = match run_command_with_timeout(&spec, EXEC_TIMEOUT).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(output) => convert_output(&output, &conversion, op, &label, log),
+                Err(_) => conversion_failure(op, &conversion, &label, "output is not UTF-8", log),
+            },
+            Err(error) => conversion_failure(op, &conversion, &label, &error, log),
+        };
+        let _ = exec_tx
+            .send(ExecEvent::Assignment(CompletedAssign { target, outcome }))
+            .await;
+    });
+}
+
+/// Converts a command's output to the target type, applying the operator's policy to an
+/// out-of-range/over-long value exactly like a literal assignment.
+fn convert_output(
+    output: &str,
+    conversion: &Conversion,
+    op: AssignOp,
+    label: &str,
+    log: Log,
+) -> Result<VarValue, String> {
+    match conversion {
+        Conversion::Int { min, max, .. } => {
+            let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+                return conversion_failure(op, conversion, label, "no output", log);
+            };
+            let Ok(number) = line.trim().parse::<i64>() else {
+                return conversion_failure(op, conversion, label, "output is not an integer", log);
+            };
+            let (min, max) = (*min as i64, *max as i64);
+            if number < min || number > max {
+                return match op {
+                    AssignOp::Strict => Err(format!(
+                        "assignment to {label} got out-of-range value {number} from its command (allowed {min}..={max})"
+                    )),
+                    AssignOp::ClampWarn => {
+                        log.warn(format!(
+                            "assignment to {label} clamped command output {number} to {}",
+                            number.clamp(min, max)
+                        ));
+                        Ok(VarValue::Int(number.clamp(min, max) as i32))
+                    }
+                    AssignOp::ClampSilent => Ok(VarValue::Int(number.clamp(min, max) as i32)),
+                };
+            }
+            Ok(VarValue::Int(number as i32))
+        }
+        Conversion::Str { max_length, .. } => {
+            let text = output.trim_end_matches(['\n', '\r']).to_string();
+            if text.chars().count() > *max_length {
+                return match op {
+                    AssignOp::Strict => Err(format!(
+                        "assignment to {label} got a value longer than {max_length} characters from its command"
+                    )),
+                    AssignOp::ClampWarn => {
+                        log.warn(format!(
+                            "assignment to {label} truncated command output to {max_length} characters"
+                        ));
+                        Ok(VarValue::Str(text.chars().take(*max_length).collect()))
+                    }
+                    AssignOp::ClampSilent => {
+                        Ok(VarValue::Str(text.chars().take(*max_length).collect()))
+                    }
+                };
+            }
+            Ok(VarValue::Str(text))
+        }
+    }
+}
+
+/// Builds a conversion failure result: a strict assignment fails, `:=` warns and falls
+/// back to the default, `~=` falls back silently.
+fn conversion_failure(
+    op: AssignOp,
+    conversion: &Conversion,
+    label: &str,
+    reason: &str,
+    log: Log,
+) -> Result<VarValue, String> {
+    match op {
+        AssignOp::Strict => Err(format!(
+            "assignment to {label} could not use its command output ({reason})"
+        )),
+        AssignOp::ClampWarn => {
+            log.warn(format!(
+                "assignment to {label} could not use its command output ({reason}); using the default value"
+            ));
+            Ok(default_value(conversion))
+        }
+        AssignOp::ClampSilent => Ok(default_value(conversion)),
+    }
+}
+
+/// The default value a failed command-output conversion falls back to.
+fn default_value(conversion: &Conversion) -> VarValue {
+    match conversion {
+        Conversion::Int { default, .. } => VarValue::Int(*default),
+        Conversion::Str { default, .. } => VarValue::Str(default.clone()),
     }
 }
 
@@ -2464,12 +3393,55 @@ pub fn action_for_event<'a>(
 /// whose value may be a single string or an array of them, exactly like an event's.
 /// Returns `None` if the scene has no timer.
 pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, Vec<&'a str>)> {
-    let scene = scenes.get(scene_name)?.as_object()?;
-    let actions = scene.get("actions")?.as_object()?;
-    let timer = actions.get("timer")?.as_object()?;
-    let (seconds_str, action) = timer.iter().next()?;
-    let seconds = seconds_str.parse::<u64>().ok()?;
-    Some((seconds, action_values(action)))
+    timer_for_scene_with(scene_name, scenes, &empty_variables())
+        .ok()
+        .flatten()
+}
+
+/// Reads the timer actions for a scene, resolving its seconds against `variables`.
+///
+/// The seconds key is either a number or a single int variable reference. Returns
+/// `Ok(None)` when the scene has no timer (or an unrecognizable one, matching
+/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable.
+pub fn timer_for_scene_with<'a>(
+    scene_name: &str,
+    scenes: &'a Value,
+    variables: &Variables,
+) -> Result<Option<(u64, Vec<&'a str>)>, String> {
+    let Some(timer) = scenes
+        .get(scene_name)
+        .and_then(Value::as_object)
+        .and_then(|scene| scene.get("actions"))
+        .and_then(Value::as_object)
+        .and_then(|actions| actions.get("timer"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let Some((seconds_str, action)) = timer.iter().next() else {
+        return Ok(None);
+    };
+    let seconds = match seconds_str.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let refs = references_in(seconds_str)
+                .map_err(|error| format!("scene \"{scene_name}\": actions.timer: {error}"))?;
+            match refs.as_slice() {
+                [reference] if variables.kind_of(reference) == Some(VarType::Int) => {
+                    let text = variables.read(reference).map_err(|error| {
+                        format!("scene \"{scene_name}\": actions.timer: {error}")
+                    })?;
+                    text.parse::<u64>().map_err(|_| {
+                        format!(
+                            "scene \"{scene_name}\": actions.timer seconds \"{seconds_str}\" resolved to \"{text}\", which is not a valid number of seconds"
+                        )
+                    })?
+                }
+                _ => return Ok(None),
+            }
+        }
+    };
+    Ok(Some((seconds, action_values(action))))
 }
 
 #[cfg(test)]
@@ -2878,6 +3850,11 @@ mod tests {
             path: "x.txt".to_string(),
             refresh_seconds: 0,
         };
+        let text_value = super::SceneOp::TextValue {
+            reference: super::Reference::button(3, 5),
+            text: "hello".to_string(),
+            refresh_seconds: 0,
+        };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(9, 8),
             command: super::CommandSpec {
@@ -2916,6 +3893,10 @@ mod tests {
             Some(&super::Reference::button(2, 4))
         );
         assert_eq!(
+            super::operation_reference(&text_value),
+            Some(&super::Reference::button(3, 5))
+        );
+        assert_eq!(
             super::operation_reference(&text_exec),
             Some(&super::Reference::button(9, 8))
         );
@@ -2934,7 +3915,7 @@ mod tests {
         assert_eq!(super::operation_reference(&unsupported), None);
     }
 
-    /// `refresh_seconds_of` reads the field from the four variants that carry one, and
+    /// `refresh_seconds_of` reads the field from the five variants that carry one, and
     /// reports 0 (the same as an absent/zero field) for the three that never do.
     #[test]
     fn refresh_seconds_of_reads_the_field_or_reports_zero() {
@@ -2947,6 +3928,11 @@ mod tests {
             reference: super::Reference::button(1, 2),
             path: "x.txt".to_string(),
             refresh_seconds: 7,
+        };
+        let text_value = super::SceneOp::TextValue {
+            reference: super::Reference::button(1, 7),
+            text: "hello".to_string(),
+            refresh_seconds: 9,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(1, 3),
@@ -2979,6 +3965,7 @@ mod tests {
         };
         assert_eq!(super::refresh_seconds_of(&image), 5);
         assert_eq!(super::refresh_seconds_of(&text), 7);
+        assert_eq!(super::refresh_seconds_of(&text_value), 9);
         assert_eq!(super::refresh_seconds_of(&text_exec), 11);
         assert_eq!(super::refresh_seconds_of(&image_exec), 13);
         assert_eq!(super::refresh_seconds_of(&launch), 0);
@@ -3131,61 +4118,79 @@ mod tests {
         );
     }
 
-    /// A well-formed `$`-assignment targeting a settable parameter classifies as
-    /// `SetConfig`.
+    /// A well-formed `$`-assignment classifies as `Assign`, with the right target,
+    /// operator and right-hand side for literals, variable references and both scopes.
     #[test]
-    fn parse_action_classifies_valid_set_config() {
+    fn parse_action_classifies_assignments() {
+        use crate::variables::{Scope, VarRef};
         assert_eq!(
             super::parse_action("$defaults.button_brightness := 80"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 80,
+            super::Action::Assign {
+                target: super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Int(80),
             }
         );
         assert_eq!(
-            super::parse_action("$defaults.encoder_brightness := 5"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::EncoderBrightness,
-                value: 5,
+            super::parse_action("$count ~= 5"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("count".to_string()),
+                op: super::AssignOp::ClampSilent,
+                rhs: super::AssignRhs::Int(5),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$var.count = -10"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("count".to_string()),
+                op: super::AssignOp::Strict,
+                rhs: super::AssignRhs::Int(-10),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$name := \"hi\""),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("name".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Str("hi".to_string()),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$a := $b"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("a".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "b".to_string(),
+                }),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$defaults.encoder_brightness := $level"),
+            super::Action::Assign {
+                target: super::AssignTarget::Default(super::SettableDefault::EncoderBrightness),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "level".to_string(),
+                }),
             }
         );
     }
 
-    /// `:=` clamps an out-of-range number into its target's constraint (`0`-`100` for
-    /// both of today's settable parameters) instead of rejecting it - a negative
-    /// number clamps up to `0`, and one above the max clamps down to `100`, matching
-    /// [`super::check_set_config_action`]'s validation-time warning for the same value.
-    #[test]
-    fn parse_action_clamps_out_of_range_numbers_for_settable_default() {
-        assert_eq!(
-            super::parse_action("$defaults.button_brightness := -10"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 0,
-            }
-        );
-        assert_eq!(
-            super::parse_action("$defaults.button_brightness := 9999999999999"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 100,
-            }
-        );
-    }
-
-    /// A `$`-assignment targeting a read-only/unknown parameter, one with the wrong
-    /// value type, or one using a not-yet-implemented operator (`=`/`~=`), falls back
-    /// to being treated as a literal command at runtime - config validation is the
+    /// A `$`-assignment that is not syntactically a variable or writable default falls
+    /// back to being treated as a literal command at runtime - config validation is the
     /// real gate against these ever being used.
     #[test]
-    fn parse_action_falls_back_to_command_for_invalid_set_config() {
+    fn parse_action_falls_back_to_command_for_unusable_assignments() {
         for value in [
-            "$defaults.short_press_duration := 100", // read-only
+            "$defaults.short_press_duration := 100", // read-only, not a writable default
             "$devices.1.key_count := 5",             // read-only
-            "$foo.bar := 1",                         // unknown
-            "$defaults.button_brightness := \"80\"", // wrong type
-            "$defaults.button_brightness = 80",      // not-yet-implemented operator "="
-            "$defaults.button_brightness ~= 80",     // not-yet-implemented operator "~="
+            "$foo.bar := 1",                         // unknown scope
+            "$defaults.button_brightness := high",   // unparsable right-hand side
+            "$defaults.button_brightness 80",        // no operator
+            "$ := 80",                               // empty target
         ] {
             assert_eq!(
                 super::parse_action(value),
@@ -3197,115 +4202,523 @@ mod tests {
         }
     }
 
-    /// [`super::classify_config_path`] recognizes the two settable paths, treats the
-    /// rest of `defaults` and all of `devices`/`scenes` as read-only, and anything else
-    /// as unknown.
-    #[test]
-    fn classify_config_path_covers_settable_readonly_and_unknown() {
-        assert!(matches!(
-            super::classify_config_path("defaults.button_brightness"),
-            super::ParamClass::Settable(super::SettableDefault::ButtonBrightness)
-        ));
-        assert!(matches!(
-            super::classify_config_path("defaults.encoder_brightness"),
-            super::ParamClass::Settable(super::SettableDefault::EncoderBrightness)
-        ));
-        for path in [
-            "defaults.short_press_duration",
-            "defaults.double_click_gap",
-            "version",
-            "scenes",
-            "devices",
-            "defaults",
-            "devices.1.key_count",
-            "scenes.on_start.setup",
-        ] {
-            assert!(
-                matches!(
-                    super::classify_config_path(path),
-                    super::ParamClass::ReadOnly
-                ),
-                "expected {path} to be read-only"
-            );
-        }
-        for path in [
-            "foo.bar",
-            "defaults.nonexistent",
-            "default.button_brightness",
-        ] {
-            assert!(
-                matches!(
-                    super::classify_config_path(path),
-                    super::ParamClass::Unknown
-                ),
-                "expected {path} to be unknown"
-            );
-        }
+    /// A variable store for assignment tests: `count` is an int in `0..=10` and `name`
+    /// is a string of at most 3 characters.
+    fn assignment_variables() -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), crate::variables::VarDef::int(0, 10, 5));
+        defs.insert(
+            "name".to_string(),
+            crate::variables::VarDef::string(3, "abc".to_string()),
+        );
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
     }
 
-    /// [`super::parse_set_config`] splits a well-formed `$path <op> value` action,
-    /// distinguishing a quoted string from a bare number - `"123"` is never treated as
-    /// the number `123` - and recognizes all three assignment operators (`:=`, `~=`,
-    /// `=`, checked in that order so `:=`'s own `=` character is never mis-split as the
-    /// bare `=` operator), even though only `:=` is implemented ([`super::AssignOp`]).
+    /// `clamp_int` passes an in-range value through, clamps out-of-range values for
+    /// `:=`/`~=`, and rejects them for `=`.
     #[test]
-    fn parse_set_config_distinguishes_numbers_strings_and_operators() {
+    fn clamp_int_applies_operator_policy() {
+        let log = crate::log::Log::default();
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Number(80)
-            ))
+            super::clamp_int(50, 0, 100, super::AssignOp::Strict, "x", true, log),
+            Some(50)
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := \"80\""),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Text("80".to_string())
-            ))
+            super::clamp_int(200, 0, 100, super::AssignOp::ClampWarn, "x", true, log),
+            Some(100)
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness ~= 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
+            super::clamp_int(-5, 0, 100, super::AssignOp::ClampSilent, "x", true, log),
+            Some(0)
+        );
+        assert_eq!(
+            super::clamp_int(200, 0, 100, super::AssignOp::Strict, "x", true, log),
+            None,
+            "a strict assignment rejects an out-of-range value"
+        );
+    }
+
+    /// `truncate_str` passes a short value through, truncates an over-long one for
+    /// `:=`/`~=`, and rejects it for `=`.
+    #[test]
+    fn truncate_str_applies_operator_policy() {
+        let log = crate::log::Log::default();
+        let text = |s: &str| s.to_string();
+        assert_eq!(
+            super::truncate_str(text("abc"), 3, super::AssignOp::Strict, "x", true, log),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            super::truncate_str(
+                text("abcdef"),
+                3,
+                super::AssignOp::ClampWarn,
+                "x",
+                true,
+                log
+            ),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            super::truncate_str(
+                text("abcdef"),
+                3,
                 super::AssignOp::ClampSilent,
-                super::AssignedValue::Number(80)
-            ))
+                "x",
+                true,
+                log
+            ),
+            Some("abc".to_string())
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness = 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::Strict,
-                super::AssignedValue::Number(80)
-            ))
-        );
-        assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := -10"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Number(-10)
-            )),
-            "a negative number is a valid literal, clamped later - not malformed"
+            super::truncate_str(text("abcdef"), 3, super::AssignOp::Strict, "x", true, log),
+            None,
+            "a strict assignment rejects an over-long value"
         );
     }
 
-    /// Malformed `$`-assignments (no operator at all, empty path/value, an unquoted
-    /// non-numeric value, or no leading `$` at all) are rejected.
+    /// `apply_assignment` clamps a variable's value into its declared range, truncates a
+    /// string to its max length, and for a writable default stores the clamped value and
+    /// reports the side effect the caller must push to the device.
     #[test]
-    fn parse_set_config_rejects_malformed_input() {
+    fn apply_assignment_updates_variables_and_reports_default_side_effect() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Variable("count".to_string()),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Int(50),
+                &mut variables,
+                true,
+                log,
+            ),
+            None
+        );
+        assert_eq!(
+            variables.store().get("count"),
+            Some(&crate::variables::VarValue::Int(10))
+        );
+
+        super::apply_assignment(
+            &super::AssignTarget::Variable("name".to_string()),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Str("abcdef".to_string()),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            variables.store().get("name"),
+            Some(&crate::variables::VarValue::Str("abc".to_string()))
+        );
+
+        let side_effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Int(200),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            side_effect,
+            Some((super::SettableDefault::ButtonBrightness, 100))
+        );
+        assert_eq!(variables.button_brightness(), 100);
+    }
+
+    /// `parse_assignment` splits the target from the operator and parses each kind of
+    /// right-hand side, without mistaking a character inside the right-hand side for the
+    /// assignment's own operator.
+    #[test]
+    fn parse_assignment_splits_target_operator_and_rhs() {
+        use crate::variables::{Scope, VarRef};
+        assert_eq!(
+            super::parse_assignment("$defaults.button_brightness := 80"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Int(80)
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$a := \"a=b\""),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Str("a=b".to_string())
+            )),
+            "an `=` inside a quoted right-hand side is not the operator"
+        );
+        assert_eq!(
+            super::parse_assignment("$a := $b"),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "b".to_string(),
+                })
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$var.a = -10"),
+            Some((
+                "var.a".to_string(),
+                super::AssignOp::Strict,
+                super::AssignRhs::Int(-10)
+            ))
+        );
+    }
+
+    /// `parse_assignment` accepts a whole `$(command)` right-hand side, treats a quoted
+    /// one as a literal string, and rejects an empty or nested substitution.
+    #[test]
+    fn parse_assignment_accepts_command_substitution() {
+        assert_eq!(
+            super::parse_assignment("$a := $(echo 1)"),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Command("echo 1".to_string())
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$a := \"$(echo 1)\""),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Str("$(echo 1)".to_string())
+            )),
+            "a quoted substitution is a literal string"
+        );
+        assert_eq!(super::parse_assignment("$a := $()"), None);
+        assert_eq!(super::parse_assignment("$a := $(echo $(echo 1))"), None);
+    }
+
+    /// `command_needs_shell` only sees operators outside quotes.
+    #[test]
+    fn command_needs_shell_ignores_quoted_operators() {
+        assert!(!super::command_needs_shell("/bin/echo hello"));
+        assert!(super::command_needs_shell("/bin/echo a | bc"));
+        assert!(super::command_needs_shell("/bin/echo a > /tmp/x"));
+        assert!(!super::command_needs_shell("/bin/sh -c 'a | b > c'"));
+        assert!(!super::command_needs_shell("/bin/echo 'a;b'"));
+        assert!(super::command_needs_shell("/bin/echo a; b"));
+    }
+
+    /// `build_command` runs a shell only when the line needs one.
+    #[test]
+    fn build_command_uses_shell_only_when_needed() {
+        let direct = super::build_command("/bin/echo hello").unwrap();
+        assert_eq!(direct.program, "/bin/echo");
+        assert_eq!(direct.args, ["hello"]);
+
+        let shell = super::build_command("/bin/echo a | bc").unwrap();
+        assert_eq!(shell.program, "sh");
+        assert_eq!(shell.args, ["-c", "/bin/echo a | bc"]);
+    }
+
+    /// `resolve_action` expands references in ordinary values but parses an assignment
+    /// structurally, leaving its target (and any `$` in the right-hand side) alone.
+    #[test]
+    fn resolve_action_expands_values_but_not_assignment_targets() {
+        let variables = scene_variables();
+        assert_eq!(
+            super::resolve_action("/bin/echo $dir", &variables).unwrap(),
+            super::Action::Command {
+                command: "/bin/echo a".to_string()
+            }
+        );
+        assert!(super::resolve_action("/bin/echo $missing", &variables).is_err());
+        assert_eq!(
+            super::resolve_action("$dir := 5", &variables).unwrap(),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("dir".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Int(5),
+            }
+        );
+    }
+
+    /// `convert_output` takes the first non-empty, trimmed line of an int command's
+    /// output, clamps it per operator, and falls back to the default on a non-strict
+    /// conversion failure.
+    #[test]
+    fn convert_output_converts_int_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Int {
+            min: 0,
+            max: 100,
+            default: 5,
+        };
+        assert_eq!(
+            super::convert_output(
+                "\n  42 \nignored\n",
+                &conversion,
+                super::AssignOp::ClampWarn,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Int(42)
+        );
+        assert!(
+            super::convert_output("200", &conversion, super::AssignOp::Strict, "$a", log).is_err(),
+            "= rejects out-of-range command output"
+        );
+        assert_eq!(
+            super::convert_output("200", &conversion, super::AssignOp::ClampWarn, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(100)
+        );
+        assert_eq!(
+            super::convert_output("-5", &conversion, super::AssignOp::ClampSilent, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(0)
+        );
+        assert!(
+            super::convert_output("high", &conversion, super::AssignOp::Strict, "$a", log).is_err(),
+            "= fails when the output is not an integer"
+        );
+        assert_eq!(
+            super::convert_output("high", &conversion, super::AssignOp::ClampWarn, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(5),
+            ":= falls back to the default on a conversion failure"
+        );
+        assert_eq!(
+            super::convert_output("", &conversion, super::AssignOp::ClampSilent, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(5),
+            "~= falls back silently on empty output"
+        );
+    }
+
+    /// `convert_output` strips trailing newlines for a str target, keeps internal ones,
+    /// and applies the operator policy when truncating.
+    #[test]
+    fn convert_output_converts_str_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Str {
+            max_length: 5,
+            default: "fallback".to_string(),
+        };
+        assert_eq!(
+            super::convert_output("hello\n\n", &conversion, super::AssignOp::Strict, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Str("hello".to_string())
+        );
+        assert_eq!(
+            super::convert_output("a\nb", &conversion, super::AssignOp::Strict, "$a", log).unwrap(),
+            crate::variables::VarValue::Str("a\nb".to_string())
+        );
+        assert!(
+            super::convert_output("toolong", &conversion, super::AssignOp::Strict, "$a", log)
+                .is_err(),
+            "= rejects a too-long command output"
+        );
+        assert_eq!(
+            super::convert_output(
+                "toolong",
+                &conversion,
+                super::AssignOp::ClampWarn,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("toolo".to_string())
+        );
+        assert_eq!(
+            super::convert_output(
+                "toolong",
+                &conversion,
+                super::AssignOp::ClampSilent,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("toolo".to_string())
+        );
+    }
+
+    /// `default_value` returns the fallback for both conversion kinds.
+    #[test]
+    fn default_value_matches_conversion_kind() {
+        assert_eq!(
+            super::default_value(&super::Conversion::Int {
+                min: 0,
+                max: 1,
+                default: 3
+            }),
+            crate::variables::VarValue::Int(3)
+        );
+        assert_eq!(
+            super::default_value(&super::Conversion::Str {
+                max_length: 1,
+                default: "x".to_string()
+            }),
+            crate::variables::VarValue::Str("x".to_string())
+        );
+    }
+
+    /// `start_command_assignment` on an undeclared target reports the problem and never
+    /// spawns, so no result event is sent.
+    #[tokio::test]
+    async fn start_command_assignment_errors_on_undeclared_target() {
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(scene_variables()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        super::start_command_assignment(
+            super::AssignTarget::Variable("missing".to_string()),
+            super::AssignOp::ClampWarn,
+            "echo 1",
+            &variables,
+            tx,
+            crate::log::Log::default(),
+        );
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            matches!(received, Ok(None)),
+            "an undeclared target must not spawn a command: {received:?}"
+        );
+    }
+
+    /// A variable store for scene/param tests: `dir` is a string, `period` an int.
+    fn scene_variables() -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "dir".to_string(),
+            crate::variables::VarDef::string(255, "a".to_string()),
+        );
+        defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::int(1, 100, 7),
+        );
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
+    }
+
+    /// `scene_operations_with` expands references in setup params from the variables,
+    /// while the variable-free `scene_operations` reports a reference as an error.
+    #[test]
+    fn scene_operations_expand_params_from_variables() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "image", "params": "/tmp/$dir.png" } } }
+        });
+        let operations = super::scene_operations_with("main", &scenes, &scene_variables()).unwrap();
+        assert_eq!(
+            operations,
+            vec![super::SceneOp::SetImage {
+                reference: crate::baseplane::Reference::button(1, 1),
+                path: "/tmp/a.png".to_string(),
+                refresh_seconds: 0,
+            }]
+        );
+        assert!(super::scene_operations("main", &scenes).is_err());
+    }
+
+    /// A `text_value` entry is the literal text itself (with references expanded), not a
+    /// path, and carries its refresh.
+    #[test]
+    fn scene_operations_resolve_text_value_inline() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "text_value", "params": "dir=$dir", "refresh": 2 } } }
+        });
+        let operations = super::scene_operations_with("main", &scenes, &scene_variables()).unwrap();
+        assert_eq!(
+            operations,
+            vec![super::SceneOp::TextValue {
+                reference: crate::baseplane::Reference::button(1, 1),
+                text: "dir=a".to_string(),
+                refresh_seconds: 2,
+            }]
+        );
+    }
+
+    /// `resolve_scene_op` re-expands from the current values each time, so a refresh tick
+    /// picks up a changed variable.
+    #[test]
+    fn resolve_scene_op_re_expands_after_variable_change() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "image", "params": "$dir/pic.png" } } }
+        });
+        let raw = super::raw_scene_operations("main", &scenes).unwrap();
+        let mut variables = scene_variables();
+        let first = super::resolve_scene_op(&raw[0], &variables).unwrap();
+        variables
+            .store_mut()
+            .set("dir", crate::variables::VarValue::Str("b".to_string()));
+        let second = super::resolve_scene_op(&raw[0], &variables).unwrap();
+        assert_ne!(first, second);
+    }
+
+    /// `timer_for_scene_with` resolves an int variable's seconds, and treats a str
+    /// variable (or an unresolvable key) as no timer.
+    #[test]
+    fn timer_seconds_resolve_from_int_variable() {
+        let scenes = json!({
+            "main": { "actions": { "timer": { "$period": "@Main" } } }
+        });
+        assert_eq!(
+            super::timer_for_scene_with("main", &scenes, &scene_variables()).unwrap(),
+            Some((7, vec!["@Main"]))
+        );
+
+        let mut str_defs = std::collections::BTreeMap::new();
+        str_defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::string(5, "7".to_string()),
+        );
+        let str_variables =
+            crate::variables::Variables::new(str_defs, &crate::press::Defaults::default());
+        assert_eq!(
+            super::timer_for_scene_with("main", &scenes, &str_variables).unwrap(),
+            None
+        );
+    }
+
+    /// Malformed assignments (no leading `$`, no operator, empty target, or a
+    /// right-hand side that is not a literal or a single variable reference) are
+    /// rejected.
+    #[test]
+    fn parse_assignment_rejects_malformed_input() {
         for value in [
-            "defaults.button_brightness := 80",    // no leading $
-            "$defaults.button_brightness 80",      // no operator at all
-            "$ := 80",                             // empty path
-            "$defaults.button_brightness := ",     // empty value
-            "$defaults.button_brightness := high", // unquoted non-numeric
+            "a := 80",    // no leading $
+            "$a 80",      // no operator at all
+            "$ := 80",    // empty target
+            "$a := ",     // empty right-hand side
+            "$a := high", // unquoted non-numeric literal
+            "$a := $",    // malformed reference
         ] {
-            assert_eq!(super::parse_set_config(value), None, "for {value}");
+            assert_eq!(super::parse_assignment(value), None, "for {value}");
         }
+    }
+
+    /// An assignment right-hand side can read a `defaults` parameter, not only a user
+    /// variable: `$defaults.short_press_duration` (300ms by default) clamps into the
+    /// target's range.
+    #[test]
+    fn apply_assignment_reads_defaults_scope_rhs() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        let reference = crate::variables::VarRef {
+            scope: crate::variables::Scope::Defaults,
+            name: "short_press_duration".to_string(),
+        };
+        super::apply_assignment(
+            &super::AssignTarget::Variable("count".to_string()),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Variable(reference),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            variables.store().get("count"),
+            Some(&crate::variables::VarValue::Int(10)),
+            "300ms clamps down to the target's max of 10"
+        );
     }
 
     /// [`action_values`] reads a single non-empty string as a one-element list and a

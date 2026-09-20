@@ -16,6 +16,8 @@ extern crate mirajazz_freebsd as mirajazz;
 
 use dak::actions::{set_image_from_file, ButtonDevice, ExecEvent, ExecOutputKind, SceneRunner};
 use dak::log::Log;
+use dak::press::Defaults;
+use dak::variables::{VarDef, VarValue, Variables};
 use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
 use mirajazz::types::{ImageFormat, ImageMirroring, ImageMode, ImageRotation};
 use serde_json::{json, Value};
@@ -811,7 +813,7 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
     let scenes = scenes_with_buttons(json!({
         "1b02": {
             "type": "text_exec",
-            "params": format!("/bin/sh -c 'echo $$ > {pid_file}; exec sleep 60'")
+            "params": format!("/bin/sh -c 'echo \\$\\$ > {pid_file}; exec sleep 60'")
         }
     }));
     runner.enter_scene("main", &scenes).await.unwrap();
@@ -979,7 +981,7 @@ async fn launch_op_spawns_program_and_touches_no_button() {
         "1b01": {
             "type": "launch",
             "params": json!(format!(
-                "/bin/sh -c 'echo $$ > {pid_file}; sleep 2; echo done > {done_file}'"
+                "/bin/sh -c 'echo \\$\\$ > {pid_file}; sleep 2; echo done > {done_file}'"
             ))
         }
     }));
@@ -1729,7 +1731,7 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
     let scenes = scenes_with_buttons(json!({
         "1b02": {
             "type": "text_exec",
-            "params": format!("/bin/sh -c 'echo $$ > {pid_file}; exec sleep 60'")
+            "params": format!("/bin/sh -c 'echo \\$\\$ > {pid_file}; exec sleep 60'")
         }
     }));
     runner.enter_scene("main", &scenes).await.unwrap();
@@ -1936,4 +1938,99 @@ async fn refresh_is_cancelled_when_the_button_is_redefined() {
     );
 
     let _ = std::fs::remove_file(&image_path);
+}
+
+/// A refresh re-resolves a `setup` entry's references against the current variable
+/// values, rather than reusing what was captured when the scene was entered.
+#[tokio::test]
+async fn refresh_re_resolves_referenced_params() {
+    let mock = MockButtonDevice::default();
+    let first = write_temp_text("first");
+    let second = write_temp_text("second");
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert(
+        "file".to_string(),
+        VarDef::string(255, first.to_str().unwrap().to_string()),
+    );
+    let variables = std::sync::Arc::new(Mutex::new(Variables::new(defs, &Defaults::default())));
+    runner.set_variables(variables.clone());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text", "params": "$file" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    let first_image = mock.last_image(0).expect("the first text should render");
+
+    variables
+        .lock()
+        .unwrap()
+        .store_mut()
+        .set("file", VarValue::Str(second.to_str().unwrap().to_string()));
+    runner.refresh_button(1).await.unwrap();
+    let second_image = mock.last_image(0).expect("the second text should render");
+
+    assert_ne!(
+        first_image.to_rgb8().into_raw(),
+        second_image.to_rgb8().into_raw(),
+        "the refresh should have re-resolved the params from the new variable value"
+    );
+
+    let _ = std::fs::remove_file(&first);
+    let _ = std::fs::remove_file(&second);
+}
+
+/// A `text_value` entry renders its expanded text directly - no file or program - and a
+/// refresh re-resolves it from the current variable values.
+#[tokio::test]
+async fn text_value_renders_and_refreshes_from_variables() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("name".to_string(), VarDef::string(20, "one".to_string()));
+    let variables = std::sync::Arc::new(Mutex::new(Variables::new(defs, &Defaults::default())));
+    runner.set_variables(variables.clone());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "n=$name" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert_eq!(mock.kinds(&mock.calls()), ["SetImage", "Flush"]);
+    let first = mock.last_image(0).expect("the value should render");
+
+    variables
+        .lock()
+        .unwrap()
+        .store_mut()
+        .set("name", VarValue::Str("two".to_string()));
+    runner.refresh_button(1).await.unwrap();
+    let second = mock.last_image(0).expect("the value should re-render");
+
+    assert_ne!(
+        first.to_rgb8().into_raw(),
+        second.to_rgb8().into_raw(),
+        "the refresh should have re-resolved the value text"
+    );
 }

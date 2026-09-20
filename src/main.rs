@@ -24,6 +24,7 @@ use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
+use dak::variables::{VarValue, Variables};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
 #[derive(Debug, Parser)]
@@ -149,6 +150,12 @@ async fn main() -> Result<(), MirajazzError> {
     // Drive every present device, each on its own task with its own input loop, scene
     // state and timer. Ctrl-C reaches every loop, so every device runs its cleanup.
     let mut handles = Vec::new();
+    // One variable/default state shared by every device: the declarations are global, so
+    // an assignment from one device's input is visible to all of them.
+    let variables = Arc::new(std::sync::Mutex::new(Variables::new(
+        config.variables.clone(),
+        &config.defaults,
+    )));
     for (device_number, definition, device_info) in assignments {
         let scenes = config.scenes.clone();
         handles.push(tokio::spawn(run_device(
@@ -158,6 +165,7 @@ async fn main() -> Result<(), MirajazzError> {
             scenes,
             log,
             config.defaults,
+            variables.clone(),
         )));
     }
     for handle in handles {
@@ -190,6 +198,7 @@ async fn run_device(
     scenes: Value,
     log: Log,
     defaults: Defaults,
+    variables: Arc<std::sync::Mutex<Variables>>,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -310,6 +319,9 @@ async fn run_device(
         log,
         &screenless_buttons,
     );
+    // Setup params are expanded against the shared variable state, re-resolved on every
+    // refresh tick (see `SceneRunner::set_variables`).
+    runner.set_variables(variables.clone());
 
     // Complex press events (short/long press, double click): the detector decides
     // which event each press or release produces. Widgets are addressed by their
@@ -338,7 +350,8 @@ async fn run_device(
     // Timer events are delivered through a channel so the input loop can react to
     // them without blocking on the device reader.
     let (timer_tx, mut timer_rx) = mpsc::channel::<Vec<String>>(1);
-    let mut timer_handle = arm_scene_timer(&current_scene, &scenes, &timer_tx, log).await;
+    let mut timer_handle =
+        arm_scene_timer(&current_scene, &scenes, &timer_tx, log, &variables).await;
 
     // Actions are inherited from the previously active scene (see `action_for_event`),
     // so the scene we came from is remembered across scene switches.
@@ -399,6 +412,7 @@ async fn run_device(
                             defaults,
                             &mut timer_handle,
                             &timer_tx,
+                            &variables,
                         )
                         .await;
                     }
@@ -426,6 +440,7 @@ async fn run_device(
                             defaults,
                             &mut timer_handle,
                             &timer_tx,
+                            &variables,
                         )
                         .await;
                     }
@@ -451,6 +466,7 @@ async fn run_device(
                             event,
                             &mut timer_handle,
                             &timer_tx,
+                            &variables,
                         )
                         .await;
                     }
@@ -474,6 +490,7 @@ async fn run_device(
                     &actions,
                     &mut timer_handle,
                     &timer_tx,
+                    &variables,
                 )
                 .await;
             }
@@ -500,6 +517,7 @@ async fn run_device(
                             "short_press",
                             &mut timer_handle,
                             &timer_tx,
+                            &variables,
                         )
                         .await;
                     }
@@ -509,7 +527,12 @@ async fn run_device(
                 let Some(event) = event else {
                     break;
                 };
-                runner.handle_exec_event(event).await;
+                match event {
+                    actions::ExecEvent::Assignment(completed) => {
+                        apply_completed_assignment(completed, &variables, &mut runner, log).await;
+                    }
+                    event => runner.handle_exec_event(event).await,
+                }
             }
             key = refresh_rx.recv() => {
                 let Some(key) = key else {
@@ -579,6 +602,7 @@ async fn run_bound_action<D: actions::ButtonDevice>(
     event: &str,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
     let actions = actions::action_for_event(
         current_scene,
@@ -605,6 +629,7 @@ async fn run_bound_action<D: actions::ButtonDevice>(
         &actions,
         timer_handle,
         timer_tx,
+        variables,
     )
     .await;
 }
@@ -636,6 +661,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
     defaults: Defaults,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
     if pressed && !down_controls.contains(reference) {
         down_controls.insert(*reference);
@@ -660,6 +686,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
             "pressed",
             timer_handle,
             timer_tx,
+            variables,
         )
         .await;
     } else if !pressed && down_controls.contains(reference) {
@@ -676,6 +703,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
             "released",
             timer_handle,
             timer_tx,
+            variables,
         )
         .await;
 
@@ -695,6 +723,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
                     "double_click",
                     timer_handle,
                     timer_tx,
+                    variables,
                 )
                 .await;
             }
@@ -713,6 +742,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
                     "long_press",
                     timer_handle,
                     timer_tx,
+                    variables,
                 )
                 .await;
             }
@@ -758,8 +788,23 @@ async fn run_action<D: actions::ButtonDevice>(
     action_value: &str,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
-    match actions::parse_action(action_value) {
+    // References are expanded for every action except an assignment (whose left-hand
+    // side is a target, not a value); an assignment's own right-hand side is resolved
+    // when it is applied.
+    let resolved = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        actions::resolve_action(action_value, &state)
+    };
+    let resolved = match resolved {
+        Ok(action) => action,
+        Err(error) => {
+            log.error(format!("action \"{action_value}\": {error}"));
+            return;
+        }
+    };
+    match resolved {
         Action::Stay => {
             log.debug(
                 Subsystem::Actions,
@@ -770,13 +815,21 @@ async fn run_action<D: actions::ButtonDevice>(
                     "failed to refresh scene \"{current_scene}\": {error}"
                 ));
             }
-            rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
+            rearm_scene_timer(
+                &*current_scene,
+                scenes,
+                timer_handle,
+                timer_tx,
+                log,
+                variables,
+            )
+            .await;
         }
         Action::Command { command } => {
             // Commands run on their own task so a running program never blocks the
             // device input loop or the scene timer, and they are not awaited inline.
             log.debug(Subsystem::Actions, format!("run command \"{command}\""));
-            match actions::parse_command_line(&command) {
+            match actions::build_command(&command) {
                 Ok(spec) => {
                     let display = spec.display();
                     tokio::spawn(async move {
@@ -805,24 +858,120 @@ async fn run_action<D: actions::ButtonDevice>(
             if let Err(error) = runner.enter_scene(&scene, scenes).await {
                 log.warn(format!("failed to enter scene \"{scene}\": {error}"));
             }
-            rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
+            rearm_scene_timer(
+                &*current_scene,
+                scenes,
+                timer_handle,
+                timer_tx,
+                log,
+                variables,
+            )
+            .await;
         }
-        Action::SetConfig { param, value } => {
-            log.debug(
-                Subsystem::Actions,
-                format!("set {} to {value}", param.path()),
-            );
-            let result = match param {
-                actions::SettableDefault::ButtonBrightness => {
-                    runner.set_button_brightness(value).await
-                }
-                actions::SettableDefault::EncoderBrightness => {
-                    runner.set_encoder_brightness(value).await
-                }
-            };
-            if let Err(error) = result {
-                log.warn(format!("failed to set {}: {error}", param.path()));
+        Action::Assign { target, op, rhs } => {
+            if let actions::AssignRhs::Command(inner) = &rhs {
+                log.debug(
+                    Subsystem::Actions,
+                    format!("assign from command \"{inner}\""),
+                );
+                // One its own task so the program never blocks the input loop and
+                // sibling actions run in parallel; the result arrives via the exec
+                // channel and is applied by the loop below.
+                actions::start_command_assignment(
+                    target,
+                    op,
+                    inner,
+                    variables,
+                    runner.tracker.sender(),
+                    log,
+                );
+                return;
             }
+            let label = match &target {
+                actions::AssignTarget::Variable(name) => format!("${name}"),
+                actions::AssignTarget::Default(param) => param.path().to_string(),
+            };
+            log.debug(Subsystem::Actions, format!("assign {label}"));
+            // A literal was already range-checked (and warned about) at load time; a
+            // variable's value is only known now, so report clamping it here.
+            let warn = !matches!(rhs, actions::AssignRhs::Int(_) | actions::AssignRhs::Str(_));
+            let side_effect = {
+                let mut state = variables.lock().expect("variables mutex poisoned");
+                actions::apply_assignment(&target, op, &rhs, &mut state, warn, log)
+            };
+            if let Some((param, value)) = side_effect {
+                let result = match param {
+                    actions::SettableDefault::ButtonBrightness => {
+                        runner.set_button_brightness(value as u8).await
+                    }
+                    actions::SettableDefault::EncoderBrightness => {
+                        runner.set_encoder_brightness(value as u8).await
+                    }
+                };
+                if let Err(error) = result {
+                    log.warn(format!("failed to set {}: {error}", param.path()));
+                }
+            }
+        }
+    }
+}
+
+/// Applies a finished command-substitution assignment: stores the converted value and,
+/// for a writable default, pushes the new brightness to the device.
+///
+/// Called by the input loop, which owns both the shared variable state and the device;
+/// the spawned command task only reports the already-converted result.
+async fn apply_completed_assignment<D: actions::ButtonDevice>(
+    completed: actions::CompletedAssign,
+    variables: &Arc<std::sync::Mutex<Variables>>,
+    runner: &mut actions::SceneRunner<'_, D>,
+    log: Log,
+) {
+    let value = match completed.outcome {
+        Ok(value) => value,
+        Err(error) => {
+            log.error(error);
+            return;
+        }
+    };
+
+    let side_effect = match &completed.target {
+        actions::AssignTarget::Variable(name) => {
+            variables
+                .lock()
+                .expect("variables mutex poisoned")
+                .store_mut()
+                .set(name, value);
+            None
+        }
+        actions::AssignTarget::Default(param) => {
+            let VarValue::Int(number) = value else {
+                log.error(format!(
+                    "assignment to {} produced a non-numeric value",
+                    param.path()
+                ));
+                return;
+            };
+            let mut state = variables.lock().expect("variables mutex poisoned");
+            match param {
+                actions::SettableDefault::ButtonBrightness => state.set_button_brightness(number),
+                actions::SettableDefault::EncoderBrightness => state.set_encoder_brightness(number),
+            }
+            Some((*param, number))
+        }
+    };
+
+    if let Some((param, number)) = side_effect {
+        let result = match param {
+            actions::SettableDefault::ButtonBrightness => {
+                runner.set_button_brightness(number as u8).await
+            }
+            actions::SettableDefault::EncoderBrightness => {
+                runner.set_encoder_brightness(number as u8).await
+            }
+        };
+        if let Err(error) = result {
+            log.warn(format!("failed to set {}: {error}", param.path()));
         }
     }
 }
@@ -846,6 +995,7 @@ async fn run_actions<D: actions::ButtonDevice>(
     actions: &[&str],
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
     for action in actions {
         run_action(
@@ -857,6 +1007,7 @@ async fn run_actions<D: actions::ButtonDevice>(
             action,
             timer_handle,
             timer_tx,
+            variables,
         )
         .await;
     }
@@ -871,9 +1022,14 @@ async fn arm_scene_timer(
     scenes: &Value,
     timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    match actions::timer_for_scene(scene_name, scenes) {
-        Some((seconds, actions)) => {
+    let timer = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        actions::timer_for_scene_with(scene_name, scenes, &state)
+    };
+    match timer {
+        Ok(Some((seconds, actions))) => {
             log.debug(
                 Subsystem::Scene,
                 format!("armed timer for scene \"{scene_name}\": {seconds}s -> {actions:?}"),
@@ -885,7 +1041,11 @@ async fn arm_scene_timer(
                 let _ = tx.send(actions).await;
             }))
         }
-        None => None,
+        Ok(None) => None,
+        Err(error) => {
+            log.error(error);
+            None
+        }
     }
 }
 
@@ -896,11 +1056,12 @@ async fn rearm_scene_timer(
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
     if let Some(handle) = timer_handle.take() {
         handle.abort();
     }
-    *timer_handle = arm_scene_timer(scene_name, scenes, timer_tx, log).await;
+    *timer_handle = arm_scene_timer(scene_name, scenes, timer_tx, log, variables).await;
 }
 
 /// Builds the `-d device` lines printed when a device is found, one per
@@ -962,7 +1123,7 @@ mod tests {
     use dak::hardware;
     use dak::log::Log;
 
-    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference};
+    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference, VarValue, Variables};
 
     /// A tiny recording keypad for the dispatch-layer tests: scene `setup` operations
     /// that reach the device are recorded so a test can see which scene was applied.
@@ -1096,6 +1257,14 @@ mod tests {
         )
     }
 
+    /// An empty shared variable state for tests that do not declare variables.
+    fn test_variables() -> std::sync::Arc<std::sync::Mutex<Variables>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            std::collections::BTreeMap::new(),
+            &Defaults::default(),
+        )))
+    }
+
     /// The shared state one device's input loop owns between events: the down-control
     /// set, the shared click detector and its pending short-press confirmations, and
     /// the timer plumbing. Mirrors the locals of `run_device`.
@@ -1108,6 +1277,8 @@ mod tests {
         timer_handle: Option<tokio::task::JoinHandle<()>>,
         timer_tx: mpsc::Sender<Vec<String>>,
         defaults: Defaults,
+        /// The shared variable/default state; most tests never assign, so it starts empty.
+        variables: std::sync::Arc<std::sync::Mutex<Variables>>,
     }
 
     impl EdgeState {
@@ -1124,6 +1295,10 @@ mod tests {
                 timer_handle: None,
                 timer_tx,
                 defaults,
+                variables: std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+                    std::collections::BTreeMap::new(),
+                    &defaults,
+                ))),
             }
         }
 
@@ -1173,6 +1348,7 @@ mod tests {
             state.defaults,
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
     }
@@ -1368,14 +1544,20 @@ mod tests {
             "Main": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, _rx) = mpsc::channel(1);
+        assert!(super::arm_scene_timer(
+            "on_start",
+            &scenes,
+            &tx,
+            Log::default(),
+            &test_variables()
+        )
+        .await
+        .is_none());
         assert!(
-            super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
+            super::arm_scene_timer("Main", &scenes, &tx, Log::default(), &test_variables())
                 .await
-                .is_none()
+                .is_some()
         );
-        assert!(super::arm_scene_timer("Main", &scenes, &tx, Log::default())
-            .await
-            .is_some());
     }
 
     /// An armed timer fires after its configured seconds and delivers the action
@@ -1386,9 +1568,10 @@ mod tests {
             "on_start": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, mut rx) = mpsc::channel(1);
-        let handle = super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
-            .await
-            .expect("scene has a timer");
+        let handle =
+            super::arm_scene_timer("on_start", &scenes, &tx, Log::default(), &test_variables())
+                .await
+                .expect("scene has a timer");
         handle.await.unwrap();
         assert_eq!(rx.recv().await, Some(vec!["@Main".to_string()]));
     }
@@ -1402,10 +1585,19 @@ mod tests {
             "Main": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, mut rx) = mpsc::channel(1);
-        let mut handle = super::arm_scene_timer("Main", &scenes, &tx, Log::default()).await;
+        let mut handle =
+            super::arm_scene_timer("Main", &scenes, &tx, Log::default(), &test_variables()).await;
         assert!(handle.is_some());
 
-        super::rearm_scene_timer("on_start", &scenes, &mut handle, &tx, Log::default()).await;
+        super::rearm_scene_timer(
+            "on_start",
+            &scenes,
+            &mut handle,
+            &tx,
+            Log::default(),
+            &test_variables(),
+        )
+        .await;
         assert!(handle.is_none(), "a scene without a timer arms nothing");
 
         let late = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await;
@@ -1437,6 +1629,7 @@ mod tests {
             "@",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1469,6 +1662,7 @@ mod tests {
             "true",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
         super::run_action(
@@ -1480,6 +1674,7 @@ mod tests {
             "/bin/echo 'unbalanced",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1513,6 +1708,7 @@ mod tests {
             "@Test",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1547,6 +1743,7 @@ mod tests {
             "@",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
         let _ = std::fs::remove_file(&path);
@@ -1581,6 +1778,7 @@ mod tests {
             "@",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1618,6 +1816,7 @@ mod tests {
             "$defaults.button_brightness := 80",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1647,6 +1846,7 @@ mod tests {
             "$defaults.encoder_brightness := 15",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1677,6 +1877,7 @@ mod tests {
             "$defaults.button_brightness := 80",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1714,6 +1915,7 @@ mod tests {
             "$defaults.encoder_brightness := 15",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1747,6 +1949,7 @@ mod tests {
             "$defaults.button_brightness := 200",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1777,6 +1980,7 @@ mod tests {
             "$defaults.button_brightness := -10",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1784,6 +1988,181 @@ mod tests {
         assert_eq!(mock.last_button_brightness(), Some(0));
         assert_eq!(current_scene, "on_start");
         assert!(previous_scene.is_none());
+    }
+
+    /// A variable assignment updates the shared store through the dispatch layer (`~=`
+    /// clamps silently, `=` rejects an out-of-range value) and never touches the device.
+    #[tokio::test]
+    async fn run_action_assigns_variables() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), dak::variables::VarDef::int(0, 10, 5));
+        state.variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$count ~= 100",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(
+            state.variables.lock().unwrap().store().get("count"),
+            Some(&dak::variables::VarValue::Int(10)),
+            "~= clamps the value silently"
+        );
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$count = 100",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(
+            state.variables.lock().unwrap().store().get("count"),
+            Some(&dak::variables::VarValue::Int(10)),
+            "a strict out-of-range assignment is rejected, leaving the value unchanged"
+        );
+        assert!(
+            mock.calls().is_empty(),
+            "a variable assignment touches no device"
+        );
+    }
+
+    /// A `$(command)` assignment runs on its own task and reports its converted value
+    /// through the exec channel; applying it updates the store (variable target) or the
+    /// device (default target).
+    #[tokio::test]
+    async fn command_substitution_assignment_reports_and_applies() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), dak::variables::VarDef::int(0, 100, 5));
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+
+        dak::actions::start_command_assignment(
+            dak::actions::AssignTarget::Variable("count".to_string()),
+            dak::actions::AssignOp::ClampWarn,
+            "echo 42",
+            &variables,
+            tx.clone(),
+            Log::default(),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a command-substitution result should arrive")
+            .expect("the exec channel must not close");
+        match event {
+            dak::actions::ExecEvent::Assignment(completed) => {
+                super::apply_completed_assignment(
+                    completed,
+                    &variables,
+                    &mut runner,
+                    Log::default(),
+                )
+                .await;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(
+            variables.lock().unwrap().store().get("count"),
+            Some(&VarValue::Int(42))
+        );
+
+        dak::actions::start_command_assignment(
+            dak::actions::AssignTarget::Default(dak::actions::SettableDefault::ButtonBrightness),
+            dak::actions::AssignOp::ClampWarn,
+            "echo 77",
+            &variables,
+            tx,
+            Log::default(),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            dak::actions::ExecEvent::Assignment(completed) => {
+                super::apply_completed_assignment(
+                    completed,
+                    &variables,
+                    &mut runner,
+                    Log::default(),
+                )
+                .await;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(variables.lock().unwrap().button_brightness(), 77);
+        assert_eq!(mock.last_button_brightness(), Some(77));
+    }
+
+    /// A failed command assignment is logged and leaves the target unchanged, and a
+    /// non-numeric value for a default target is ignored rather than pushed to the device.
+    #[tokio::test]
+    async fn apply_completed_assignment_handles_failure_and_wrong_type() {
+        use dak::actions::{AssignTarget, CompletedAssign, SettableDefault};
+
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), dak::variables::VarDef::int(0, 100, 5));
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Variable("count".to_string()),
+                outcome: Err("command failed".to_string()),
+            },
+            &variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+        assert_eq!(
+            variables.lock().unwrap().store().get("count"),
+            Some(&VarValue::Int(5)),
+            "a failed assignment leaves the variable unchanged"
+        );
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::ButtonBrightness),
+                outcome: Ok(VarValue::Str("nope".to_string())),
+            },
+            &variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+        assert_eq!(mock.last_button_brightness(), None);
+        assert!(mock.calls().is_empty(), "nothing should reach the device");
     }
 
     /// A `$defaults.encoder_brightness := 200` action that exceeds the valid range
@@ -1807,6 +2186,7 @@ mod tests {
             "$defaults.encoder_brightness := 200",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1838,6 +2218,7 @@ mod tests {
             "$defaults.encoder_brightness := -10",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1869,6 +2250,7 @@ mod tests {
             "false",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1906,6 +2288,7 @@ mod tests {
             "sleep 10",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1924,6 +2307,7 @@ mod tests {
             "@Test",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1953,6 +2337,7 @@ mod tests {
             "/bin/sh -c 'hello",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -1990,6 +2375,7 @@ mod tests {
             "@Test",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 
@@ -2030,6 +2416,7 @@ mod tests {
             "@",
             &mut state.timer_handle,
             &state.timer_tx,
+            &state.variables,
         )
         .await;
 

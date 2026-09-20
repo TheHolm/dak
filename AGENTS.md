@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.9.0 (declared as `0.9.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.10.0 (declared as `0.10.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -41,6 +41,9 @@ under other platforms.
 
 - `src/main.rs` — device discovery, connection setup, image upload, input loop
 - `src/actions.rs` — config loading and scene/action handling
+- `src/variables.rs` — declared variables and their validation, `$` reference
+  expansion/substitution, and the runtime variable/default state
+  (`VariableStore`/`Variables`) shared by every device
 - `src/baseplane.rs` — device addressing: the `Reference`/`Kind` model (device N,
   button B, encoder E) that scene configs and control references use
 - `src/press.rs` — complex press-event detection: turns a button's raw
@@ -59,6 +62,7 @@ under other platforms.
 - `config.json` — the user's own runtime config (gitignored, not checked in):
   scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `config.json.example` — checked-in template new users copy to `config.json`
+- `examples/` — complete, copyable example configs, indexed by `examples/EXAMPLES.md`
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
 - `INSTALL.md` — building from source (both platforms, plus a FreeBSD-specific

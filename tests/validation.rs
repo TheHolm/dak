@@ -6,8 +6,9 @@ use dak::actions::{load_config, load_config_from_path};
 
 use crate::common::{
     assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
-    write_scenes_config, write_temp_config, SetHome, ENV_LOCK,
+    write_scenes_config, write_temp_config, write_variables_config, SetHome, ENV_LOCK,
 };
+use dak::variables::{VarDef, VarValue};
 use std::os::unix::fs::PermissionsExt;
 
 /// A minimal valid config loads successfully.
@@ -64,6 +65,23 @@ fn comment_markers_inside_strings_are_not_comments() {
 fn load_config_reads_repo_config_json() {
     let config = load_config();
     assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// Every JSON file under `examples/` is a complete config that loads and validates.
+#[test]
+fn example_configs_load() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("the examples directory should exist") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let config = load_config_from_path(path.to_str().unwrap());
+        assert!(config.is_ok(), "{}: {:?}", path.display(), config.err());
+        checked += 1;
+    }
+    assert!(checked >= 1, "expected at least one example config");
 }
 
 /// Malformed JSON is rejected with line and column information.
@@ -1235,22 +1253,144 @@ fn in_range_set_config_value_has_no_clamp_warning() {
     );
 }
 
-/// The `=` and `~=` assignment operators are recognized (not "malformed") but rejected
-/// with a distinct "not implemented yet" error, pointing at `:=` as the alternative -
-/// see the README's TODO entry for their planned future behavior.
+/// All three assignment operators are implemented for `defaults` targets: `:=` clamps
+/// with a warning, `~=` clamps silently, and `=` accepts an in-range value but rejects
+/// an out-of-range one.
 #[test]
-fn rejects_not_yet_implemented_assignment_operators() {
-    for (value, operator) in [
-        ("$defaults.button_brightness = 80", "\"=\""),
-        ("$defaults.button_brightness ~= 80", "\"~=\""),
+fn assignment_operators_are_all_implemented_for_defaults() {
+    for value in [
+        "$defaults.button_brightness := 200", // clamps, warns
+        "$defaults.button_brightness ~= 200", // clamps, silent
+        "$defaults.button_brightness = 80",   // in range
     ] {
-        assert_validation_error(
-            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{value}"}}}}}}}}"#),
-            &format!(
-                "uses {operator} on \"defaults.button_brightness\", which is not implemented yet"
-            ),
+        let path = write_scenes_config(&format!(
+            r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{value}"}}}}}}}}"#
+        ));
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(config.is_ok(), "{value}: {:?}", config.err());
+    }
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness ~= 200"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !config
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("clamped")),
+        "~= clamps silently"
+    );
+
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness = 200"}}}}"#,
+        "outside 0..=100",
+    );
+}
+
+/// Variable assignments are type-checked and, for literals, range-checked at load time:
+/// `:=` clamps with a warning, `=` rejects an out-of-range value, and wrong-type or
+/// undefined right-hand sides are hard errors.
+#[test]
+fn validates_variable_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 10, "value": 5}, "name": {"type": "str", "max_length": 3, "value": "abc"}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": ["$count := 7", "$name := \"hi\"", "$count := $count"]}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := 100"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        config
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("out of range 0-10")),
+        ":= clamps an out-of-range variable value with a warning"
+    );
+
+    for (action, expected) in [
+        ("$count = 100", "outside 0..=10"),
+        ("$count := \"x\"", "int variable"),
+        ("$name := 5", "string variable"),
+        ("$count := $name", "which is a string"),
+        ("$missing := 5", "sets undefined variable"),
+    ] {
+        let escaped = action.replace('"', "\\\"");
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{escaped}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "{action}: expected {expected:?}, got: {errors}"
         );
     }
+}
+
+/// A `$(command)` right-hand side loads, its internal references are validated, and an
+/// empty or nested substitution is rejected as malformed.
+#[test]
+fn validates_command_substitution_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 100, "value": 5}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := $(echo $count)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    for (action, expected) in [
+        ("$count := $(echo $missing)", "undefined variable"),
+        ("$count := $(echo $(echo 1))", "malformed"),
+    ] {
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{action}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains(expected), "{action}: {errors}");
+    }
+}
+
+/// A `$(command)` right-hand side whose literal program does not exist is warned about
+/// (not rejected), matching how command actions and exec params are checked.
+#[test]
+fn warns_on_missing_command_substitution_program() {
+    let path = write_variables_config(
+        r#"{"count": {"type": "int", "min": 0, "max": 10, "value": 1}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := $(definitely-not-a-real-program-xyz)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("program not found")),
+        "{:?}",
+        config.warnings
+    );
 }
 
 /// A malformed `$`-assignment (no assignment operator at all) is rejected with its own
@@ -1319,4 +1459,198 @@ fn tilde_path_in_exec_program_resolves_against_home() {
         "{:?}",
         config.warnings
     );
+}
+
+// -- variables section --
+
+/// A valid `variables` section loads and its declarations carry the right type,
+/// constraints and initial value.
+#[test]
+fn loads_variables_section() {
+    let path = write_variables_config(
+        r#"{
+            "count": { "type": "int", "min": 0, "max": 10, "value": 3 },
+            "name": { "type": "str", "max_length": 5, "value": "Bob" }
+        }"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+
+    assert_eq!(config.variables["count"], VarDef::int(0, 10, 3));
+    assert_eq!(
+        config.variables["name"],
+        VarDef::string(5, "Bob".to_string())
+    );
+    assert_eq!(config.variables["count"].initial, VarValue::Int(3));
+}
+
+/// A config without a `variables` section still loads, with an empty declaration map.
+#[test]
+fn variables_section_is_optional() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.unwrap().variables.is_empty());
+}
+
+/// Invalid variable declarations are reported (as hard errors) and the config is
+/// rejected as a whole.
+#[test]
+fn rejects_invalid_variable_declarations() {
+    for (variables, expected) in [
+        (r#"{"1a": {"type": "int"}}"#, "invalid variable name"),
+        (r#"{"a": 5}"#, "must be an object"),
+        (r#"{"a": {"value": 1}}"#, "\"type\" must be a string"),
+        (r#"{"a": {"type": "bool"}}"#, "unknown type"),
+        (r#"{"a": {"type": "int", "bogus": 1}}"#, "unknown key"),
+        (
+            r#"{"a": {"type": "int", "max_length": 3}}"#,
+            "only valid for a \"str\"",
+        ),
+        (
+            r#"{"a": {"type": "str", "min": 1}}"#,
+            "only valid for an \"int\"",
+        ),
+        (
+            r#"{"a": {"type": "int", "min": 5, "max": 1}}"#,
+            "greater than",
+        ),
+        (
+            r#"{"a": {"type": "int", "min": 0, "max": 10, "value": 11}}"#,
+            "outside the declared range",
+        ),
+        (
+            r#"{"a": {"type": "str", "max_length": 2, "value": "abc"}}"#,
+            "longer than",
+        ),
+    ] {
+        let path = write_variables_config(variables, r#"{"on_start": {"actions": {}}}"#);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "expected errors to contain {expected:?}, got: {errors}"
+        );
+    }
+}
+
+// -- variable references in scenes --
+
+/// Declared variables may be referenced from setup params and action commands; a dynamic
+/// image path suppresses the literal file-existence warning.
+#[test]
+fn accepts_references_to_declared_variables() {
+    let path = write_variables_config(
+        r#"{"name": {"type": "str", "value": "Bob"}, "count": {"type": "int", "value": 3}}"#,
+        r#"{
+            "on_start": {
+                "setup": { "1b01": { "type": "image", "params": "/tmp/$name.png" } },
+                "actions": { "1b02": { "pressed": "/bin/echo $count $name" } }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(
+        !config.warnings.iter().any(|w| w.contains("file not found")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// An undeclared reference anywhere in a scene is a hard error naming the variable.
+#[test]
+fn rejects_undefined_variable_references() {
+    for scenes in [
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/$missing.png"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $missing"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "@$missing"}}}}"#,
+    ] {
+        let path = write_variables_config(r#"{}"#, scenes);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains("undefined variable"), "{errors}");
+    }
+}
+
+/// A malformed `$` reference (not followed by a name) is a hard error.
+#[test]
+fn rejects_malformed_variable_reference() {
+    let path = write_variables_config(
+        r#"{"x": {"type": "int", "value": 1}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $ x"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("must be followed by a variable name"),
+        "{errors}"
+    );
+}
+
+/// Read-only `$defaults.*` constants may be read (e.g. from a command) even though they
+/// cannot be assigned.
+#[test]
+fn allows_reading_read_only_defaults() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $defaults.short_press_duration"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A `text_value` setup entry accepts its params as display text (references included),
+/// and rejects empty params.
+#[test]
+fn validates_text_value_setup_entries() {
+    let path = write_variables_config(
+        r#"{"name": {"type": "str", "value": "Bob"}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": "Hello $name", "refresh": 1}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": ""}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("text_value params must be text"),
+        "{errors}"
+    );
+}
+
+/// A timer key may be an int variable reference.
+#[test]
+fn timer_key_may_reference_an_int_variable() {
+    let path = write_variables_config(
+        r#"{"period": {"type": "int", "min": 1, "value": 5}}"#,
+        r#"{"on_start": {"actions": {"timer": {"$period": "@"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A timer key referencing a non-int variable is rejected.
+#[test]
+fn timer_key_rejects_non_int_variable() {
+    let path = write_variables_config(
+        r#"{"period": {"type": "str", "value": "5"}}"#,
+        r#"{"on_start": {"actions": {"timer": {"$period": "@"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("timer seconds must be an int"), "{errors}");
 }

@@ -1,6 +1,6 @@
 [package]
 name = "dak"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"

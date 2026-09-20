@@ -23,3 +23,4 @@ pub mod log;
 pub mod map;
 pub mod press;
 pub mod text;
+pub mod variables;
