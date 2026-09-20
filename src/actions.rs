@@ -2,6 +2,7 @@ use serde_json::{self, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::baseplane::{Kind, Reference};
@@ -10,7 +11,7 @@ use crate::map::Mapping;
 use crate::press::Defaults;
 use crate::variables::{
     check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
-    VarRef, VarType, Variables,
+    VarRef, VarType, VarValue, Variables,
 };
 use image::DynamicImage;
 use mirajazz::device::Device;
@@ -659,16 +660,19 @@ fn check_button_op(
                     "scene \"{scene_name}\": {location} {kind} params must be a program command line"
                 ));
             } else {
-                match parse_command_line(params) {
-                    Ok(command) => {
-                        // The program itself may be a reference resolved only at runtime;
-                        // only check a literal program path.
-                        if matches!(references_in(&command.program), Ok(refs) if refs.is_empty()) {
-                            check_executable(scene_name, &location, &command.program, warnings);
+                if !command_needs_shell(params) {
+                    match parse_command_line(params) {
+                        Ok(command) => {
+                            // The program itself may be a reference resolved only at
+                            // runtime; only check a literal program path.
+                            if matches!(references_in(&command.program), Ok(refs) if refs.is_empty())
+                            {
+                                check_executable(scene_name, &location, &command.program, warnings);
+                            }
                         }
-                    }
-                    Err(error) => {
-                        errors.push(format!("scene \"{scene_name}\": {location}: {error}"))
+                        Err(error) => {
+                            errors.push(format!("scene \"{scene_name}\": {location}: {error}"))
+                        }
                     }
                 }
             }
@@ -884,9 +888,10 @@ fn check_action_value(
         return;
     }
 
-    // A command's executable is only checkable when it is not built from references.
+    // A command's executable is only checkable when it is not built from references and
+    // does not use a shell.
     let refs = check_references(scene_name, path, value, variables, errors);
-    if refs.is_empty() {
+    if refs.is_empty() && !command_needs_shell(value) {
         let executable = value.split_whitespace().next().unwrap_or_default();
         if !executable.is_empty() {
             check_executable(scene_name, path, executable, warnings);
@@ -1013,6 +1018,29 @@ fn check_variable_assignment(
             )),
             Some(_) => {}
         },
+        AssignRhs::Command(inner) => {
+            validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
+        }
+    }
+}
+
+/// Validates a `$(command)` right-hand side: every reference inside it must resolve, and
+/// a literal program that needs no shell is checked for existence. The output's type is
+/// only known at action time, so no range/type check happens here.
+fn validate_command_rhs(
+    scene_name: &str,
+    path: &str,
+    inner: &str,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let refs = check_references(scene_name, path, inner, variables, errors);
+    if refs.is_empty() && !command_needs_shell(inner) {
+        match parse_command_line(inner) {
+            Ok(command) => check_executable(scene_name, path, &command.program, warnings),
+            Err(error) => errors.push(format!("scene \"{scene_name}\": {path}: {error}")),
+        }
     }
 }
 
@@ -1046,6 +1074,9 @@ fn check_default_assignment(
                 "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a string, but it requires a number"
             )),
         },
+        AssignRhs::Command(inner) => {
+            validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
+        }
     }
 }
 
@@ -1380,8 +1411,7 @@ fn params_command(
             "scene \"{scene_name}\": key \"{key}\": {kind} params must be a program command line"
         ));
     }
-    parse_command_line(params)
-        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+    build_command(params).map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
 }
 
 /// Splits a whitespace-separated command line into a program and its arguments.
@@ -1439,6 +1469,50 @@ pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
         program: expand_tilde(&words.next().unwrap()),
         args: words.map(|arg| expand_tilde(&arg)).collect(),
     })
+}
+
+/// Whether an already-expanded command line needs a shell to run: it contains an
+/// unquoted shell operator (`|`, `&`, `;`, `<`, `>`, a backtick or parentheses) or a
+/// newline.
+///
+/// Operators inside single or double quotes are literal (so `/bin/sh -c 'a | b'` runs
+/// `sh` directly, for example), and a backslash escapes the next character outside
+/// quotes, exactly as [`parse_command_line`] treats them. A command without any operator
+/// runs directly, so no shell is involved.
+pub fn command_needs_shell(text: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '\\' => {
+                chars.next();
+            }
+            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Builds the command to run for an already-expanded command line: `sh -c "<text>"` when
+/// the line contains shell syntax (so pipes and redirection work), or a direct
+/// [`parse_command_line`] program plus arguments otherwise.
+pub fn build_command(text: &str) -> Result<CommandSpec, String> {
+    if command_needs_shell(text) {
+        Ok(CommandSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), text.to_string()],
+        })
+    } else {
+        parse_command_line(text)
+    }
 }
 
 /// How long an async `text_exec`/`image_exec` program may run before it is killed.
@@ -2044,6 +2118,11 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         .error(format!("button {key}: failed to draw error label: {error}"));
                 }
             }
+            ExecEvent::Assignment(_) => {
+                // Command-substitution assignments need the shared variable state and
+                // the device, so the input loop applies them itself (see `run_device`);
+                // this method only handles per-button results.
+            }
         }
     }
 
@@ -2207,6 +2286,16 @@ pub enum ExecOutputKind {
     Image,
 }
 
+/// A command-substitution assignment whose program has finished, ready to be applied by
+/// the input loop (which owns the shared state and the device).
+#[derive(Debug, PartialEq)]
+pub struct CompletedAssign {
+    /// The assignment's target.
+    pub target: AssignTarget,
+    /// The converted value, or a description of why a strict assignment failed.
+    pub outcome: Result<VarValue, String>,
+}
+
 /// Outcome reported by a spawned `exec` task once its program finished or failed.
 #[derive(Debug, PartialEq)]
 pub enum ExecEvent {
@@ -2230,6 +2319,10 @@ pub enum ExecEvent {
         /// Human-readable description of what went wrong.
         error: String,
     },
+    /// A command-substitution assignment finished; see [`CompletedAssign`]. The input
+    /// loop intercepts this before [`SceneRunner::handle_exec_event`], which only deals
+    /// with per-button results.
+    Assignment(CompletedAssign),
 }
 
 /// Spawns an asynchronous task that runs `command`, enforcing [`EXEC_TIMEOUT`].
@@ -2474,6 +2567,10 @@ pub enum AssignRhs {
     Str(String),
     /// Another variable, read at action time.
     Variable(VarRef),
+    /// A `$(command)` substitution: the command runs at action time and its output is
+    /// converted to the target's type. Kept unexpanded, since references inside it are
+    /// resolved when the action fires.
+    Command(String),
 }
 
 /// The assignment operator of a `$target <op> value` action.
@@ -2574,6 +2671,17 @@ fn parse_assignment(value: &str) -> Option<(String, AssignOp, AssignRhs)> {
 /// Parses an assignment's right-hand side: a single variable reference (`$b`), a
 /// `"double-quoted string"` literal, or a bare signed integer.
 fn parse_rhs(text: &str) -> Option<AssignRhs> {
+    if let Some(inner) = text
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        // Nested command substitution is not supported; reject rather than silently
+        // handing the inner `$(` to the shell.
+        if inner.is_empty() || inner.contains("$(") {
+            return None;
+        }
+        return Some(AssignRhs::Command(inner.to_string()));
+    }
     if text.starts_with('$') {
         return parse_lone_reference(text).map(AssignRhs::Variable);
     }
@@ -2669,6 +2777,19 @@ pub fn parse_action(value: &str) -> Action {
     }
 }
 
+/// Resolves an action value to an [`Action`], expanding `$` references against the
+/// current state first.
+///
+/// An assignment is parsed structurally without expanding its left-hand side (only the
+/// assignment's own right-hand side is resolved, when it fires); every other value -
+/// a scene switch target, a command - is expanded as a whole.
+pub fn resolve_action(value: &str, variables: &Variables) -> Result<Action, String> {
+    if value.starts_with('$') && parse_assignment(value).is_some() {
+        return Ok(parse_action(value));
+    }
+    Ok(parse_action(&variables.expand(value)?))
+}
+
 /// One scalar value on its way into an assignment, kept in its source precision until it
 /// is clamped/truncated for the target.
 enum Scalar {
@@ -2698,8 +2819,8 @@ pub fn apply_assignment(
         AssignRhs::Int(number) => Scalar::Int(*number),
         AssignRhs::Str(text) => Scalar::Str(text.clone()),
         AssignRhs::Variable(reference) => match variables.store().get(&reference.name) {
-            Some(crate::variables::VarValue::Int(number)) => Scalar::Int(*number as i64),
-            Some(crate::variables::VarValue::Str(text)) => Scalar::Str(text.clone()),
+            Some(VarValue::Int(number)) => Scalar::Int(*number as i64),
+            Some(VarValue::Str(text)) => Scalar::Str(text.clone()),
             None => {
                 log.error(format!(
                     "assignment reads undefined variable \"{reference}\""
@@ -2707,6 +2828,12 @@ pub fn apply_assignment(
                 return None;
             }
         },
+        AssignRhs::Command(_) => {
+            log.error(
+                "command-substitution assignments must be started on their own task (start_command_assignment)",
+            );
+            return None;
+        }
     };
 
     match target {
@@ -2831,6 +2958,188 @@ fn truncate_str(
         return Some(text.chars().take(max_length).collect());
     }
     Some(text)
+}
+
+/// The conversion a command-substitution assignment applies to its program's output.
+enum Conversion {
+    /// Parse the first non-empty line as an integer, then clamp to `min..=max`; `default`
+    /// is used on a non-strict conversion failure.
+    Int { min: i32, max: i32, default: i32 },
+    /// Use the whole output (trailing newlines stripped), truncated to `max_length`;
+    /// `default` is used on a non-strict conversion failure.
+    Str { max_length: usize, default: String },
+}
+
+/// Prepares a `$(command)` assignment: resolves the target's conversion parameters and
+/// expands and builds the command to run. Called at dispatch time, so any variable read
+/// inside the command sees the value as of the moment the action was triggered.
+fn prepare_command_assignment(
+    target: &AssignTarget,
+    inner: &str,
+    state: &Variables,
+) -> Result<(Conversion, CommandSpec, String), String> {
+    let (conversion, label) = match target {
+        AssignTarget::Variable(name) => {
+            let def = state
+                .store()
+                .def(name)
+                .ok_or_else(|| format!("assignment to undeclared variable \"${name}\""))?;
+            let conversion = match def.kind {
+                VarType::Int => Conversion::Int {
+                    min: def.min,
+                    max: def.max,
+                    default: def.initial.as_int().unwrap_or(0),
+                },
+                VarType::Str => Conversion::Str {
+                    max_length: def.max_length,
+                    default: def.initial.as_str().unwrap_or("").to_string(),
+                },
+            };
+            (conversion, format!("${name}"))
+        }
+        AssignTarget::Default(param) => {
+            let Constraint::NumberRange { min, max } = param.constraint();
+            (
+                Conversion::Int {
+                    min: min as i32,
+                    max: max as i32,
+                    default: param.default_value(state.loaded_defaults()),
+                },
+                param.path().to_string(),
+            )
+        }
+    };
+    let expanded = state.expand(inner)?;
+    let spec = build_command(&expanded)?;
+    Ok((conversion, spec, label))
+}
+
+/// Starts a `$(command)` assignment on its own task, so the input loop is never blocked by
+/// the command and sibling actions keep running in parallel.
+///
+/// The command is expanded and built here (reading the current values of any referenced
+/// variables), then the task runs it, converts its output, and reports the result through
+/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply.
+pub fn start_command_assignment(
+    target: AssignTarget,
+    op: AssignOp,
+    inner: &str,
+    variables: &Arc<Mutex<Variables>>,
+    exec_tx: mpsc::Sender<ExecEvent>,
+    log: Log,
+) {
+    let prepared = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        prepare_command_assignment(&target, inner, &state)
+    };
+    let (conversion, spec, label) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log.error(error);
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        let outcome = match run_command_with_timeout(&spec, EXEC_TIMEOUT).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(output) => convert_output(&output, &conversion, op, &label, log),
+                Err(_) => conversion_failure(op, &conversion, &label, "output is not UTF-8", log),
+            },
+            Err(error) => conversion_failure(op, &conversion, &label, &error, log),
+        };
+        let _ = exec_tx
+            .send(ExecEvent::Assignment(CompletedAssign { target, outcome }))
+            .await;
+    });
+}
+
+/// Converts a command's output to the target type, applying the operator's policy to an
+/// out-of-range/over-long value exactly like a literal assignment.
+fn convert_output(
+    output: &str,
+    conversion: &Conversion,
+    op: AssignOp,
+    label: &str,
+    log: Log,
+) -> Result<VarValue, String> {
+    match conversion {
+        Conversion::Int { min, max, .. } => {
+            let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+                return conversion_failure(op, conversion, label, "no output", log);
+            };
+            let Ok(number) = line.trim().parse::<i64>() else {
+                return conversion_failure(op, conversion, label, "output is not an integer", log);
+            };
+            let (min, max) = (*min as i64, *max as i64);
+            if number < min || number > max {
+                return match op {
+                    AssignOp::Strict => Err(format!(
+                        "assignment to {label} got out-of-range value {number} from its command (allowed {min}..={max})"
+                    )),
+                    AssignOp::ClampWarn => {
+                        log.warn(format!(
+                            "assignment to {label} clamped command output {number} to {}",
+                            number.clamp(min, max)
+                        ));
+                        Ok(VarValue::Int(number.clamp(min, max) as i32))
+                    }
+                    AssignOp::ClampSilent => Ok(VarValue::Int(number.clamp(min, max) as i32)),
+                };
+            }
+            Ok(VarValue::Int(number as i32))
+        }
+        Conversion::Str { max_length, .. } => {
+            let text = output.trim_end_matches(['\n', '\r']).to_string();
+            if text.chars().count() > *max_length {
+                return match op {
+                    AssignOp::Strict => Err(format!(
+                        "assignment to {label} got a value longer than {max_length} characters from its command"
+                    )),
+                    AssignOp::ClampWarn => {
+                        log.warn(format!(
+                            "assignment to {label} truncated command output to {max_length} characters"
+                        ));
+                        Ok(VarValue::Str(text.chars().take(*max_length).collect()))
+                    }
+                    AssignOp::ClampSilent => {
+                        Ok(VarValue::Str(text.chars().take(*max_length).collect()))
+                    }
+                };
+            }
+            Ok(VarValue::Str(text))
+        }
+    }
+}
+
+/// Builds a conversion failure result: a strict assignment fails, `:=` warns and falls
+/// back to the default, `~=` falls back silently.
+fn conversion_failure(
+    op: AssignOp,
+    conversion: &Conversion,
+    label: &str,
+    reason: &str,
+    log: Log,
+) -> Result<VarValue, String> {
+    match op {
+        AssignOp::Strict => Err(format!(
+            "assignment to {label} could not use its command output ({reason})"
+        )),
+        AssignOp::ClampWarn => {
+            log.warn(format!(
+                "assignment to {label} could not use its command output ({reason}); using the default value"
+            ));
+            Ok(default_value(conversion))
+        }
+        AssignOp::ClampSilent => Ok(default_value(conversion)),
+    }
+}
+
+/// The default value a failed command-output conversion falls back to.
+fn default_value(conversion: &Conversion) -> VarValue {
+    match conversion {
+        Conversion::Int { default, .. } => VarValue::Int(*default),
+        Conversion::Str { default, .. } => VarValue::Str(default.clone()),
+    }
 }
 
 /// Reads an action value - a single string or an array of them, per [`check_action_values`]
@@ -3819,6 +4128,54 @@ mod tests {
                 super::AssignRhs::Int(-10)
             ))
         );
+    }
+
+    /// `parse_assignment` accepts a whole `$(command)` right-hand side, treats a quoted
+    /// one as a literal string, and rejects an empty or nested substitution.
+    #[test]
+    fn parse_assignment_accepts_command_substitution() {
+        assert_eq!(
+            super::parse_assignment("$a := $(echo 1)"),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Command("echo 1".to_string())
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$a := \"$(echo 1)\""),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Str("$(echo 1)".to_string())
+            )),
+            "a quoted substitution is a literal string"
+        );
+        assert_eq!(super::parse_assignment("$a := $()"), None);
+        assert_eq!(super::parse_assignment("$a := $(echo $(echo 1))"), None);
+    }
+
+    /// `command_needs_shell` only sees operators outside quotes.
+    #[test]
+    fn command_needs_shell_ignores_quoted_operators() {
+        assert!(!super::command_needs_shell("/bin/echo hello"));
+        assert!(super::command_needs_shell("/bin/echo a | bc"));
+        assert!(super::command_needs_shell("/bin/echo a > /tmp/x"));
+        assert!(!super::command_needs_shell("/bin/sh -c 'a | b > c'"));
+        assert!(!super::command_needs_shell("/bin/echo 'a;b'"));
+        assert!(super::command_needs_shell("/bin/echo a; b"));
+    }
+
+    /// `build_command` runs a shell only when the line needs one.
+    #[test]
+    fn build_command_uses_shell_only_when_needed() {
+        let direct = super::build_command("/bin/echo hello").unwrap();
+        assert_eq!(direct.program, "/bin/echo");
+        assert_eq!(direct.args, ["hello"]);
+
+        let shell = super::build_command("/bin/echo a | bc").unwrap();
+        assert_eq!(shell.program, "sh");
+        assert_eq!(shell.args, ["-c", "/bin/echo a | bc"]);
     }
 
     /// Malformed assignments (no leading `$`, no operator, empty target, or a

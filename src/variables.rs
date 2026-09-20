@@ -610,6 +610,9 @@ pub struct Variables {
     short_press_duration_ms: i64,
     /// Current double-click gap in milliseconds.
     double_click_gap_ms: i64,
+    /// The `defaults` values the program started with, kept so a failed command-output
+    /// assignment can reset a writable brightness parameter to its configured default.
+    defaults: Defaults,
 }
 
 impl Variables {
@@ -621,7 +624,14 @@ impl Variables {
             encoder_brightness: defaults.encoder_brightness as i32,
             short_press_duration_ms: duration_millis(defaults.short_press_duration),
             double_click_gap_ms: duration_millis(defaults.double_click_gap),
+            defaults: *defaults,
         }
+    }
+
+    /// The `defaults` values loaded at startup, used as the reset value when a non-strict
+    /// command-output assignment cannot convert its output.
+    pub fn loaded_defaults(&self) -> &Defaults {
+        &self.defaults
     }
 
     /// The user-variable store, for direct access by callers that need definitions or

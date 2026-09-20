@@ -1326,6 +1326,35 @@ fn validates_variable_assignments() {
     }
 }
 
+/// A `$(command)` right-hand side loads, its internal references are validated, and an
+/// empty or nested substitution is rejected as malformed.
+#[test]
+fn validates_command_substitution_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 100, "value": 5}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := $(echo $count)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    for (action, expected) in [
+        ("$count := $(echo $missing)", "undefined variable"),
+        ("$count := $(echo $(echo 1))", "malformed"),
+    ] {
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{action}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains(expected), "{action}: {errors}");
+    }
+}
+
 /// A malformed `$`-assignment (no assignment operator at all) is rejected with its own
 /// distinct error.
 #[test]

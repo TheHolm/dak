@@ -24,7 +24,7 @@ use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
-use dak::variables::Variables;
+use dak::variables::{VarValue, Variables};
 
 /// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
 #[derive(Debug, Parser)]
@@ -523,7 +523,12 @@ async fn run_device(
                 let Some(event) = event else {
                     break;
                 };
-                runner.handle_exec_event(event).await;
+                match event {
+                    actions::ExecEvent::Assignment(completed) => {
+                        apply_completed_assignment(completed, &variables, &mut runner, log).await;
+                    }
+                    event => runner.handle_exec_event(event).await,
+                }
             }
             key = refresh_rx.recv() => {
                 let Some(key) = key else {
@@ -781,7 +786,21 @@ async fn run_action<D: actions::ButtonDevice>(
     timer_tx: &mpsc::Sender<Vec<String>>,
     variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
-    match actions::parse_action(action_value) {
+    // References are expanded for every action except an assignment (whose left-hand
+    // side is a target, not a value); an assignment's own right-hand side is resolved
+    // when it is applied.
+    let resolved = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        actions::resolve_action(action_value, &state)
+    };
+    let resolved = match resolved {
+        Ok(action) => action,
+        Err(error) => {
+            log.error(format!("action \"{action_value}\": {error}"));
+            return;
+        }
+    };
+    match resolved {
         Action::Stay => {
             log.debug(
                 Subsystem::Actions,
@@ -798,7 +817,7 @@ async fn run_action<D: actions::ButtonDevice>(
             // Commands run on their own task so a running program never blocks the
             // device input loop or the scene timer, and they are not awaited inline.
             log.debug(Subsystem::Actions, format!("run command \"{command}\""));
-            match actions::parse_command_line(&command) {
+            match actions::build_command(&command) {
                 Ok(spec) => {
                     let display = spec.display();
                     tokio::spawn(async move {
@@ -830,6 +849,24 @@ async fn run_action<D: actions::ButtonDevice>(
             rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
         }
         Action::Assign { target, op, rhs } => {
+            if let actions::AssignRhs::Command(inner) = &rhs {
+                log.debug(
+                    Subsystem::Actions,
+                    format!("assign from command \"{inner}\""),
+                );
+                // One its own task so the program never blocks the input loop and
+                // sibling actions run in parallel; the result arrives via the exec
+                // channel and is applied by the loop below.
+                actions::start_command_assignment(
+                    target,
+                    op,
+                    inner,
+                    variables,
+                    runner.tracker.sender(),
+                    log,
+                );
+                return;
+            }
             let label = match &target {
                 actions::AssignTarget::Variable(name) => format!("${name}"),
                 actions::AssignTarget::Default(param) => param.path().to_string(),
@@ -855,6 +892,66 @@ async fn run_action<D: actions::ButtonDevice>(
                     log.warn(format!("failed to set {}: {error}", param.path()));
                 }
             }
+        }
+    }
+}
+
+/// Applies a finished command-substitution assignment: stores the converted value and,
+/// for a writable default, pushes the new brightness to the device.
+///
+/// Called by the input loop, which owns both the shared variable state and the device;
+/// the spawned command task only reports the already-converted result.
+async fn apply_completed_assignment<D: actions::ButtonDevice>(
+    completed: actions::CompletedAssign,
+    variables: &Arc<std::sync::Mutex<Variables>>,
+    runner: &mut actions::SceneRunner<'_, D>,
+    log: Log,
+) {
+    let value = match completed.outcome {
+        Ok(value) => value,
+        Err(error) => {
+            log.error(error);
+            return;
+        }
+    };
+
+    let side_effect = match &completed.target {
+        actions::AssignTarget::Variable(name) => {
+            variables
+                .lock()
+                .expect("variables mutex poisoned")
+                .store_mut()
+                .set(name, value);
+            None
+        }
+        actions::AssignTarget::Default(param) => {
+            let VarValue::Int(number) = value else {
+                log.error(format!(
+                    "assignment to {} produced a non-numeric value",
+                    param.path()
+                ));
+                return;
+            };
+            let mut state = variables.lock().expect("variables mutex poisoned");
+            match param {
+                actions::SettableDefault::ButtonBrightness => state.set_button_brightness(number),
+                actions::SettableDefault::EncoderBrightness => state.set_encoder_brightness(number),
+            }
+            Some((*param, number))
+        }
+    };
+
+    if let Some((param, number)) = side_effect {
+        let result = match param {
+            actions::SettableDefault::ButtonBrightness => {
+                runner.set_button_brightness(number as u8).await
+            }
+            actions::SettableDefault::EncoderBrightness => {
+                runner.set_encoder_brightness(number as u8).await
+            }
+        };
+        if let Err(error) = result {
+            log.warn(format!("failed to set {}: {error}", param.path()));
         }
     }
 }
@@ -996,7 +1093,7 @@ mod tests {
     use dak::hardware;
     use dak::log::Log;
 
-    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference, Variables};
+    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference, VarValue, Variables};
 
     /// A tiny recording keypad for the dispatch-layer tests: scene `setup` operations
     /// that reach the device are recorded so a test can see which scene was applied.
@@ -1895,6 +1992,78 @@ mod tests {
             mock.calls().is_empty(),
             "a variable assignment touches no device"
         );
+    }
+
+    /// A `$(command)` assignment runs on its own task and reports its converted value
+    /// through the exec channel; applying it updates the store (variable target) or the
+    /// device (default target).
+    #[tokio::test]
+    async fn command_substitution_assignment_reports_and_applies() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), dak::variables::VarDef::int(0, 100, 5));
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+
+        dak::actions::start_command_assignment(
+            dak::actions::AssignTarget::Variable("count".to_string()),
+            dak::actions::AssignOp::ClampWarn,
+            "echo 42",
+            &variables,
+            tx.clone(),
+            Log::default(),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a command-substitution result should arrive")
+            .expect("the exec channel must not close");
+        match event {
+            dak::actions::ExecEvent::Assignment(completed) => {
+                super::apply_completed_assignment(
+                    completed,
+                    &variables,
+                    &mut runner,
+                    Log::default(),
+                )
+                .await;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(
+            variables.lock().unwrap().store().get("count"),
+            Some(&VarValue::Int(42))
+        );
+
+        dak::actions::start_command_assignment(
+            dak::actions::AssignTarget::Default(dak::actions::SettableDefault::ButtonBrightness),
+            dak::actions::AssignOp::ClampWarn,
+            "echo 77",
+            &variables,
+            tx,
+            Log::default(),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            dak::actions::ExecEvent::Assignment(completed) => {
+                super::apply_completed_assignment(
+                    completed,
+                    &variables,
+                    &mut runner,
+                    Log::default(),
+                )
+                .await;
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(variables.lock().unwrap().button_brightness(), 77);
+        assert_eq!(mock.last_button_brightness(), Some(77));
     }
 
     /// A `$defaults.encoder_brightness := 200` action that exceeds the valid range
