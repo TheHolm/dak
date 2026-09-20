@@ -8,6 +8,7 @@ use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::press::Defaults;
+use crate::variables::{self, VarDef};
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -32,6 +33,9 @@ pub struct LoadedConfig {
     /// The settings from the `defaults` section (press-detection timing knobs plus
     /// connect-time brightness), with built-in defaults applied.
     pub defaults: Defaults,
+    /// The validated `variables` section, keyed by variable name. Empty when the config
+    /// declares no variables.
+    pub variables: BTreeMap<String, VarDef>,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
 }
@@ -206,9 +210,14 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes" && key != "devices" && key != "defaults" && key != "version" {
+        if key != "scenes"
+            && key != "devices"
+            && key != "defaults"
+            && key != "variables"
+            && key != "version"
+        {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\" and \"version\""
+                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\", \"variables\" and \"version\""
             ));
         }
     }
@@ -247,6 +256,10 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         .get("defaults")
         .map(|defaults| check_defaults(defaults, &mut errors))
         .unwrap_or_default();
+    let variables = map
+        .get("variables")
+        .map(|variables| variables::check_variables(variables, &mut errors))
+        .unwrap_or_default();
 
     if !errors.is_empty() {
         return Err(errors);
@@ -256,6 +269,7 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         scenes: scenes.clone(),
         devices: ConfiguredDevices { by_id },
         defaults,
+        variables,
         warnings,
     })
 }
@@ -926,7 +940,7 @@ fn is_executable(path: &str) -> bool {
 }
 
 /// Human-readable type name of a JSON value, for error messages.
-fn value_type(value: &Value) -> &'static str {
+pub(crate) fn value_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "bool",

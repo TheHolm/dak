@@ -6,8 +6,9 @@ use dak::actions::{load_config, load_config_from_path};
 
 use crate::common::{
     assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
-    write_scenes_config, write_temp_config, SetHome, ENV_LOCK,
+    write_scenes_config, write_temp_config, write_variables_config, SetHome, ENV_LOCK,
 };
+use dak::variables::{VarDef, VarValue};
 use std::os::unix::fs::PermissionsExt;
 
 /// A minimal valid config loads successfully.
@@ -1319,4 +1320,80 @@ fn tilde_path_in_exec_program_resolves_against_home() {
         "{:?}",
         config.warnings
     );
+}
+
+// -- variables section --
+
+/// A valid `variables` section loads and its declarations carry the right type,
+/// constraints and initial value.
+#[test]
+fn loads_variables_section() {
+    let path = write_variables_config(
+        r#"{
+            "count": { "type": "int", "min": 0, "max": 10, "value": 3 },
+            "name": { "type": "str", "max_length": 5, "value": "Bob" }
+        }"#,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+
+    assert_eq!(config.variables["count"], VarDef::int(0, 10, 3));
+    assert_eq!(
+        config.variables["name"],
+        VarDef::string(5, "Bob".to_string())
+    );
+    assert_eq!(config.variables["count"].initial, VarValue::Int(3));
+}
+
+/// A config without a `variables` section still loads, with an empty declaration map.
+#[test]
+fn variables_section_is_optional() {
+    let path = write_scenes_config(r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.unwrap().variables.is_empty());
+}
+
+/// Invalid variable declarations are reported (as hard errors) and the config is
+/// rejected as a whole.
+#[test]
+fn rejects_invalid_variable_declarations() {
+    for (variables, expected) in [
+        (r#"{"1a": {"type": "int"}}"#, "invalid variable name"),
+        (r#"{"a": 5}"#, "must be an object"),
+        (r#"{"a": {"value": 1}}"#, "\"type\" must be a string"),
+        (r#"{"a": {"type": "bool"}}"#, "unknown type"),
+        (r#"{"a": {"type": "int", "bogus": 1}}"#, "unknown key"),
+        (
+            r#"{"a": {"type": "int", "max_length": 3}}"#,
+            "only valid for a \"str\"",
+        ),
+        (
+            r#"{"a": {"type": "str", "min": 1}}"#,
+            "only valid for an \"int\"",
+        ),
+        (
+            r#"{"a": {"type": "int", "min": 5, "max": 1}}"#,
+            "greater than",
+        ),
+        (
+            r#"{"a": {"type": "int", "min": 0, "max": 10, "value": 11}}"#,
+            "outside the declared range",
+        ),
+        (
+            r#"{"a": {"type": "str", "max_length": 2, "value": "abc"}}"#,
+            "longer than",
+        ),
+    ] {
+        let path = write_variables_config(variables, r#"{"on_start": {"actions": {}}}"#);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "expected errors to contain {expected:?}, got: {errors}"
+        );
+    }
 }
