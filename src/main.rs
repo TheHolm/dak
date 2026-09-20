@@ -319,6 +319,9 @@ async fn run_device(
         log,
         &screenless_buttons,
     );
+    // Setup params are expanded against the shared variable state, re-resolved on every
+    // refresh tick (see `SceneRunner::set_variables`).
+    runner.set_variables(variables.clone());
 
     // Complex press events (short/long press, double click): the detector decides
     // which event each press or release produces. Widgets are addressed by their
@@ -347,7 +350,8 @@ async fn run_device(
     // Timer events are delivered through a channel so the input loop can react to
     // them without blocking on the device reader.
     let (timer_tx, mut timer_rx) = mpsc::channel::<Vec<String>>(1);
-    let mut timer_handle = arm_scene_timer(&current_scene, &scenes, &timer_tx, log).await;
+    let mut timer_handle =
+        arm_scene_timer(&current_scene, &scenes, &timer_tx, log, &variables).await;
 
     // Actions are inherited from the previously active scene (see `action_for_event`),
     // so the scene we came from is remembered across scene switches.
@@ -811,7 +815,15 @@ async fn run_action<D: actions::ButtonDevice>(
                     "failed to refresh scene \"{current_scene}\": {error}"
                 ));
             }
-            rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
+            rearm_scene_timer(
+                &*current_scene,
+                scenes,
+                timer_handle,
+                timer_tx,
+                log,
+                variables,
+            )
+            .await;
         }
         Action::Command { command } => {
             // Commands run on their own task so a running program never blocks the
@@ -846,7 +858,15 @@ async fn run_action<D: actions::ButtonDevice>(
             if let Err(error) = runner.enter_scene(&scene, scenes).await {
                 log.warn(format!("failed to enter scene \"{scene}\": {error}"));
             }
-            rearm_scene_timer(&*current_scene, scenes, timer_handle, timer_tx, log).await;
+            rearm_scene_timer(
+                &*current_scene,
+                scenes,
+                timer_handle,
+                timer_tx,
+                log,
+                variables,
+            )
+            .await;
         }
         Action::Assign { target, op, rhs } => {
             if let actions::AssignRhs::Command(inner) = &rhs {
@@ -1002,9 +1022,14 @@ async fn arm_scene_timer(
     scenes: &Value,
     timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    match actions::timer_for_scene(scene_name, scenes) {
-        Some((seconds, actions)) => {
+    let timer = {
+        let state = variables.lock().expect("variables mutex poisoned");
+        actions::timer_for_scene_with(scene_name, scenes, &state)
+    };
+    match timer {
+        Ok(Some((seconds, actions))) => {
             log.debug(
                 Subsystem::Scene,
                 format!("armed timer for scene \"{scene_name}\": {seconds}s -> {actions:?}"),
@@ -1016,7 +1041,11 @@ async fn arm_scene_timer(
                 let _ = tx.send(actions).await;
             }))
         }
-        None => None,
+        Ok(None) => None,
+        Err(error) => {
+            log.error(error);
+            None
+        }
     }
 }
 
@@ -1027,11 +1056,12 @@ async fn rearm_scene_timer(
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
     log: Log,
+    variables: &Arc<std::sync::Mutex<Variables>>,
 ) {
     if let Some(handle) = timer_handle.take() {
         handle.abort();
     }
-    *timer_handle = arm_scene_timer(scene_name, scenes, timer_tx, log).await;
+    *timer_handle = arm_scene_timer(scene_name, scenes, timer_tx, log, variables).await;
 }
 
 /// Builds the `-d device` lines printed when a device is found, one per
@@ -1225,6 +1255,14 @@ mod tests {
             Log::default(),
             &HashSet::new(),
         )
+    }
+
+    /// An empty shared variable state for tests that do not declare variables.
+    fn test_variables() -> std::sync::Arc<std::sync::Mutex<Variables>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            std::collections::BTreeMap::new(),
+            &Defaults::default(),
+        )))
     }
 
     /// The shared state one device's input loop owns between events: the down-control
@@ -1506,14 +1544,20 @@ mod tests {
             "Main": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, _rx) = mpsc::channel(1);
+        assert!(super::arm_scene_timer(
+            "on_start",
+            &scenes,
+            &tx,
+            Log::default(),
+            &test_variables()
+        )
+        .await
+        .is_none());
         assert!(
-            super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
+            super::arm_scene_timer("Main", &scenes, &tx, Log::default(), &test_variables())
                 .await
-                .is_none()
+                .is_some()
         );
-        assert!(super::arm_scene_timer("Main", &scenes, &tx, Log::default())
-            .await
-            .is_some());
     }
 
     /// An armed timer fires after its configured seconds and delivers the action
@@ -1524,9 +1568,10 @@ mod tests {
             "on_start": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, mut rx) = mpsc::channel(1);
-        let handle = super::arm_scene_timer("on_start", &scenes, &tx, Log::default())
-            .await
-            .expect("scene has a timer");
+        let handle =
+            super::arm_scene_timer("on_start", &scenes, &tx, Log::default(), &test_variables())
+                .await
+                .expect("scene has a timer");
         handle.await.unwrap();
         assert_eq!(rx.recv().await, Some(vec!["@Main".to_string()]));
     }
@@ -1540,10 +1585,19 @@ mod tests {
             "Main": { "actions": { "timer": { "1": "@Main" } } }
         });
         let (tx, mut rx) = mpsc::channel(1);
-        let mut handle = super::arm_scene_timer("Main", &scenes, &tx, Log::default()).await;
+        let mut handle =
+            super::arm_scene_timer("Main", &scenes, &tx, Log::default(), &test_variables()).await;
         assert!(handle.is_some());
 
-        super::rearm_scene_timer("on_start", &scenes, &mut handle, &tx, Log::default()).await;
+        super::rearm_scene_timer(
+            "on_start",
+            &scenes,
+            &mut handle,
+            &tx,
+            Log::default(),
+            &test_variables(),
+        )
+        .await;
         assert!(handle.is_none(), "a scene without a timer arms nothing");
 
         let late = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await;

@@ -1279,11 +1279,29 @@ pub enum SceneOp {
     Unsupported { kind: String },
 }
 
-/// Builds the ordered list of operations for a scene without touching the device.
+/// A raw scene `setup` entry, before variable/tilde expansion or command parsing.
+///
+/// Keeping the entry raw lets a `refresh` re-resolve it against the current variables
+/// every time it fires, instead of freezing the values it started with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSceneOp {
+    /// The scene the entry came from, for error messages.
+    pub scene: String,
+    /// The control the entry targets.
+    pub reference: Reference,
+    /// The entry's `type`.
+    pub kind: String,
+    /// The entry's raw `params` string (trimmed).
+    pub params: String,
+    /// The entry's `refresh` seconds (0 = never; unused by launch/clear).
+    pub refresh_seconds: u64,
+}
+
+/// Parses a scene's `setup` into raw entries without expanding or parsing anything.
 ///
 /// The scene's `setup` dictionary holds the numbered button entries; a scene without a
-/// `setup` key yields no operations.
-pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>, String> {
+/// `setup` key (or an undefined scene) yields no entries.
+pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawSceneOp>, String> {
     let mut operations = Vec::new();
 
     let scene = scenes
@@ -1325,45 +1343,84 @@ pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>
         // "type"/"params" already are.
         let refresh_seconds = object.get("refresh").and_then(Value::as_u64).unwrap_or(0);
 
-        match kind {
-            "image" => operations.push(SceneOp::SetImage {
-                reference,
-                path: expand_tilde(&params),
-                refresh_seconds,
-            }),
-            "text" => operations.push(SceneOp::Text {
-                reference,
-                path: expand_tilde(&params),
-                refresh_seconds,
-            }),
-            "text_exec" => {
-                let command = params_command(scene_name, key, "text_exec", &params)?;
-                operations.push(SceneOp::TextExec {
-                    reference,
-                    command,
-                    refresh_seconds,
-                });
-            }
-            "image_exec" => {
-                let command = params_command(scene_name, key, "image_exec", &params)?;
-                operations.push(SceneOp::ImageExec {
-                    reference,
-                    command,
-                    refresh_seconds,
-                });
-            }
-            "launch" => {
-                let command = params_command(scene_name, key, "launch", &params)?;
-                operations.push(SceneOp::Launch { reference, command });
-            }
-            "clear" => operations.push(SceneOp::Clear { reference }),
-            other => operations.push(SceneOp::Unsupported {
-                kind: other.to_string(),
-            }),
-        }
+        operations.push(RawSceneOp {
+            scene: scene_name.to_string(),
+            reference,
+            kind: kind.to_string(),
+            params,
+            refresh_seconds,
+        });
     }
 
     Ok(operations)
+}
+
+/// Resolves a raw scene entry into a [`SceneOp`], expanding references in `params` from
+/// `variables` and then expanding a leading `~` and parsing any command line.
+pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<SceneOp, String> {
+    let scene_name = raw.scene.as_str();
+    let reference = raw.reference;
+    let key = reference.to_string();
+    let params = variables
+        .expand(&raw.params)
+        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))?;
+    Ok(match raw.kind.as_str() {
+        "image" => SceneOp::SetImage {
+            reference,
+            path: expand_tilde(&params),
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text" => SceneOp::Text {
+            reference,
+            path: expand_tilde(&params),
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text_exec" => SceneOp::TextExec {
+            reference,
+            command: params_command(scene_name, &key, "text_exec", &params)?,
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "image_exec" => SceneOp::ImageExec {
+            reference,
+            command: params_command(scene_name, &key, "image_exec", &params)?,
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "launch" => SceneOp::Launch {
+            reference,
+            command: params_command(scene_name, &key, "launch", &params)?,
+        },
+        "clear" => SceneOp::Clear { reference },
+        other => SceneOp::Unsupported {
+            kind: other.to_string(),
+        },
+    })
+}
+
+/// A variable store with no declarations and built-in defaults, for callers (and tests)
+/// that have no runtime state; references then fail to resolve.
+fn empty_variables() -> Variables {
+    Variables::new(BTreeMap::new(), &Defaults::default())
+}
+
+/// Builds the ordered list of operations for a scene with no variable state.
+///
+/// References in `params` cannot be resolved and are reported as errors; callers with a
+/// [`Variables`] should use [`scene_operations_with`] instead.
+pub fn scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<SceneOp>, String> {
+    scene_operations_with(scene_name, scenes, &empty_variables())
+}
+
+/// Builds the ordered list of operations for a scene, expanding references in `params`
+/// from `variables`.
+pub fn scene_operations_with(
+    scene_name: &str,
+    scenes: &Value,
+    variables: &Variables,
+) -> Result<Vec<SceneOp>, String> {
+    raw_scene_operations(scene_name, scenes)?
+        .iter()
+        .map(|raw| resolve_scene_op(raw, variables))
+        .collect()
 }
 
 /// Spawns `command` fully detached from this program: its own process group (so terminal
@@ -1625,9 +1682,15 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// `refresh_seconds`, if any. Replaced (old task aborted) every time that button is
     /// explicitly re-applied, whether by its own tick or by a scene redefining it.
     refresh_handles: std::collections::HashMap<u8, tokio::task::JoinHandle<()>>,
+    /// The raw `setup` entry behind each button's active operation (1-based), so a
+    /// refresh tick can re-resolve it against the current variable values.
+    refresh_sources: std::collections::HashMap<u8, RawSceneOp>,
     /// Sender for refresh ticks: a spawned task sleeps for a button's `refresh_seconds`
     /// then sends its key here; the receiving end drives [`SceneRunner::refresh_button`].
     pub refresh_tx: mpsc::Sender<u8>,
+    /// The shared variable/default state, when attached (see
+    /// [`SceneRunner::set_variables`]); `setup` params are expanded against it.
+    variables: Option<Arc<Mutex<Variables>>>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
@@ -1656,11 +1719,34 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             screenless_buttons: screenless_buttons.clone(),
             active_setup: std::collections::HashMap::new(),
             refresh_handles: std::collections::HashMap::new(),
+            refresh_sources: std::collections::HashMap::new(),
             refresh_tx,
+            variables: None,
+        }
+    }
+
+    /// Attaches the shared variable/default state, so `setup` params are resolved (and,
+    /// for refreshing buttons, re-resolved on every tick) against the current values.
+    pub fn set_variables(&mut self, variables: Arc<Mutex<Variables>>) {
+        self.variables = Some(variables);
+    }
+
+    /// Resolves a raw scene entry against the attached variable state (or an empty one,
+    /// which makes any reference an error) for use in `enter_scene`/`refresh_button`.
+    fn resolve_op(&self, raw: &RawSceneOp) -> Result<SceneOp, String> {
+        match &self.variables {
+            Some(variables) => {
+                let state = variables.lock().expect("variables mutex poisoned");
+                resolve_scene_op(raw, &state)
+            }
+            None => resolve_scene_op(raw, &empty_variables()),
         }
     }
 
     /// Applies the numbered button operations of `scene_name` to the device.
+    ///
+    /// Each raw entry is resolved against the current variable values, and remembered so
+    /// its refresh ticks re-resolve it (rather than freezing the values it started with).
     pub async fn enter_scene(
         &mut self,
         scene_name: &str,
@@ -1668,7 +1754,14 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.log
             .debug(Subsystem::Scene, format!("Entering scene \"{scene_name}\""));
-        let operations = scene_operations(scene_name, scenes)?;
+        let raw_entries = raw_scene_operations(scene_name, scenes)?;
+        let mut operations = Vec::with_capacity(raw_entries.len());
+        for raw in &raw_entries {
+            operations.push(self.resolve_op(raw)?);
+        }
+        for raw in raw_entries {
+            self.refresh_sources.insert(raw.reference.number, raw);
+        }
         self.apply_scene_operations(&operations).await
     }
 
@@ -1725,8 +1818,16 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// `apply_one_operation` always cancels the previous handle before scheduling a new
     /// one).
     pub async fn refresh_button(&mut self, key: u8) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(operation) = self.active_setup.get(&key).cloned() else {
-            return Ok(());
+        // Re-resolve from the raw source each tick, so a reference in the params picks up
+        // the current variable values instead of the ones captured on scene entry. Falls
+        // back to the already-resolved operation when no raw source is known (e.g. when
+        // operations were applied directly rather than through `enter_scene`).
+        let operation = match self.refresh_sources.get(&key).cloned() {
+            Some(raw) => self.resolve_op(&raw)?,
+            None => match self.active_setup.get(&key).cloned() {
+                Some(operation) => operation,
+                None => return Ok(()),
+            },
         };
         self.apply_one_operation(&operation).await;
         self.device.flush().await?;
@@ -3208,12 +3309,55 @@ pub fn action_for_event<'a>(
 /// whose value may be a single string or an array of them, exactly like an event's.
 /// Returns `None` if the scene has no timer.
 pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, Vec<&'a str>)> {
-    let scene = scenes.get(scene_name)?.as_object()?;
-    let actions = scene.get("actions")?.as_object()?;
-    let timer = actions.get("timer")?.as_object()?;
-    let (seconds_str, action) = timer.iter().next()?;
-    let seconds = seconds_str.parse::<u64>().ok()?;
-    Some((seconds, action_values(action)))
+    timer_for_scene_with(scene_name, scenes, &empty_variables())
+        .ok()
+        .flatten()
+}
+
+/// Reads the timer actions for a scene, resolving its seconds against `variables`.
+///
+/// The seconds key is either a number or a single int variable reference. Returns
+/// `Ok(None)` when the scene has no timer (or an unrecognizable one, matching
+/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable.
+pub fn timer_for_scene_with<'a>(
+    scene_name: &str,
+    scenes: &'a Value,
+    variables: &Variables,
+) -> Result<Option<(u64, Vec<&'a str>)>, String> {
+    let Some(timer) = scenes
+        .get(scene_name)
+        .and_then(Value::as_object)
+        .and_then(|scene| scene.get("actions"))
+        .and_then(Value::as_object)
+        .and_then(|actions| actions.get("timer"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let Some((seconds_str, action)) = timer.iter().next() else {
+        return Ok(None);
+    };
+    let seconds = match seconds_str.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let refs = references_in(seconds_str)
+                .map_err(|error| format!("scene \"{scene_name}\": actions.timer: {error}"))?;
+            match refs.as_slice() {
+                [reference] if variables.kind_of(reference) == Some(VarType::Int) => {
+                    let text = variables.read(reference).map_err(|error| {
+                        format!("scene \"{scene_name}\": actions.timer: {error}")
+                    })?;
+                    text.parse::<u64>().map_err(|_| {
+                        format!(
+                            "scene \"{scene_name}\": actions.timer seconds \"{seconds_str}\" resolved to \"{text}\", which is not a valid number of seconds"
+                        )
+                    })?
+                }
+                _ => return Ok(None),
+            }
+        }
+    };
+    Ok(Some((seconds, action_values(action))))
 }
 
 #[cfg(test)]
@@ -4176,6 +4320,81 @@ mod tests {
         let shell = super::build_command("/bin/echo a | bc").unwrap();
         assert_eq!(shell.program, "sh");
         assert_eq!(shell.args, ["-c", "/bin/echo a | bc"]);
+    }
+
+    /// A variable store for scene/param tests: `dir` is a string, `period` an int.
+    fn scene_variables() -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "dir".to_string(),
+            crate::variables::VarDef::string(255, "a".to_string()),
+        );
+        defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::int(1, 100, 7),
+        );
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
+    }
+
+    /// `scene_operations_with` expands references in setup params from the variables,
+    /// while the variable-free `scene_operations` reports a reference as an error.
+    #[test]
+    fn scene_operations_expand_params_from_variables() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "image", "params": "/tmp/$dir.png" } } }
+        });
+        let operations = super::scene_operations_with("main", &scenes, &scene_variables()).unwrap();
+        assert_eq!(
+            operations,
+            vec![super::SceneOp::SetImage {
+                reference: crate::baseplane::Reference::button(1, 1),
+                path: "/tmp/a.png".to_string(),
+                refresh_seconds: 0,
+            }]
+        );
+        assert!(super::scene_operations("main", &scenes).is_err());
+    }
+
+    /// `resolve_scene_op` re-expands from the current values each time, so a refresh tick
+    /// picks up a changed variable.
+    #[test]
+    fn resolve_scene_op_re_expands_after_variable_change() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "image", "params": "$dir/pic.png" } } }
+        });
+        let raw = super::raw_scene_operations("main", &scenes).unwrap();
+        let mut variables = scene_variables();
+        let first = super::resolve_scene_op(&raw[0], &variables).unwrap();
+        variables
+            .store_mut()
+            .set("dir", crate::variables::VarValue::Str("b".to_string()));
+        let second = super::resolve_scene_op(&raw[0], &variables).unwrap();
+        assert_ne!(first, second);
+    }
+
+    /// `timer_for_scene_with` resolves an int variable's seconds, and treats a str
+    /// variable (or an unresolvable key) as no timer.
+    #[test]
+    fn timer_seconds_resolve_from_int_variable() {
+        let scenes = json!({
+            "main": { "actions": { "timer": { "$period": "@Main" } } }
+        });
+        assert_eq!(
+            super::timer_for_scene_with("main", &scenes, &scene_variables()).unwrap(),
+            Some((7, vec!["@Main"]))
+        );
+
+        let mut str_defs = std::collections::BTreeMap::new();
+        str_defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::string(5, "7".to_string()),
+        );
+        let str_variables =
+            crate::variables::Variables::new(str_defs, &crate::press::Defaults::default());
+        assert_eq!(
+            super::timer_for_scene_with("main", &scenes, &str_variables).unwrap(),
+            None
+        );
     }
 
     /// Malformed assignments (no leading `$`, no operator, empty target, or a
