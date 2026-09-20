@@ -8,7 +8,10 @@ use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::press::Defaults;
-use crate::variables::{check_variables, references_in, VarDef, VarRef, VarType, Variables};
+use crate::variables::{
+    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
+    VarRef, VarType, Variables,
+};
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -877,7 +880,7 @@ fn check_action_value(
         return;
     }
     if value.starts_with('$') {
-        check_set_config_action(scene_name, path, value, errors, warnings);
+        check_set_config_action(variables, scene_name, path, value, errors, warnings);
         return;
     }
 
@@ -891,90 +894,222 @@ fn check_action_value(
     }
 }
 
-/// Validates a `$path <op> value` action: `value` must parse as `$<dotted path> <op>
-/// <number or "quoted string">` for one of the three [`AssignOp`] operators; `path`
-/// must name a currently-settable parameter (only `defaults.button_brightness`/
-/// `defaults.encoder_brightness` for now); and the right-hand-side literal must be the
-/// type [`SettableDefault::constraint`] expects for that parameter.
+/// Validates a `$target <op> rhs` assignment action.
 ///
-/// A well-formed path that names a real but immutable config field/section (anything
-/// else under `defaults`, or anything under `devices`/`scenes`) is a distinct
-/// "read-only parameter" error; a path that doesn't correspond to any real config field
-/// at all is a distinct "unknown parameter" error - see [`classify_config_path`]. A
-/// wrong-type value (e.g. a quoted string for a numeric parameter) is a distinct error
-/// under every operator, since clamping/truncation is a range/length concept, not a
-/// type coercion - `"100"` never satisfies a numeric parameter the way `100` does.
+/// The target must be a declared variable or a writable `defaults` parameter. A real but
+/// immutable config field/section is a "read-only parameter" error, a syntactically valid
+/// but undeclared variable is an "undefined variable" error, and anything else is an
+/// "unknown parameter" error.
 ///
-/// Only `:=` ([`AssignOp::ClampWarn`]) is implemented: an out-of-range number is
-/// clamped into its [`Constraint`], with a warning when clamping actually changed the
-/// value (an in-range number is silently fine). `=`/`~=` are recognized but rejected
-/// with a distinct "not implemented yet" error - see [`AssignOp`]'s doc comments for
-/// their intended future behavior.
+/// The right-hand side must have the target's type: a numeric target rejects a quoted
+/// string, and an int variable rejects a string, under every operator - clamping and
+/// truncation are range/length concepts, not type coercion. A literal that is out of
+/// range (or over-long) is clamped/truncated by `:=` (with a warning), silently by `~=`,
+/// and rejected by `=`. A variable right-hand side is type-checked here, but its value is
+/// only known when the action fires, so its range is checked then.
 fn check_set_config_action(
+    variables: &Variables,
     scene_name: &str,
     path: &str,
     value: &str,
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    let Some((config_path, op, assigned)) = parse_set_config(value) else {
+    let Some((target_path, op, rhs)) = parse_assignment(value) else {
         errors.push(format!(
-            "scene \"{scene_name}\": {path} is a malformed \"$\" assignment \"{value}\", expected \"$path := value\" with value a number or a \"quoted string\""
+            "scene \"{scene_name}\": {path} is a malformed \"$\" assignment \"{value}\", expected \"$target <op> value\" with value a literal, a $variable or a \"$(command)\""
         ));
         return;
     };
 
-    let param = match classify_config_path(&config_path) {
-        ParamClass::Settable(param) => param,
-        ParamClass::ReadOnly => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} tries to set read-only parameter \"{config_path}\""
-            ));
-            return;
+    match classify_target(&target_path, variables) {
+        TargetClass::ReadOnly(config_path) => errors.push(format!(
+            "scene \"{scene_name}\": {path} tries to set read-only parameter \"{config_path}\""
+        )),
+        TargetClass::Unknown(unknown) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets unknown parameter \"{unknown}\""
+        )),
+        TargetClass::UndefinedVariable(name) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets undefined variable \"${name}\""
+        )),
+        TargetClass::Variable(name) => {
+            let def = variables
+                .store()
+                .def(&name)
+                .cloned()
+                .expect("classified as a declared variable");
+            check_variable_assignment(
+                scene_name, path, &name, &def, op, &rhs, variables, errors, warnings,
+            );
         }
-        ParamClass::Unknown => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} sets unknown parameter \"{config_path}\""
-            ));
-            return;
+        TargetClass::Default(param) => {
+            check_default_assignment(
+                scene_name, path, param, op, &rhs, variables, errors, warnings,
+            );
         }
-    };
-
-    match op {
-        AssignOp::Strict => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} uses \"=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
-            ));
-            return;
-        }
-        AssignOp::ClampSilent => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} uses \"~=\" on \"{config_path}\", which is not implemented yet - use \":=\" instead"
-            ));
-            return;
-        }
-        AssignOp::ClampWarn => {}
     }
+}
 
-    match (param.constraint(), assigned) {
-        (Constraint::NumberRange { min, max }, AssignedValue::Number(number)) => {
-            let clamped = number.clamp(min, max);
-            if clamped != number {
-                warnings.push(format!(
-                    "scene \"{scene_name}\": {path} sets \"{config_path}\" to {number} via \":=\", out of range {min}-{max} - clamped to {clamped}"
+/// Validates the right-hand side of an assignment to a declared user variable against
+/// the variable's declared type and, for literals, its range/length.
+fn check_variable_assignment(
+    scene_name: &str,
+    path: &str,
+    name: &str,
+    def: &VarDef,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let label = format!("${name}");
+    match rhs {
+        AssignRhs::Int(number) => {
+            if def.kind != VarType::Int {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets string variable \"${name}\" to the number {number}"
                 ));
+                return;
             }
+            check_number_range(
+                scene_name,
+                path,
+                &label,
+                op,
+                *number,
+                def.min as i64,
+                def.max as i64,
+                errors,
+                warnings,
+            );
         }
-        (Constraint::NumberRange { .. }, AssignedValue::Text(text)) => {
-            errors.push(format!(
-                "scene \"{scene_name}\": {path} sets \"{config_path}\" to a string (\"{text}\"), but it requires a number"
-            ));
+        AssignRhs::Str(text) => {
+            if def.kind != VarType::Str {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets int variable \"${name}\" to a string (\"{text}\")"
+                ));
+                return;
+            }
+            check_string_length(
+                scene_name,
+                path,
+                &label,
+                op,
+                text.chars().count(),
+                def.max_length,
+                errors,
+                warnings,
+            );
         }
-        (Constraint::MaxLength(_), _) => {
-            unreachable!(
-                "no settable string parameter exists yet - see Constraint::MaxLength's doc comment"
-            )
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            None => errors.push(format!(
+                "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+            )),
+            Some(kind) if kind != def.kind => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets {} variable \"${name}\" to \"{reference}\", which is {}",
+                kind_label(def.kind),
+                kind_label(kind)
+            )),
+            Some(_) => {}
+        },
+    }
+}
+
+/// Validates the right-hand side of an assignment to a writable `defaults` parameter,
+/// which is always numeric.
+fn check_default_assignment(
+    scene_name: &str,
+    path: &str,
+    param: SettableDefault,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let Constraint::NumberRange { min, max } = param.constraint();
+    let label = param.path();
+    match rhs {
+        AssignRhs::Int(number) => {
+            check_number_range(scene_name, path, label, op, *number, min, max, errors, warnings);
         }
+        AssignRhs::Str(text) => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to a string (\"{text}\"), but it requires a number"
+        )),
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            None => errors.push(format!(
+                "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+            )),
+            Some(VarType::Int) => {}
+            Some(VarType::Str) => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a string, but it requires a number"
+            )),
+        },
+    }
+}
+
+/// A human-readable type name for an assignment error message.
+fn kind_label(kind: VarType) -> &'static str {
+    match kind {
+        VarType::Int => "an int",
+        VarType::Str => "a string",
+    }
+}
+
+/// Applies an operator's range policy to a literal number: `=` rejects an out-of-range
+/// value, `:=` clamps with a warning, `~=` clamps silently.
+#[allow(clippy::too_many_arguments)]
+fn check_number_range(
+    scene_name: &str,
+    path: &str,
+    label: &str,
+    op: AssignOp,
+    number: i64,
+    min: i64,
+    max: i64,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let clamped = number.clamp(min, max);
+    if clamped == number {
+        return;
+    }
+    match op {
+        AssignOp::Strict => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to {number}, outside {min}..={max}; use \":=\" to clamp"
+        )),
+        AssignOp::ClampWarn => warnings.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to {number} via \":=\", out of range {min}-{max} - clamped to {clamped}"
+        )),
+        AssignOp::ClampSilent => {}
+    }
+}
+
+/// Applies an operator's length policy to a literal string, mirroring
+/// [`check_number_range`].
+#[allow(clippy::too_many_arguments)]
+fn check_string_length(
+    scene_name: &str,
+    path: &str,
+    label: &str,
+    op: AssignOp,
+    length: usize,
+    max_length: usize,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    if length <= max_length {
+        return;
+    }
+    match op {
+        AssignOp::Strict => errors.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" to a {length}-character string, longer than {max_length}; use \":=\" to truncate"
+        )),
+        AssignOp::ClampWarn => warnings.push(format!(
+            "scene \"{scene_name}\": {path} sets \"{label}\" via \":=\" to a {length}-character string, longer than {max_length} - truncated"
+        )),
+        AssignOp::ClampSilent => {}
     }
 }
 
@@ -2272,11 +2407,12 @@ pub async fn set_image_from_file<D: ButtonDevice>(
     Ok(())
 }
 
-/// A config `defaults` field settable at runtime via a `$path := value` action.
+/// A writable `defaults` parameter, settable at runtime by an assignment action.
 ///
-/// Currently the only two settable parameters; everything else in the config (all of
-/// `devices`/`scenes`, the rest of `defaults`, and `version`) is read-only - see
-/// [`classify_config_path`].
+/// The `defaults` address space behaves like variables that also drive the device: a
+/// write updates the stored value and pushes the matching hardware setting. Its other
+/// members (`short_press_duration`, `double_click_gap`) are read-only - see
+/// [`classify_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettableDefault {
     ButtonBrightness,
@@ -2293,171 +2429,213 @@ impl SettableDefault {
         }
     }
 
-    /// The value constraint `:=`/`~=` clamp or truncate into (and `=` will hard-error
-    /// against, once implemented). Both of today's settable parameters are numeric
-    /// brightness percentages, matching `mirajazz::Device::set_brightness`/
-    /// `set_led_brightness`'s own internal `percent.clamp(0, 100)`.
+    /// The inclusive numeric range the parameter accepts, matching
+    /// `mirajazz::Device::set_brightness`/`set_led_brightness`'s own internal
+    /// `percent.clamp(0, 100)`.
     fn constraint(&self) -> Constraint {
+        Constraint::NumberRange { min: 0, max: 100 }
+    }
+
+    /// The value a non-strict assignment resets the parameter to when a command's output
+    /// cannot be converted: the configured `defaults` value loaded at startup.
+    pub fn default_value(&self, defaults: &Defaults) -> i32 {
         match self {
-            SettableDefault::ButtonBrightness | SettableDefault::EncoderBrightness => {
-                Constraint::NumberRange { min: 0, max: 100 }
+            SettableDefault::ButtonBrightness => defaults.button_brightness as i32,
+            SettableDefault::EncoderBrightness => defaults.encoder_brightness as i32,
+        }
+    }
+}
+
+/// The numeric constraint an assignment clamps into (`:=`/`~=`) or hard-errors against
+/// (`=`).
+enum Constraint {
+    /// A number must fall within `min..=max` (inclusive on both ends).
+    NumberRange { min: i64, max: i64 },
+}
+
+/// The target of an assignment action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignTarget {
+    /// A user variable, by name.
+    Variable(String),
+    /// A writable `defaults` parameter.
+    Default(SettableDefault),
+}
+
+/// The right-hand side of an assignment action, before clamping/conversion.
+///
+/// A quoted `"123"` is text, not the number `123`: a numeric target rejects it rather
+/// than silently coercing it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AssignRhs {
+    /// A signed integer literal (signed so a negative value can clamp up to a minimum).
+    Int(i64),
+    /// A `"double-quoted string"` literal (no escape support inside the quotes yet).
+    Str(String),
+    /// Another variable, read at action time.
+    Variable(VarRef),
+}
+
+/// The assignment operator of a `$target <op> value` action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignOp {
+    /// `=` - rejects an out-of-range/over-long value instead of clamping/truncating.
+    Strict,
+    /// `:=` - clamps a number or truncates a string into the target's constraints, and
+    /// warns when it had to.
+    ClampWarn,
+    /// `~=` - the same clamping/truncation as [`AssignOp::ClampWarn`], but silently.
+    ClampSilent,
+}
+
+/// How an assignment target classifies against the actual config, given the declarations.
+enum TargetClass {
+    /// A declared user variable.
+    Variable(String),
+    /// A writable `defaults` parameter.
+    Default(SettableDefault),
+    /// A real but immutable config field/section.
+    ReadOnly(String),
+    /// A syntactically valid variable name that is not declared.
+    UndefinedVariable(String),
+    /// Not a real config path or declared variable at all.
+    Unknown(String),
+}
+
+/// Classifies an assignment target path against the config schema and declarations.
+///
+/// `devices.*`/`scenes.*` (and the whole `version`/`scenes`/`devices`/`defaults` keys)
+/// are read-only wholesale rather than field-by-field, since their shapes are
+/// config-author-chosen. `defaults.*` has an exact, fixed field list: the two brightness
+/// keys are writable, the two timing keys are read-only, and anything else under
+/// `defaults` does not exist. Everything else is a variable reference (`$name` or
+/// `$var.name`), declared or not.
+fn classify_target(path: &str, variables: &Variables) -> TargetClass {
+    match path {
+        "defaults.button_brightness" => TargetClass::Default(SettableDefault::ButtonBrightness),
+        "defaults.encoder_brightness" => TargetClass::Default(SettableDefault::EncoderBrightness),
+        "defaults.short_press_duration" | "defaults.double_click_gap" => {
+            TargetClass::ReadOnly(path.to_string())
+        }
+        "version" | "scenes" | "devices" | "defaults" => TargetClass::ReadOnly(path.to_string()),
+        _ if path.starts_with("devices.") || path.starts_with("scenes.") => {
+            TargetClass::ReadOnly(path.to_string())
+        }
+        _ if path.starts_with("defaults.") => TargetClass::Unknown(path.to_string()),
+        _ => {
+            let name = path.strip_prefix("var.").unwrap_or(path);
+            if is_valid_name(name) && (path.starts_with("var.") || !is_reserved_name(name)) {
+                if variables.store().contains(name) {
+                    TargetClass::Variable(name.to_string())
+                } else {
+                    TargetClass::UndefinedVariable(name.to_string())
+                }
+            } else {
+                TargetClass::Unknown(path.to_string())
             }
         }
     }
 }
 
-/// The value constraint a settable parameter's assignment operator checks against -
-/// what `:=`/`~=` clamp or truncate into, and what `=` will hard-error against once
-/// implemented (see [`AssignOp`]).
-enum Constraint {
-    /// A number must fall within `min..=max` (inclusive on both ends).
-    NumberRange { min: i64, max: i64 },
-    /// A string must be at most `max_len` characters. Reserved for a future
-    /// string-typed settable parameter; [`SettableDefault::constraint`] never returns
-    /// this today, since both current settable parameters are numeric.
-    #[allow(dead_code)]
-    MaxLength(usize),
-}
-
-/// The right-hand-side literal of a `$path <op> value` action, before it's matched
-/// against the type a specific [`SettableDefault`] expects.
+/// Splits a `$target <op> rhs` action into its raw target path, assignment operator and
+/// parsed right-hand side.
 ///
-/// Kept distinct from [`AssignedValue::Number`] on purpose: a quoted `"123"` is text,
-/// not the number `123`, so a settable parameter that requires a number rejects a
-/// quoted numeral instead of silently coercing it - see [`check_action_value`].
-#[derive(Debug, Clone, PartialEq)]
-enum AssignedValue {
-    /// A signed integer literal, e.g. `-10`, `0`, `100` - signed so a negative value
-    /// can be clamped up to a constraint's `min` instead of being rejected outright as
-    /// unparsable.
-    Number(i64),
-    Text(String),
-}
-
-/// The assignment operator of a `$path <op> value` action.
-///
-/// Only [`AssignOp::ClampWarn`] (`:=`) is implemented today; the other two are
-/// recognized by [`parse_set_config`] (so a config author's choice of operator is
-/// remembered and can be reported back with a clear "not implemented yet" error
-/// instead of a generic "malformed" one) but rejected by [`check_set_config_action`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AssignOp {
-    /// `=` - **not yet implemented.** Will hard-error instead of clamping/truncating
-    /// when the value violates the target's [`Constraint`]. For a constant literal
-    /// (today's only supported right-hand side) that check could happen entirely at
-    /// config-load time, same as `:=`'s out-of-range case used to before this operator
-    /// family existed; once real runtime variables exist, the same check will instead
-    /// need to happen when the action actually fires, since the value won't be known
-    /// until then.
-    Strict,
-    /// `:=` - clamps a number into its [`Constraint`]'s range, or (once a string-typed
-    /// settable parameter exists) truncates a string to its max length, and warns
-    /// when it had to.
-    ClampWarn,
-    /// `~=` - **not yet implemented.** Will apply the same clamping/truncation as
-    /// `ClampWarn`, but silently - no warning even when the value was out of range.
-    ClampSilent,
-}
-
-/// How a `$`-action's dotted path resolves against the config schema.
-enum ParamClass {
-    /// A real, currently-settable parameter.
-    Settable(SettableDefault),
-    /// A real config field or section that isn't (yet) settable at runtime.
-    ReadOnly,
-    /// Not a real config path at all (typo, or a section/field that doesn't exist).
-    Unknown,
-}
-
-/// Classifies a `$`-action's dotted path against the config schema.
-///
-/// `devices.*`/`scenes.*` are read-only wholesale rather than field-by-field: both
-/// sections are dynamically shaped (device ids, scene names, control references are
-/// all config-author-chosen), so there is no fixed field list to check deeper than the
-/// section name - anything under either is real but immutable. `defaults.*` has an
-/// exact, fixed field list, so it's checked field-by-field instead: the two brightness
-/// keys are settable, `short_press_duration`/`double_click_gap` are read-only, and any
-/// other `defaults.*` field is unknown (no such field exists).
-fn classify_config_path(path: &str) -> ParamClass {
-    match path {
-        "defaults.button_brightness" => ParamClass::Settable(SettableDefault::ButtonBrightness),
-        "defaults.encoder_brightness" => ParamClass::Settable(SettableDefault::EncoderBrightness),
-        "defaults.short_press_duration"
-        | "defaults.double_click_gap"
-        | "version"
-        | "scenes"
-        | "devices"
-        | "defaults" => ParamClass::ReadOnly,
-        _ if path.starts_with("devices.") || path.starts_with("scenes.") => ParamClass::ReadOnly,
-        _ => ParamClass::Unknown,
-    }
-}
-
-/// Splits a `$path <op> value` action string into its dotted path, assignment
-/// operator, and parsed right-hand-side literal.
-///
-/// Recognizes all three operators (`:=`, `~=`, `=`, checked in that order so `:=`'s own
-/// `=` character is never mis-split as the bare `=` operator, and likewise for `~=`)
-/// even though only `:=` is implemented ([`AssignOp`]) - that way a config using `=`/
-/// `~=` gets a clear "not implemented yet" error from [`check_set_config_action`]
-/// instead of a generic "malformed" one.
-///
-/// Returns `None` when `value` doesn't start with `$`, has no operator at all, has an
-/// empty path or right-hand side, or a right-hand side that is neither a bare signed
-/// integer (e.g. `-10`, `100`) nor a `"double-quoted string"` (no escape support inside
-/// quotes yet). Doesn't check the path against the config schema at all - that's
-/// [`classify_config_path`]'s job, called separately by both [`check_action_value`]
-/// (which needs to report path-specific errors) and [`parse_action`] (which just needs
-/// *a* parsed value or none).
-fn parse_set_config(value: &str) -> Option<(String, AssignOp, AssignedValue)> {
+/// The target runs from the `$` up to the first whitespace or operator character, so the
+/// operator is always the one the author wrote and never one appearing inside the
+/// right-hand side. The three operators (`:=`, `~=`, `=`) are checked in that order so
+/// `:=` is not mis-split as `=`. Returns `None` when there is no leading `$`, no operator,
+/// an empty target, or a malformed right-hand side (see [`parse_rhs`]).
+fn parse_assignment(value: &str) -> Option<(String, AssignOp, AssignRhs)> {
     let rest = value.strip_prefix('$')?;
-    let (path, op, rhs) = if let Some((path, rhs)) = rest.split_once(":=") {
-        (path, AssignOp::ClampWarn, rhs)
-    } else if let Some((path, rhs)) = rest.split_once("~=") {
-        (path, AssignOp::ClampSilent, rhs)
-    } else if let Some((path, rhs)) = rest.split_once('=') {
-        (path, AssignOp::Strict, rhs)
+    let target_end = rest
+        .find(|c: char| c.is_whitespace() || c == ':' || c == '~' || c == '=')
+        .unwrap_or(rest.len());
+    let target = rest[..target_end].trim();
+    if target.is_empty() {
+        return None;
+    }
+    let after = rest[target_end..].trim_start();
+    let (op, rhs) = if let Some(rhs) = after.strip_prefix(":=") {
+        (AssignOp::ClampWarn, rhs)
+    } else if let Some(rhs) = after.strip_prefix("~=") {
+        (AssignOp::ClampSilent, rhs)
+    } else if let Some(rhs) = after.strip_prefix('=') {
+        (AssignOp::Strict, rhs)
     } else {
         return None;
     };
-    let path = path.trim();
     let rhs = rhs.trim();
-    if path.is_empty() || rhs.is_empty() {
+    if rhs.is_empty() {
         return None;
     }
-    let parsed = if let Some(inner) = rhs
+    Some((target.to_string(), op, parse_rhs(rhs)?))
+}
+
+/// Parses an assignment's right-hand side: a single variable reference (`$b`), a
+/// `"double-quoted string"` literal, or a bare signed integer.
+fn parse_rhs(text: &str) -> Option<AssignRhs> {
+    if text.starts_with('$') {
+        return parse_lone_reference(text).map(AssignRhs::Variable);
+    }
+    if let Some(inner) = text
         .strip_prefix('"')
         .and_then(|rest| rest.strip_suffix('"'))
     {
-        AssignedValue::Text(inner.to_string())
-    } else if let Ok(number) = rhs.parse::<i64>() {
-        AssignedValue::Number(number)
-    } else {
-        return None;
-    };
-    Some((path.to_string(), op, parsed))
+        return Some(AssignRhs::Str(inner.to_string()));
+    }
+    text.parse::<i64>().ok().map(AssignRhs::Int)
+}
+
+/// Classifies a raw target path into a typed target using syntax only, without any
+/// declarations: `parse_action` runs without a variable store, so a syntactically valid
+/// variable target is accepted here and checked against the declarations during config
+/// validation ([`classify_target`]).
+fn classify_assign_target_syntax(path: &str) -> Option<AssignTarget> {
+    match path {
+        "defaults.button_brightness" => {
+            Some(AssignTarget::Default(SettableDefault::ButtonBrightness))
+        }
+        "defaults.encoder_brightness" => {
+            Some(AssignTarget::Default(SettableDefault::EncoderBrightness))
+        }
+        _ => {
+            if let Some(name) = path.strip_prefix("var.") {
+                is_valid_name(name).then(|| AssignTarget::Variable(name.to_string()))
+            } else if is_valid_name(path) && !is_reserved_name(path) {
+                Some(AssignTarget::Variable(path.to_string()))
+            } else {
+                None
+            }
+        }
+    }
 }
 
 /// The outcome of an action value: stay on the scene, switch to another scene, run a
-/// command, or set a runtime-settable config parameter.
+/// command, or assign to a variable/default.
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Stay,
-    SwitchScene { scene: String },
-    Command { command: String },
-    SetConfig { param: SettableDefault, value: u8 },
+    SwitchScene {
+        scene: String,
+    },
+    Command {
+        command: String,
+    },
+    Assign {
+        target: AssignTarget,
+        op: AssignOp,
+        rhs: AssignRhs,
+    },
 }
 
 /// Classifies an action value: a bare `@` stays, `@name` switches scene, a well-formed
-/// `$path := value` targeting a settable parameter with `:=` (today's only
-/// implemented operator - see [`AssignOp`]) sets it, anything else (including a
-/// malformed or not-yet-implemented `$`-action - config validation is the real gate
-/// against those ever reaching here) is a command.
+/// `$target <op> rhs` assignment (see [`parse_assignment`]) whose target is
+/// syntactically a variable or a writable default assigns, and anything else - including
+/// a malformed or read-only/unknown `$`-action, which config validation is the real gate
+/// against - is a command.
 ///
-/// A `:=` number is clamped into its target's [`Constraint`] here exactly like
-/// [`check_set_config_action`] already validated at config-load time (e.g. `:=
-/// 9999999999999` on a `0`-`100` parameter becomes `100`), so the value actually sent
-/// to the device always matches what was validated/warned about.
+/// Clamping/truncation is deferred to when the action fires (see [`apply_assignment`]),
+/// since a variable right-hand side is only known then.
 ///
 /// Note the breaking change from earlier versions: `~` no longer means "stay" (that's
 /// now a bare `@`, freeing `~` up for the home-directory expansion [`expand_tilde`]
@@ -2473,30 +2651,14 @@ pub fn parse_action(value: &str) -> Action {
             }
         }
     } else if value.starts_with('$') {
-        match parse_set_config(value) {
-            Some((path, AssignOp::ClampWarn, AssignedValue::Number(number))) => {
-                match classify_config_path(&path) {
-                    ParamClass::Settable(param) => {
-                        let Constraint::NumberRange { min, max } = param.constraint() else {
-                            unreachable!(
-                                "no settable string parameter exists yet - see \
-                                 Constraint::MaxLength's doc comment"
-                            )
-                        };
-                        // Safe: every constraint in use today has a `max` that fits in
-                        // a u8 (0-100), so the clamped value always does too.
-                        let clamped = number.clamp(min, max) as u8;
-                        Action::SetConfig {
-                            param,
-                            value: clamped,
-                        }
-                    }
-                    _ => Action::Command {
-                        command: value.to_string(),
-                    },
-                }
-            }
-            _ => Action::Command {
+        match parse_assignment(value) {
+            Some((target_path, op, rhs)) => match classify_assign_target_syntax(&target_path) {
+                Some(target) => Action::Assign { target, op, rhs },
+                None => Action::Command {
+                    command: value.to_string(),
+                },
+            },
+            None => Action::Command {
                 command: value.to_string(),
             },
         }
@@ -2505,6 +2667,170 @@ pub fn parse_action(value: &str) -> Action {
             command: value.to_string(),
         }
     }
+}
+
+/// One scalar value on its way into an assignment, kept in its source precision until it
+/// is clamped/truncated for the target.
+enum Scalar {
+    /// An integer, as parsed (before clamping to the target's `i32` range).
+    Int(i64),
+    /// A string.
+    Str(String),
+}
+
+/// Applies an assignment whose value is known now - a literal or another variable's
+/// current value. Returns the writable default and its new value when the target is one,
+/// so the caller can push it to the device; returns `None` for a variable target or a
+/// rejected assignment.
+///
+/// `warn` controls whether a clamp/truncation is reported here: a literal was already
+/// validated (and warned about) at config-load time, while a variable's value is only
+/// known now.
+pub fn apply_assignment(
+    target: &AssignTarget,
+    op: AssignOp,
+    rhs: &AssignRhs,
+    variables: &mut Variables,
+    warn: bool,
+    log: Log,
+) -> Option<(SettableDefault, i32)> {
+    let scalar = match rhs {
+        AssignRhs::Int(number) => Scalar::Int(*number),
+        AssignRhs::Str(text) => Scalar::Str(text.clone()),
+        AssignRhs::Variable(reference) => match variables.store().get(&reference.name) {
+            Some(crate::variables::VarValue::Int(number)) => Scalar::Int(*number as i64),
+            Some(crate::variables::VarValue::Str(text)) => Scalar::Str(text.clone()),
+            None => {
+                log.error(format!(
+                    "assignment reads undefined variable \"{reference}\""
+                ));
+                return None;
+            }
+        },
+    };
+
+    match target {
+        AssignTarget::Variable(name) => {
+            let Some(def) = variables.store().def(name).cloned() else {
+                log.error(format!("assignment to undeclared variable \"${name}\""));
+                return None;
+            };
+            match (def.kind, scalar) {
+                (VarType::Int, Scalar::Int(number)) => {
+                    let value = clamp_int(
+                        number,
+                        def.min as i64,
+                        def.max as i64,
+                        op,
+                        &format!("${name}"),
+                        warn,
+                        log,
+                    )?;
+                    variables
+                        .store_mut()
+                        .set(name, crate::variables::VarValue::Int(value));
+                }
+                (VarType::Str, Scalar::Str(text)) => {
+                    let value =
+                        truncate_str(text, def.max_length, op, &format!("${name}"), warn, log)?;
+                    variables
+                        .store_mut()
+                        .set(name, crate::variables::VarValue::Str(value));
+                }
+                (kind, _) => {
+                    log.error(format!(
+                        "assignment to ${name} has the wrong type, expected {}",
+                        match kind {
+                            VarType::Int => "an int",
+                            VarType::Str => "a string",
+                        }
+                    ));
+                    return None;
+                }
+            }
+            None
+        }
+        AssignTarget::Default(param) => {
+            let Scalar::Int(number) = scalar else {
+                log.error(format!("assignment to {} requires a number", param.path()));
+                return None;
+            };
+            let Constraint::NumberRange { min, max } = param.constraint();
+            let value = clamp_int(number, min, max, op, param.path(), warn, log)?;
+            match param {
+                SettableDefault::ButtonBrightness => variables.set_button_brightness(value),
+                SettableDefault::EncoderBrightness => variables.set_encoder_brightness(value),
+            }
+            Some((*param, value))
+        }
+    }
+}
+
+/// Clamps `number` into `min..=max`, applying the operator's policy: `=` rejects an
+/// out-of-range value, `:=` clamps (warning when `warn`), `~=` clamps silently. Returns
+/// `None` only when a strict assignment rejected the value.
+fn clamp_int(
+    number: i64,
+    min: i64,
+    max: i64,
+    op: AssignOp,
+    label: &str,
+    warn: bool,
+    log: Log,
+) -> Option<i32> {
+    if number < min || number > max {
+        let clamped = number.clamp(min, max);
+        match op {
+            AssignOp::Strict => {
+                log.error(format!(
+                    "assignment to {label} rejected out-of-range value {number} (allowed {min}..={max})"
+                ));
+                return None;
+            }
+            AssignOp::ClampWarn => {
+                if warn {
+                    log.warn(format!(
+                        "assignment to {label} clamped out-of-range value {number} to {clamped}"
+                    ));
+                }
+            }
+            AssignOp::ClampSilent => {}
+        }
+        return Some(clamped as i32);
+    }
+    Some(number as i32)
+}
+
+/// Truncates `text` to at most `max_length` characters, applying the operator's policy
+/// like [`clamp_int`]. Returns `None` only when a strict assignment rejected the value.
+fn truncate_str(
+    text: String,
+    max_length: usize,
+    op: AssignOp,
+    label: &str,
+    warn: bool,
+    log: Log,
+) -> Option<String> {
+    if text.chars().count() > max_length {
+        match op {
+            AssignOp::Strict => {
+                log.error(format!(
+                    "assignment to {label} rejected a value longer than {max_length} characters"
+                ));
+                return None;
+            }
+            AssignOp::ClampWarn => {
+                if warn {
+                    log.warn(format!(
+                        "assignment to {label} truncated a value longer than {max_length} characters"
+                    ));
+                }
+            }
+            AssignOp::ClampSilent => {}
+        }
+        return Some(text.chars().take(max_length).collect());
+    }
+    Some(text)
 }
 
 /// Reads an action value - a single string or an array of them, per [`check_action_values`]
@@ -3240,61 +3566,79 @@ mod tests {
         );
     }
 
-    /// A well-formed `$`-assignment targeting a settable parameter classifies as
-    /// `SetConfig`.
+    /// A well-formed `$`-assignment classifies as `Assign`, with the right target,
+    /// operator and right-hand side for literals, variable references and both scopes.
     #[test]
-    fn parse_action_classifies_valid_set_config() {
+    fn parse_action_classifies_assignments() {
+        use crate::variables::{Scope, VarRef};
         assert_eq!(
             super::parse_action("$defaults.button_brightness := 80"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 80,
+            super::Action::Assign {
+                target: super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Int(80),
             }
         );
         assert_eq!(
-            super::parse_action("$defaults.encoder_brightness := 5"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::EncoderBrightness,
-                value: 5,
+            super::parse_action("$count ~= 5"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("count".to_string()),
+                op: super::AssignOp::ClampSilent,
+                rhs: super::AssignRhs::Int(5),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$var.count = -10"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("count".to_string()),
+                op: super::AssignOp::Strict,
+                rhs: super::AssignRhs::Int(-10),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$name := \"hi\""),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("name".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Str("hi".to_string()),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$a := $b"),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("a".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "b".to_string(),
+                }),
+            }
+        );
+        assert_eq!(
+            super::parse_action("$defaults.encoder_brightness := $level"),
+            super::Action::Assign {
+                target: super::AssignTarget::Default(super::SettableDefault::EncoderBrightness),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "level".to_string(),
+                }),
             }
         );
     }
 
-    /// `:=` clamps an out-of-range number into its target's constraint (`0`-`100` for
-    /// both of today's settable parameters) instead of rejecting it - a negative
-    /// number clamps up to `0`, and one above the max clamps down to `100`, matching
-    /// [`super::check_set_config_action`]'s validation-time warning for the same value.
-    #[test]
-    fn parse_action_clamps_out_of_range_numbers_for_settable_default() {
-        assert_eq!(
-            super::parse_action("$defaults.button_brightness := -10"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 0,
-            }
-        );
-        assert_eq!(
-            super::parse_action("$defaults.button_brightness := 9999999999999"),
-            super::Action::SetConfig {
-                param: super::SettableDefault::ButtonBrightness,
-                value: 100,
-            }
-        );
-    }
-
-    /// A `$`-assignment targeting a read-only/unknown parameter, one with the wrong
-    /// value type, or one using a not-yet-implemented operator (`=`/`~=`), falls back
-    /// to being treated as a literal command at runtime - config validation is the
+    /// A `$`-assignment that is not syntactically a variable or writable default falls
+    /// back to being treated as a literal command at runtime - config validation is the
     /// real gate against these ever being used.
     #[test]
-    fn parse_action_falls_back_to_command_for_invalid_set_config() {
+    fn parse_action_falls_back_to_command_for_unusable_assignments() {
         for value in [
-            "$defaults.short_press_duration := 100", // read-only
+            "$defaults.short_press_duration := 100", // read-only, not a writable default
             "$devices.1.key_count := 5",             // read-only
-            "$foo.bar := 1",                         // unknown
-            "$defaults.button_brightness := \"80\"", // wrong type
-            "$defaults.button_brightness = 80",      // not-yet-implemented operator "="
-            "$defaults.button_brightness ~= 80",     // not-yet-implemented operator "~="
+            "$foo.bar := 1",                         // unknown scope
+            "$defaults.button_brightness := high",   // unparsable right-hand side
+            "$defaults.button_brightness 80",        // no operator
+            "$ := 80",                               // empty target
         ] {
             assert_eq!(
                 super::parse_action(value),
@@ -3306,114 +3650,191 @@ mod tests {
         }
     }
 
-    /// [`super::classify_config_path`] recognizes the two settable paths, treats the
-    /// rest of `defaults` and all of `devices`/`scenes` as read-only, and anything else
-    /// as unknown.
-    #[test]
-    fn classify_config_path_covers_settable_readonly_and_unknown() {
-        assert!(matches!(
-            super::classify_config_path("defaults.button_brightness"),
-            super::ParamClass::Settable(super::SettableDefault::ButtonBrightness)
-        ));
-        assert!(matches!(
-            super::classify_config_path("defaults.encoder_brightness"),
-            super::ParamClass::Settable(super::SettableDefault::EncoderBrightness)
-        ));
-        for path in [
-            "defaults.short_press_duration",
-            "defaults.double_click_gap",
-            "version",
-            "scenes",
-            "devices",
-            "defaults",
-            "devices.1.key_count",
-            "scenes.on_start.setup",
-        ] {
-            assert!(
-                matches!(
-                    super::classify_config_path(path),
-                    super::ParamClass::ReadOnly
-                ),
-                "expected {path} to be read-only"
-            );
-        }
-        for path in [
-            "foo.bar",
-            "defaults.nonexistent",
-            "default.button_brightness",
-        ] {
-            assert!(
-                matches!(
-                    super::classify_config_path(path),
-                    super::ParamClass::Unknown
-                ),
-                "expected {path} to be unknown"
-            );
-        }
+    /// A variable store for assignment tests: `count` is an int in `0..=10` and `name`
+    /// is a string of at most 3 characters.
+    fn assignment_variables() -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), crate::variables::VarDef::int(0, 10, 5));
+        defs.insert(
+            "name".to_string(),
+            crate::variables::VarDef::string(3, "abc".to_string()),
+        );
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
     }
 
-    /// [`super::parse_set_config`] splits a well-formed `$path <op> value` action,
-    /// distinguishing a quoted string from a bare number - `"123"` is never treated as
-    /// the number `123` - and recognizes all three assignment operators (`:=`, `~=`,
-    /// `=`, checked in that order so `:=`'s own `=` character is never mis-split as the
-    /// bare `=` operator), even though only `:=` is implemented ([`super::AssignOp`]).
+    /// `clamp_int` passes an in-range value through, clamps out-of-range values for
+    /// `:=`/`~=`, and rejects them for `=`.
     #[test]
-    fn parse_set_config_distinguishes_numbers_strings_and_operators() {
+    fn clamp_int_applies_operator_policy() {
+        let log = crate::log::Log::default();
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Number(80)
-            ))
+            super::clamp_int(50, 0, 100, super::AssignOp::Strict, "x", true, log),
+            Some(50)
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := \"80\""),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Text("80".to_string())
-            ))
+            super::clamp_int(200, 0, 100, super::AssignOp::ClampWarn, "x", true, log),
+            Some(100)
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness ~= 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
+            super::clamp_int(-5, 0, 100, super::AssignOp::ClampSilent, "x", true, log),
+            Some(0)
+        );
+        assert_eq!(
+            super::clamp_int(200, 0, 100, super::AssignOp::Strict, "x", true, log),
+            None,
+            "a strict assignment rejects an out-of-range value"
+        );
+    }
+
+    /// `truncate_str` passes a short value through, truncates an over-long one for
+    /// `:=`/`~=`, and rejects it for `=`.
+    #[test]
+    fn truncate_str_applies_operator_policy() {
+        let log = crate::log::Log::default();
+        let text = |s: &str| s.to_string();
+        assert_eq!(
+            super::truncate_str(text("abc"), 3, super::AssignOp::Strict, "x", true, log),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            super::truncate_str(
+                text("abcdef"),
+                3,
+                super::AssignOp::ClampWarn,
+                "x",
+                true,
+                log
+            ),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            super::truncate_str(
+                text("abcdef"),
+                3,
                 super::AssignOp::ClampSilent,
-                super::AssignedValue::Number(80)
-            ))
+                "x",
+                true,
+                log
+            ),
+            Some("abc".to_string())
         );
         assert_eq!(
-            super::parse_set_config("$defaults.button_brightness = 80"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::Strict,
-                super::AssignedValue::Number(80)
-            ))
-        );
-        assert_eq!(
-            super::parse_set_config("$defaults.button_brightness := -10"),
-            Some((
-                "defaults.button_brightness".to_string(),
-                super::AssignOp::ClampWarn,
-                super::AssignedValue::Number(-10)
-            )),
-            "a negative number is a valid literal, clamped later - not malformed"
+            super::truncate_str(text("abcdef"), 3, super::AssignOp::Strict, "x", true, log),
+            None,
+            "a strict assignment rejects an over-long value"
         );
     }
 
-    /// Malformed `$`-assignments (no operator at all, empty path/value, an unquoted
-    /// non-numeric value, or no leading `$` at all) are rejected.
+    /// `apply_assignment` clamps a variable's value into its declared range, truncates a
+    /// string to its max length, and for a writable default stores the clamped value and
+    /// reports the side effect the caller must push to the device.
     #[test]
-    fn parse_set_config_rejects_malformed_input() {
+    fn apply_assignment_updates_variables_and_reports_default_side_effect() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Variable("count".to_string()),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Int(50),
+                &mut variables,
+                true,
+                log,
+            ),
+            None
+        );
+        assert_eq!(
+            variables.store().get("count"),
+            Some(&crate::variables::VarValue::Int(10))
+        );
+
+        super::apply_assignment(
+            &super::AssignTarget::Variable("name".to_string()),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Str("abcdef".to_string()),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            variables.store().get("name"),
+            Some(&crate::variables::VarValue::Str("abc".to_string()))
+        );
+
+        let side_effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Int(200),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            side_effect,
+            Some((super::SettableDefault::ButtonBrightness, 100))
+        );
+        assert_eq!(variables.button_brightness(), 100);
+    }
+
+    /// `parse_assignment` splits the target from the operator and parses each kind of
+    /// right-hand side, without mistaking a character inside the right-hand side for the
+    /// assignment's own operator.
+    #[test]
+    fn parse_assignment_splits_target_operator_and_rhs() {
+        use crate::variables::{Scope, VarRef};
+        assert_eq!(
+            super::parse_assignment("$defaults.button_brightness := 80"),
+            Some((
+                "defaults.button_brightness".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Int(80)
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$a := \"a=b\""),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Str("a=b".to_string())
+            )),
+            "an `=` inside a quoted right-hand side is not the operator"
+        );
+        assert_eq!(
+            super::parse_assignment("$a := $b"),
+            Some((
+                "a".to_string(),
+                super::AssignOp::ClampWarn,
+                super::AssignRhs::Variable(VarRef {
+                    scope: Scope::Var,
+                    name: "b".to_string(),
+                })
+            ))
+        );
+        assert_eq!(
+            super::parse_assignment("$var.a = -10"),
+            Some((
+                "var.a".to_string(),
+                super::AssignOp::Strict,
+                super::AssignRhs::Int(-10)
+            ))
+        );
+    }
+
+    /// Malformed assignments (no leading `$`, no operator, empty target, or a
+    /// right-hand side that is not a literal or a single variable reference) are
+    /// rejected.
+    #[test]
+    fn parse_assignment_rejects_malformed_input() {
         for value in [
-            "defaults.button_brightness := 80",    // no leading $
-            "$defaults.button_brightness 80",      // no operator at all
-            "$ := 80",                             // empty path
-            "$defaults.button_brightness := ",     // empty value
-            "$defaults.button_brightness := high", // unquoted non-numeric
+            "a := 80",    // no leading $
+            "$a 80",      // no operator at all
+            "$ := 80",    // empty target
+            "$a := ",     // empty right-hand side
+            "$a := high", // unquoted non-numeric literal
+            "$a := $",    // malformed reference
         ] {
-            assert_eq!(super::parse_set_config(value), None, "for {value}");
+            assert_eq!(super::parse_assignment(value), None, "for {value}");
         }
     }
 

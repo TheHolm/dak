@@ -170,6 +170,14 @@ impl VariableStore {
     }
 }
 
+/// Names that a variable declaration may not use: the scope keywords (`var`,
+/// `defaults`) and the reserved read-only top-level config keys (`version`, `scenes`,
+/// `devices`). Keeping these reserved means a `$` reference is never ambiguous between a
+/// variable and a built-in scope/config path.
+pub fn is_reserved_name(name: &str) -> bool {
+    matches!(name, "var" | "defaults" | "version" | "scenes" | "devices")
+}
+
 /// Whether `name` is a valid variable name: a nonempty sequence starting with an ASCII
 /// letter, followed by ASCII letters, digits or underscores.
 ///
@@ -217,6 +225,12 @@ fn check_variable(name: &str, declaration: &Value, errors: &mut Vec<String>) -> 
     if !is_valid_name(name) {
         errors.push(format!(
             "variables: invalid variable name \"{name}\", expected a name starting with a letter and containing only letters, digits and underscores"
+        ));
+        return None;
+    }
+    if is_reserved_name(name) {
+        errors.push(format!(
+            "variables: \"{name}\" is a reserved name (a scope keyword or read-only config key) and cannot be declared"
         ));
         return None;
     }
@@ -550,6 +564,32 @@ pub fn references_in(text: &str) -> Result<Vec<VarRef>, String> {
         Ok(String::new())
     })?;
     Ok(refs)
+}
+
+/// Parses `text` as exactly one whole `$` reference, with no surrounding literal text or
+/// escapes - the form an assignment's right-hand side takes (`$a := $b`). Returns `None`
+/// for anything else, including a malformed reference.
+pub fn parse_lone_reference(text: &str) -> Option<VarRef> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    if chars.get(index) != Some(&'$') {
+        return None;
+    }
+    index += 1;
+    let first = parse_name(&chars, &mut index)?;
+    let scope = Scope::parse(&first);
+    let reference = if scope.is_some() && chars.get(index) == Some(&'.') {
+        let scope = scope.expect("checked just above");
+        index += 1;
+        let name = parse_name(&chars, &mut index)?;
+        VarRef { scope, name }
+    } else {
+        VarRef {
+            scope: Scope::Var,
+            name: first,
+        }
+    };
+    (index == chars.len()).then_some(reference)
 }
 
 /// The current state of every variable and `defaults` parameter.

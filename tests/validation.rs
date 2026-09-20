@@ -1236,20 +1236,92 @@ fn in_range_set_config_value_has_no_clamp_warning() {
     );
 }
 
-/// The `=` and `~=` assignment operators are recognized (not "malformed") but rejected
-/// with a distinct "not implemented yet" error, pointing at `:=` as the alternative -
-/// see the README's TODO entry for their planned future behavior.
+/// All three assignment operators are implemented for `defaults` targets: `:=` clamps
+/// with a warning, `~=` clamps silently, and `=` accepts an in-range value but rejects
+/// an out-of-range one.
 #[test]
-fn rejects_not_yet_implemented_assignment_operators() {
-    for (value, operator) in [
-        ("$defaults.button_brightness = 80", "\"=\""),
-        ("$defaults.button_brightness ~= 80", "\"~=\""),
+fn assignment_operators_are_all_implemented_for_defaults() {
+    for value in [
+        "$defaults.button_brightness := 200", // clamps, warns
+        "$defaults.button_brightness ~= 200", // clamps, silent
+        "$defaults.button_brightness = 80",   // in range
     ] {
-        assert_validation_error(
-            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{value}"}}}}}}}}"#),
-            &format!(
-                "uses {operator} on \"defaults.button_brightness\", which is not implemented yet"
-            ),
+        let path = write_scenes_config(&format!(
+            r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{value}"}}}}}}}}"#
+        ));
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(config.is_ok(), "{value}: {:?}", config.err());
+    }
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness ~= 200"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !config
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("clamped")),
+        "~= clamps silently"
+    );
+
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness = 200"}}}}"#,
+        "outside 0..=100",
+    );
+}
+
+/// Variable assignments are type-checked and, for literals, range-checked at load time:
+/// `:=` clamps with a warning, `=` rejects an out-of-range value, and wrong-type or
+/// undefined right-hand sides are hard errors.
+#[test]
+fn validates_variable_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 10, "value": 5}, "name": {"type": "str", "max_length": 3, "value": "abc"}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": ["$count := 7", "$name := \"hi\"", "$count := $count"]}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := 100"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        config
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("out of range 0-10")),
+        ":= clamps an out-of-range variable value with a warning"
+    );
+
+    for (action, expected) in [
+        ("$count = 100", "outside 0..=10"),
+        ("$count := \"x\"", "int variable"),
+        ("$name := 5", "string variable"),
+        ("$count := $name", "which is a string"),
+        ("$missing := 5", "sets undefined variable"),
+    ] {
+        let escaped = action.replace('"', "\\\"");
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{escaped}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "{action}: expected {expected:?}, got: {errors}"
         );
     }
 }
