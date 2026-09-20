@@ -829,6 +829,21 @@ mod tests {
         }
     }
 
+    /// Reserved names (scope keywords and read-only top-level config keys) cannot be
+    /// declared as variables.
+    #[test]
+    fn check_variable_rejects_reserved_names() {
+        for name in ["var", "defaults", "version", "scenes", "devices"] {
+            let mut errors = Vec::new();
+            let def = check_variable(name, &json!({ "type": "int" }), &mut errors);
+            assert!(def.is_none(), "{name} should not be declarable");
+            assert!(
+                errors.iter().any(|error| error.contains("reserved")),
+                "{name}: {errors:?}"
+            );
+        }
+    }
+
     /// The store starts every declared variable at its initial value, looks declarations
     /// and values up by name, and `set` only touches declared variables.
     #[test]

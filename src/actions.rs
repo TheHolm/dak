@@ -4342,6 +4342,170 @@ mod tests {
         assert_eq!(shell.args, ["-c", "/bin/echo a | bc"]);
     }
 
+    /// `resolve_action` expands references in ordinary values but parses an assignment
+    /// structurally, leaving its target (and any `$` in the right-hand side) alone.
+    #[test]
+    fn resolve_action_expands_values_but_not_assignment_targets() {
+        let variables = scene_variables();
+        assert_eq!(
+            super::resolve_action("/bin/echo $dir", &variables).unwrap(),
+            super::Action::Command {
+                command: "/bin/echo a".to_string()
+            }
+        );
+        assert!(super::resolve_action("/bin/echo $missing", &variables).is_err());
+        assert_eq!(
+            super::resolve_action("$dir := 5", &variables).unwrap(),
+            super::Action::Assign {
+                target: super::AssignTarget::Variable("dir".to_string()),
+                op: super::AssignOp::ClampWarn,
+                rhs: super::AssignRhs::Int(5),
+            }
+        );
+    }
+
+    /// `convert_output` takes the first non-empty, trimmed line of an int command's
+    /// output, clamps it per operator, and falls back to the default on a non-strict
+    /// conversion failure.
+    #[test]
+    fn convert_output_converts_int_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Int {
+            min: 0,
+            max: 100,
+            default: 5,
+        };
+        assert_eq!(
+            super::convert_output(
+                "\n  42 \nignored\n",
+                &conversion,
+                super::AssignOp::ClampWarn,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Int(42)
+        );
+        assert!(
+            super::convert_output("200", &conversion, super::AssignOp::Strict, "$a", log).is_err(),
+            "= rejects out-of-range command output"
+        );
+        assert_eq!(
+            super::convert_output("200", &conversion, super::AssignOp::ClampWarn, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(100)
+        );
+        assert_eq!(
+            super::convert_output("-5", &conversion, super::AssignOp::ClampSilent, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(0)
+        );
+        assert!(
+            super::convert_output("high", &conversion, super::AssignOp::Strict, "$a", log).is_err(),
+            "= fails when the output is not an integer"
+        );
+        assert_eq!(
+            super::convert_output("high", &conversion, super::AssignOp::ClampWarn, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(5),
+            ":= falls back to the default on a conversion failure"
+        );
+        assert_eq!(
+            super::convert_output("", &conversion, super::AssignOp::ClampSilent, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Int(5),
+            "~= falls back silently on empty output"
+        );
+    }
+
+    /// `convert_output` strips trailing newlines for a str target, keeps internal ones,
+    /// and applies the operator policy when truncating.
+    #[test]
+    fn convert_output_converts_str_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Str {
+            max_length: 5,
+            default: "fallback".to_string(),
+        };
+        assert_eq!(
+            super::convert_output("hello\n\n", &conversion, super::AssignOp::Strict, "$a", log)
+                .unwrap(),
+            crate::variables::VarValue::Str("hello".to_string())
+        );
+        assert_eq!(
+            super::convert_output("a\nb", &conversion, super::AssignOp::Strict, "$a", log).unwrap(),
+            crate::variables::VarValue::Str("a\nb".to_string())
+        );
+        assert!(
+            super::convert_output("toolong", &conversion, super::AssignOp::Strict, "$a", log)
+                .is_err(),
+            "= rejects a too-long command output"
+        );
+        assert_eq!(
+            super::convert_output(
+                "toolong",
+                &conversion,
+                super::AssignOp::ClampWarn,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("toolo".to_string())
+        );
+        assert_eq!(
+            super::convert_output(
+                "toolong",
+                &conversion,
+                super::AssignOp::ClampSilent,
+                "$a",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("toolo".to_string())
+        );
+    }
+
+    /// `default_value` returns the fallback for both conversion kinds.
+    #[test]
+    fn default_value_matches_conversion_kind() {
+        assert_eq!(
+            super::default_value(&super::Conversion::Int {
+                min: 0,
+                max: 1,
+                default: 3
+            }),
+            crate::variables::VarValue::Int(3)
+        );
+        assert_eq!(
+            super::default_value(&super::Conversion::Str {
+                max_length: 1,
+                default: "x".to_string()
+            }),
+            crate::variables::VarValue::Str("x".to_string())
+        );
+    }
+
+    /// `start_command_assignment` on an undeclared target reports the problem and never
+    /// spawns, so no result event is sent.
+    #[tokio::test]
+    async fn start_command_assignment_errors_on_undeclared_target() {
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(scene_variables()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        super::start_command_assignment(
+            super::AssignTarget::Variable("missing".to_string()),
+            super::AssignOp::ClampWarn,
+            "echo 1",
+            &variables,
+            tx,
+            crate::log::Log::default(),
+        );
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            matches!(received, Ok(None)),
+            "an undeclared target must not spawn a command: {received:?}"
+        );
+    }
+
     /// A variable store for scene/param tests: `dir` is a string, `period` an int.
     fn scene_variables() -> crate::variables::Variables {
         let mut defs = std::collections::BTreeMap::new();

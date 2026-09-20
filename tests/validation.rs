@@ -1372,6 +1372,27 @@ fn validates_command_substitution_assignments() {
     }
 }
 
+/// A `$(command)` right-hand side whose literal program does not exist is warned about
+/// (not rejected), matching how command actions and exec params are checked.
+#[test]
+fn warns_on_missing_command_substitution_program() {
+    let path = write_variables_config(
+        r#"{"count": {"type": "int", "min": 0, "max": 10, "value": 1}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$count := $(definitely-not-a-real-program-xyz)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("program not found")),
+        "{:?}",
+        config.warnings
+    );
+}
+
 /// A malformed `$`-assignment (no assignment operator at all) is rejected with its own
 /// distinct error.
 #[test]

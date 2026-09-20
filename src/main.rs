@@ -2120,6 +2120,51 @@ mod tests {
         assert_eq!(mock.last_button_brightness(), Some(77));
     }
 
+    /// A failed command assignment is logged and leaves the target unchanged, and a
+    /// non-numeric value for a default target is ignored rather than pushed to the device.
+    #[tokio::test]
+    async fn apply_completed_assignment_handles_failure_and_wrong_type() {
+        use dak::actions::{AssignTarget, CompletedAssign, SettableDefault};
+
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert("count".to_string(), dak::variables::VarDef::int(0, 100, 5));
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Variable("count".to_string()),
+                outcome: Err("command failed".to_string()),
+            },
+            &variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+        assert_eq!(
+            variables.lock().unwrap().store().get("count"),
+            Some(&VarValue::Int(5)),
+            "a failed assignment leaves the variable unchanged"
+        );
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::ButtonBrightness),
+                outcome: Ok(VarValue::Str("nope".to_string())),
+            },
+            &variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+        assert_eq!(mock.last_button_brightness(), None);
+        assert!(mock.calls().is_empty(), "nothing should reach the device");
+    }
+
     /// A `$defaults.encoder_brightness := 200` action that exceeds the valid range
     /// is clamped to `100` at parse time, and the clamped value is applied to the
     /// device's LED brightness.
