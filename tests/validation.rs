@@ -67,6 +67,23 @@ fn load_config_reads_repo_config_json() {
     assert!(config.is_ok(), "{:?}", config.err());
 }
 
+/// Every JSON file under `examples/` is a complete config that loads and validates.
+#[test]
+fn example_configs_load() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("the examples directory should exist") {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let config = load_config_from_path(path.to_str().unwrap());
+        assert!(config.is_ok(), "{}: {:?}", path.display(), config.err());
+        checked += 1;
+    }
+    assert!(checked >= 1, "expected at least one example config");
+}
+
 /// Malformed JSON is rejected with line and column information.
 #[test]
 fn rejects_invalid_json() {

@@ -1,5 +1,10 @@
 {
   "version": "1.0",
+  // Global values actions and setup params can read and assign. See the README's
+  // "Variables" section and the complete examples/ folder.
+  "variables": {
+    "step": { "type": "int", "min": 1, "max": 100, "value": 10 }
+  },
   "defaults": {
     "short_press_duration": 300,
     "double_click_gap": 300,
