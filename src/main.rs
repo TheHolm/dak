@@ -1727,6 +1727,241 @@ mod tests {
         assert!(previous_scene.is_none());
     }
 
+    /// A `$defaults.button_brightness := 200` action that exceeds the valid range is
+    /// clamped to `100` at parse time, and the clamped value is applied to the device.
+    #[tokio::test]
+    async fn run_action_set_config_clamps_button_brightness_to_max() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.button_brightness := 200",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // Clamped to max (100), not the raw value (200)
+        assert_eq!(mock.last_button_brightness(), Some(100));
+        assert_eq!(mock.last_encoder_brightness(), None);
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// A `$defaults.button_brightness := -10` action that is negative is clamped to
+    /// `0` at parse time, and the clamped value is applied to the device.
+    #[tokio::test]
+    async fn run_action_set_config_clamps_button_brightness_to_min() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.button_brightness := -10",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // Clamped to min (0), not the raw value (-10)
+        assert_eq!(mock.last_button_brightness(), Some(0));
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// A `$defaults.encoder_brightness := 200` action that exceeds the valid range
+    /// is clamped to `100` at parse time, and the clamped value is applied to the
+    /// device's LED brightness.
+    #[tokio::test]
+    async fn run_action_set_config_clamps_encoder_brightness_to_max() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.encoder_brightness := 200",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // Clamped to max (100), not the raw value (200)
+        assert_eq!(mock.last_encoder_brightness(), Some(100));
+        assert_eq!(mock.last_button_brightness(), None);
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// A `$defaults.encoder_brightness := -10` action that is negative is clamped to
+    /// `0` at parse time, and the clamped value is applied to the device's LED
+    /// brightness.
+    #[tokio::test]
+    async fn run_action_set_config_clamps_encoder_brightness_to_min() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.encoder_brightness := -10",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // Clamped to min (0), not the raw value (-10)
+        assert_eq!(mock.last_encoder_brightness(), Some(0));
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// A command that exits with non-zero status (e.g., `false`) is still non-blocking
+    /// and leaves the scene state untouched; `run_action` logs the failure via its
+    /// spawned task but the caller never awaits it.
+    #[tokio::test]
+    async fn run_action_nonzero_command_leaves_scene_untouched() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        // `false` exits with status 1, which `run_action`'s spawned task logs.
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "false",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // `run_action` returns immediately; the spawned task still runs.
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+        assert!(mock.calls().is_empty(), "no device calls expected");
+
+        // Wait for the spawned task to log its failure.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// A command that runs for a long time (e.g., `sleep 10`) returns immediately
+    /// without blocking `run_action`, and the caller can proceed with subsequent
+    /// actions.
+    #[tokio::test]
+    async fn run_action_slow_command_returns_immediately() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        // Start with a slow command, then switch scenes immediately.
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "sleep 10",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        // The slow command hasn't finished yet, but run_action returned.
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+
+        // Now switch scenes; this should happen immediately since the
+        // previous command was spawned on a background task.
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@Test",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(current_scene, "Test");
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+    }
+
+    /// A command with malformed quotes (unbalanced single quote) is rejected by
+    /// `parse_command_line` and `run_action` logs a warning instead of spawning
+    /// the command; scene state is untouched.
+    #[tokio::test]
+    async fn run_action_malformed_command_skipped() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        // Unbalanced single quote: the parser sees an unterminated string.
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "/bin/sh -c 'hello",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+        assert!(mock.calls().is_empty(), "no device calls expected");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     /// An `@scene` action still switches even when the target scene has a button that
     /// fails to draw: the scene name and `previous_scene` update before the setup runs,
     /// and the failing button draws the red "Error" label instead of stopping the
@@ -1812,826 +2047,5 @@ mod tests {
             state.timer_handle.is_none(),
             "an undefined scene has no timer to arm"
         );
-    }
-
-    /// An `@scene` action targeting a scene that is not defined at all fails
-    /// `enter_scene` itself, mirroring
-    /// `run_action_stay_logs_and_continues_when_scene_is_undefined` for `SwitchScene`
-    /// instead of `Stay`: the scene name and `previous_scene` still update (the switch
-    /// itself does not depend on the target existing), the failure is logged and
-    /// swallowed, and no device call is ever attempted.
-    #[tokio::test]
-    async fn run_action_switch_scene_logs_and_continues_when_target_is_undefined() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({ "on_start": { "actions": {} } });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        super::run_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            "@Missing",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        assert_eq!(
-            current_scene, "Missing",
-            "the scene name updates even though the target scene does not exist"
-        );
-        assert_eq!(previous_scene.as_deref(), Some("on_start"));
-        assert!(
-            mock.calls().is_empty(),
-            "enter_scene must fail before touching the device: {:?}",
-            mock.calls()
-        );
-    }
-
-    /// the background task to completion so `run_action_command`'s success and
-    /// failure branches both run, not just the `tokio::spawn` call itself.
-    #[tokio::test]
-    async fn run_action_command_completion_runs_for_success_and_failure() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({ "on_start": { "actions": {} } });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        super::run_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            "true",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        super::run_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            "false",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        // `run_action` spawns the command and returns immediately; yield long enough
-        // for both background tasks to run to completion (and hit their log lines)
-        // before the test ends and the runtime drops any task still in flight.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert_eq!(current_scene, "on_start", "commands never change the scene");
-    }
-
-    /// `run_bound_action` runs the action a reference bound to an event, switching
-    /// scenes; a reference without a binding does nothing.
-    #[tokio::test]
-    async fn run_bound_action_runs_bound_and_ignores_unbound() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": { "1b01": { "pressed": "@Test" } } },
-            "Test": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &Reference::button(1, 1),
-            "pressed",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        assert_eq!(current_scene, "Test");
-
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &Reference::button(1, 9),
-            "pressed",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        assert_eq!(current_scene, "Test", "an unbound reference must not act");
-    }
-
-    /// A list of actions runs every entry in order; a slow command in the list does not
-    /// block the scene-changing action that follows it. `Action::Command` spawns and
-    /// never awaits its own completion, so looping over a list (see `run_actions`) is
-    /// exactly as non-blocking as a single `run_action` call already is - "run without
-    /// waiting on each other" falls out of that for free, since validation caps a list
-    /// to at most one scene-changing entry, so there is never a second synchronous
-    /// `enter_scene` competing with this loop's own state mutation.
-    #[tokio::test]
-    async fn run_bound_action_runs_a_list_without_waiting_on_a_slow_command() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": { "1b01": { "pressed": ["sleep 5", "@Test"] } } },
-            "Test": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            super::run_bound_action(
-                Log::default(),
-                &mut runner,
-                &mut current_scene,
-                &mut previous_scene,
-                &scenes,
-                &Reference::button(1, 1),
-                "pressed",
-                &mut state.timer_handle,
-                &state.timer_tx,
-            ),
-        )
-        .await;
-
-        assert!(
-            result.is_ok(),
-            "run_bound_action should not block on the slow command"
-        );
-        assert_eq!(
-            current_scene, "Test",
-            "the scene-changing action must still run"
-        );
-    }
-
-    /// `run_bound_action` dispatches the encoder turn events (`turn_cw` / `turn_ccw`)
-    /// exactly like any other bound event on the encoder reference.
-    #[tokio::test]
-    async fn run_bound_action_dispatching_turn_events() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": { "1e01": { "turn_cw": "@CW", "turn_ccw": "@CCW" } } },
-            "CW": { "actions": {} },
-            "CCW": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &Reference::encoder(1, 1),
-            "turn_cw",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        assert_eq!(current_scene, "CW");
-
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &Reference::encoder(1, 1),
-            "turn_ccw",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        assert_eq!(current_scene, "CCW");
-    }
-
-    /// A full click of a button flows through the edge handler: `pressed` fires on the
-    /// down edge, `released` on the up edge, and a quick release schedules the
-    /// short-press confirmation that a test can drain like the input loop does.
-    #[tokio::test]
-    async fn pressable_edge_runs_press_release_then_confirms_short_press() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = pressable_scenes("1b01");
-        let reference = Reference::button(1, 1);
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(quickly_clicking_defaults());
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "P");
-        assert_eq!(previous_scene.as_deref(), Some("on_start"));
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "R");
-        assert!(
-            state.pending_shorts.contains_key(&reference),
-            "a short press waits for the double-click gap"
-        );
-
-        let (confirmed, event) = state.receive_click().await;
-        assert_eq!(confirmed, reference);
-        assert_eq!(event, ClickEvent::ShortPress);
-
-        state.pending_shorts.remove(&reference);
-        state.click_detector.confirm_single();
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &reference,
-            "short_press",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-        assert_eq!(current_scene, "S");
-    }
-
-    /// Pushing an encoder knob flows through the same edge handler as a button: the
-    /// remembered push code resolves to an encoder reference that behaves like any
-    /// pressable control.
-    #[tokio::test]
-    async fn pressable_edge_handles_encoder_pushes_like_buttons() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = pressable_scenes("1e01");
-        let reference = Reference::encoder(1, 1);
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(quickly_clicking_defaults());
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "P");
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "R");
-        assert!(state.pending_shorts.contains_key(&reference));
-
-        let (confirmed, event) = state.receive_click().await;
-        assert_eq!(confirmed, reference);
-        assert_eq!(event, ClickEvent::ShortPress);
-    }
-
-    /// Duplicate press reports while a control is already down, and releases of a
-    /// control that was never pressed, are ignored: each event runs at most once.
-    #[tokio::test]
-    async fn pressable_edge_ignores_duplicate_and_unmatched_edges() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = pressable_scenes("1b01");
-        let reference = Reference::button(1, 1);
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(quickly_clicking_defaults());
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "P");
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert_eq!(
-            current_scene, "P",
-            "a repeated press while down must not re-fire"
-        );
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "R");
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-        assert_eq!(
-            current_scene, "R",
-            "a repeated release while up must not re-fire"
-        );
-
-        let never_pressed = Reference::button(1, 2);
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            never_pressed,
-            false,
-            &mut state,
-        )
-        .await;
-        assert_eq!(
-            current_scene, "R",
-            "a release without a press must be ignored"
-        );
-    }
-
-    /// A press held past the short-press threshold fires `long_press` on release, and
-    /// no short-press confirmation is scheduled afterwards.
-    #[tokio::test]
-    async fn pressable_edge_long_press_fires_on_release() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = pressable_scenes("1b01");
-        let reference = Reference::button(1, 1);
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(long_press_defaults());
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert_eq!(current_scene, "P");
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-
-        assert_eq!(current_scene, "L", "the long press fired on release");
-        assert!(state.pending_shorts.is_empty());
-        state.assert_no_click(Duration::from_millis(120)).await;
-    }
-
-    /// `run_actions` runs multiple actions in sequence from the timer delivery path.
-    /// A slow command in the list does not block subsequent actions since each command
-    /// spawns on its own task.
-    #[tokio::test]
-    async fn run_actions_runs_sequence_from_timer_delivery() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": {} },
-            "A": { "actions": {} },
-            "B": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        let actions: Vec<&str> = vec![
-            "/bin/sh -c 'true'",
-            "/bin/sh -c 'sleep 2'",
-            "@A",
-            "@B",
-        ];
-
-        super::run_actions(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &actions,
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        assert_eq!(current_scene, "B");
-        assert_eq!(
-            previous_scene.as_deref(),
-            Some("A"),
-            "intermediate scene switch stored as previous"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    /// When `run_actions` encounters an unbound reference in the action list, it
-    /// silently skips it; the sequence continues through remaining actions.
-    #[tokio::test]
-    async fn run_actions_skips_unbound_in_sequence() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": {} },
-            "Test": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        let actions: Vec<&str> = vec!["@Test", "/bin/true", "/bin/false", "sleep 1"];
-
-        super::run_actions(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &actions,
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        assert_eq!(current_scene, "Test");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    /// `run_actions` with multiple scene-changing actions keeps the last one's scene,
-    /// since each `run_action` call updates `current_scene`.
-    #[tokio::test]
-    async fn run_actions_keeps_last_scene_in_list() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": {} },
-            "A": { "actions": {} },
-            "B": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        let actions: Vec<&str> = vec!["@A", "@B"];
-
-        super::run_actions(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &actions,
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        assert_eq!(current_scene, "B");
-        assert_eq!(previous_scene.as_deref(), Some("A"));
-    }
-
-    /// A refresh tick for a button triggers `refresh_button` on the runner, which
-    /// re-applies that button's operation without touching others.
-    #[tokio::test]
-    async fn refresh_tick_reapplies_single_button() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": {
-                "setup": {
-                    "1b01": { "type": "image", "params": "/tmp/test.png", "refresh": 1 },
-                    "1b02": { "type": "image", "params": "/tmp/test2.png", "refresh": 1 }
-                },
-                "actions": {}
-            }
-        });
-        std::fs::write("/tmp/test.png", b"fake").unwrap();
-        std::fs::write("/tmp/test2.png", b"fake").unwrap();
-
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-        mock.calls().clear();
-
-        let (refresh_tx, mut _refresh_rx) = mpsc::channel(8);
-        runner.refresh_tx = refresh_tx.clone();
-
-        // Re-enter to re-arm refresh tasks
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // Send refresh tick for button 1 (1b01)
-        refresh_tx.send(1).await.unwrap();
-        // Drain the refresh task's send to the runner's channel
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    /// `handle_exec_event` for `ExecEvent::Output` draws the output on the button.
-    #[tokio::test]
-    async fn handle_exec_event_draws_text_output() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-
-        // Enter the scene to prime the runner's tracker
-        let scenes = json!({
-            "on_start": {
-                "setup": { "1b01": { "type": "text_exec", "params": "true" } },
-                "actions": {}
-            }
-        });
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // Enter again to bump generation to 2
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // After second enter, button 1 should be at generation 2
-        // Send event with generation 2 (current)
-        runner
-            .handle_exec_event(dak::actions::ExecEvent::Output {
-                key: 1,
-                generation: 2,
-                kind: dak::actions::ExecOutputKind::Text,
-                stdout: b"hello\n".to_vec(),
-            })
-            .await;
-
-        let calls = mock.calls();
-        assert!(
-            calls.contains(&"set"),
-            "text output should be staged: calls = {:?}",
-            calls
-        );
-        assert!(
-            calls.contains(&"flush"),
-            "text output should be flushed: calls = {:?}",
-            calls
-        );
-    }
-
-    /// `handle_exec_event` for `ExecEvent::Error` draws the red error label.
-    #[tokio::test]
-    async fn handle_exec_event_draws_error_on_failure() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-
-        // Enter the scene to prime the runner's tracker
-        let scenes = json!({
-            "on_start": {
-                "setup": { "1b01": { "type": "text_exec", "params": "true" } },
-                "actions": {}
-            }
-        });
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // Enter again to bump generation to 2
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // Send error event with current generation
-        runner
-            .handle_exec_event(dak::actions::ExecEvent::Error {
-                key: 1,
-                generation: 2,
-                error: "command failed".to_string(),
-            })
-            .await;
-
-        let calls = mock.calls();
-        assert!(
-            calls.contains(&"set"),
-            "error label should be staged: calls = {:?}",
-            calls
-        );
-        assert!(
-            calls.contains(&"flush"),
-            "error label should be flushed: calls = {:?}",
-            calls
-        );
-    }
-
-    /// `handle_exec_event` discards events from a stale generation.
-    #[tokio::test]
-    async fn handle_exec_event_discards_stale_generation() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-
-        // Enter the scene to prime the runner's tracker
-        let scenes = json!({
-            "on_start": {
-                "setup": { "1b01": { "type": "text_exec", "params": "true" } },
-                "actions": {}
-            }
-        });
-        runner.enter_scene("on_start", &scenes).await.unwrap();
-
-        // After first enter, button 1 should be at generation 1
-        // Capture the call count (only the flush from enter_scene)
-        let calls_before = mock.calls();
-        assert_eq!(
-            calls_before,
-            vec!["flush"],
-            "enter_scene should flush once"
-        );
-
-        // The tracker's is_current(1, 0) should return false
-        let is_current = runner.tracker.is_current(1, 0);
-        assert!(
-            !is_current,
-            "generation 0 should be stale after enter_scene bumped it"
-        );
-
-        runner
-            .handle_exec_event(dak::actions::ExecEvent::Output {
-                key: 1,
-                generation: 0,
-                kind: dak::actions::ExecOutputKind::Text,
-                stdout: b"stale".to_vec(),
-            })
-            .await;
-
-        let calls_after = mock.calls();
-        // handle_exec_event with stale generation should not add any calls
-        assert!(
-            calls_after == calls_before,
-            "stale events should not touch the device: before {:?}, after {:?}",
-            calls_before,
-            calls_after
-        );
-    }
-
-    /// `run_bound_action` dispatches the `released` event for a button reference.
-    #[tokio::test]
-    async fn run_bound_action_dispatches_released_event() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = json!({
-            "on_start": { "actions": { "1b01": { "released": "@Test" } } },
-            "Test": { "actions": {} }
-        });
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(Defaults::default());
-
-        super::run_bound_action(
-            Log::default(),
-            &mut runner,
-            &mut current_scene,
-            &mut previous_scene,
-            &scenes,
-            &Reference::button(1, 1),
-            "released",
-            &mut state.timer_handle,
-            &state.timer_tx,
-        )
-        .await;
-
-        assert_eq!(current_scene, "Test");
-        assert_eq!(
-            previous_scene.as_deref(),
-            Some("on_start"),
-            "released event switches scene like other events"
-        );
-    }
-
-    /// A second press landing inside the double-click gap cancels the first click's
-    /// pending short-press confirmation, and the pair fires `double_click` on the
-    /// second release.
-    #[tokio::test]
-    async fn pressable_edge_double_click_cancels_pending_short() {
-        let mock = MockButtonDevice::default();
-        let mut runner = make_runner(&mock);
-        let scenes = pressable_scenes("1b01");
-        let reference = Reference::button(1, 1);
-        let mut current_scene = String::from("on_start");
-        let mut previous_scene = None;
-        let mut state = EdgeState::new(quickly_clicking_defaults());
-
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-        assert!(state.pending_shorts.contains_key(&reference));
-
-        // Second press arrives within the gap: it cancels the pending confirmation
-        // and its release is a double click instead of a short.
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            true,
-            &mut state,
-        )
-        .await;
-        assert!(
-            state.pending_shorts.is_empty(),
-            "the pending short press must be cancelled by the second press"
-        );
-        press_edge(
-            &mut runner,
-            &scenes,
-            &mut current_scene,
-            &mut previous_scene,
-            reference,
-            false,
-            &mut state,
-        )
-        .await;
-
-        assert_eq!(
-            current_scene, "D",
-            "the double click fired on the second release"
-        );
-        assert!(state.pending_shorts.is_empty());
-        state.assert_no_click(Duration::from_millis(120)).await;
     }
 }
