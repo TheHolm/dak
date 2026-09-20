@@ -2919,9 +2919,29 @@ pub fn apply_assignment(
     let scalar = match rhs {
         AssignRhs::Int(number) => Scalar::Int(*number),
         AssignRhs::Str(text) => Scalar::Str(text.clone()),
-        AssignRhs::Variable(reference) => match variables.store().get(&reference.name) {
-            Some(VarValue::Int(number)) => Scalar::Int(*number as i64),
-            Some(VarValue::Str(text)) => Scalar::Str(text.clone()),
+        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+            Some(VarType::Int) => {
+                match variables
+                    .read(reference)
+                    .ok()
+                    .and_then(|text| text.parse::<i64>().ok())
+                {
+                    Some(number) => Scalar::Int(number),
+                    None => {
+                        log.error(format!(
+                            "assignment reads int variable \"{reference}\", but its value is not an integer"
+                        ));
+                        return None;
+                    }
+                }
+            }
+            Some(VarType::Str) => match variables.read(reference) {
+                Ok(text) => Scalar::Str(text),
+                Err(error) => {
+                    log.error(error);
+                    return None;
+                }
+            },
             None => {
                 log.error(format!(
                     "assignment reads undefined variable \"{reference}\""
@@ -4412,6 +4432,32 @@ mod tests {
         ] {
             assert_eq!(super::parse_assignment(value), None, "for {value}");
         }
+    }
+
+    /// An assignment right-hand side can read a `defaults` parameter, not only a user
+    /// variable: `$defaults.short_press_duration` (300ms by default) clamps into the
+    /// target's range.
+    #[test]
+    fn apply_assignment_reads_defaults_scope_rhs() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        let reference = crate::variables::VarRef {
+            scope: crate::variables::Scope::Defaults,
+            name: "short_press_duration".to_string(),
+        };
+        super::apply_assignment(
+            &super::AssignTarget::Variable("count".to_string()),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Variable(reference),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            variables.store().get("count"),
+            Some(&crate::variables::VarValue::Int(10)),
+            "300ms clamps down to the target's max of 10"
+        );
     }
 
     /// [`action_values`] reads a single non-empty string as a one-element list and a
