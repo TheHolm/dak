@@ -1990,3 +1990,47 @@ async fn refresh_re_resolves_referenced_params() {
     let _ = std::fs::remove_file(&first);
     let _ = std::fs::remove_file(&second);
 }
+
+/// A `text_value` entry renders its expanded text directly - no file or program - and a
+/// refresh re-resolves it from the current variable values.
+#[tokio::test]
+async fn text_value_renders_and_refreshes_from_variables() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("name".to_string(), VarDef::string(20, "one".to_string()));
+    let variables = std::sync::Arc::new(Mutex::new(Variables::new(defs, &Defaults::default())));
+    runner.set_variables(variables.clone());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "n=$name" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert_eq!(mock.kinds(&mock.calls()), ["SetImage", "Flush"]);
+    let first = mock.last_image(0).expect("the value should render");
+
+    variables
+        .lock()
+        .unwrap()
+        .store_mut()
+        .set("name", VarValue::Str("two".to_string()));
+    runner.refresh_button(1).await.unwrap();
+    let second = mock.last_image(0).expect("the value should re-render");
+
+    assert_ne!(
+        first.to_rgb8().into_raw(),
+        second.to_rgb8().into_raw(),
+        "the refresh should have re-resolved the value text"
+    );
+}

@@ -654,6 +654,13 @@ fn check_button_op(
                 check_file_exists(scene_name, &location, params, warnings);
             }
         }
+        "text_value" => {
+            if params.is_empty() {
+                errors.push(format!(
+                    "scene \"{scene_name}\": {location} text_value params must be text"
+                ));
+            }
+        }
         "image_exec" | "text_exec" | "launch" => {
             if params.is_empty() {
                 errors.push(format!(
@@ -680,7 +687,7 @@ fn check_button_op(
         "clear" => {}
         other => {
             errors.push(format!(
-                "scene \"{scene_name}\": {location} unknown type \"{other}\", expected image, image_exec, text, text_exec, launch or clear"
+                "scene \"{scene_name}\": {location} unknown type \"{other}\", expected image, image_exec, text, text_value, text_exec, launch or clear"
             ));
         }
     }
@@ -1249,6 +1256,17 @@ pub enum SceneOp {
         path: String,
         refresh_seconds: u64,
     },
+    /// Render `text` directly on a button. Unlike [`SceneOp::Text`] the value is the text
+    /// itself (already expanded from any `$` references), not a file path, so a variable
+    /// can be shown without shelling out to `echo`. References are physical buttons
+    /// (1-based). `refresh_seconds` (0 = never) re-applies this operation on its own,
+    /// independent of any scene switch - and, like every refreshed entry, re-expands its
+    /// `text` from the current variable values each time.
+    TextValue {
+        reference: Reference,
+        text: String,
+        refresh_seconds: u64,
+    },
     /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
     /// scene switch.
@@ -1373,6 +1391,11 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
         "text" => SceneOp::Text {
             reference,
             path: expand_tilde(&params),
+            refresh_seconds: raw.refresh_seconds,
+        },
+        "text_value" => SceneOp::TextValue {
+            reference,
+            text: params,
             refresh_seconds: raw.refresh_seconds,
         },
         "text_exec" => SceneOp::TextExec {
@@ -1904,6 +1927,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 operation,
                 SceneOp::SetImage { .. }
                     | SceneOp::Text { .. }
+                    | SceneOp::TextValue { .. }
                     | SceneOp::TextExec { .. }
                     | SceneOp::ImageExec { .. }
             )
@@ -2019,6 +2043,42 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         self.fail_button(
                             key,
                             format!("button {key}: failed to read text from \"{path}\": {message}"),
+                        )
+                        .await;
+                    }
+                }
+            }
+            SceneOp::TextValue {
+                reference: _, text, ..
+            } => {
+                self.log.debug(
+                    Subsystem::Scene,
+                    format!("render value on key {key}: \"{text}\""),
+                );
+                // See the `SetImage` branch above: errors are stringified immediately.
+                let render_result =
+                    crate::text::render_text(&crate::text::button_text(text), self.image_format)
+                        .map_err(|error| error.to_string());
+                match render_result {
+                    Ok(image) => {
+                        if let Err(error) = self
+                            .device
+                            .set_button_image(key.saturating_sub(1), self.image_format, image)
+                            .await
+                        {
+                            self.log
+                                .error(format!("button {key}: failed to draw value text: {error}"));
+                        } else {
+                            self.log.debug(
+                                Subsystem::Device,
+                                format!("set image on button {key} from text"),
+                            );
+                        }
+                    }
+                    Err(message) => {
+                        self.fail_button(
+                            key,
+                            format!("button {key}: failed to render value text: {message}"),
                         )
                         .await;
                     }
@@ -2289,6 +2349,7 @@ fn operation_reference(operation: &SceneOp) -> Option<&Reference> {
     match operation {
         SceneOp::SetImage { reference, .. }
         | SceneOp::Text { reference, .. }
+        | SceneOp::TextValue { reference, .. }
         | SceneOp::TextExec { reference, .. }
         | SceneOp::ImageExec { reference, .. }
         | SceneOp::Launch { reference, .. }
@@ -2306,6 +2367,9 @@ fn refresh_seconds_of(operation: &SceneOp) -> u64 {
             refresh_seconds, ..
         }
         | SceneOp::Text {
+            refresh_seconds, ..
+        }
+        | SceneOp::TextValue {
             refresh_seconds, ..
         }
         | SceneOp::TextExec {
@@ -3786,6 +3850,11 @@ mod tests {
             path: "x.txt".to_string(),
             refresh_seconds: 0,
         };
+        let text_value = super::SceneOp::TextValue {
+            reference: super::Reference::button(3, 5),
+            text: "hello".to_string(),
+            refresh_seconds: 0,
+        };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(9, 8),
             command: super::CommandSpec {
@@ -3824,6 +3893,10 @@ mod tests {
             Some(&super::Reference::button(2, 4))
         );
         assert_eq!(
+            super::operation_reference(&text_value),
+            Some(&super::Reference::button(3, 5))
+        );
+        assert_eq!(
             super::operation_reference(&text_exec),
             Some(&super::Reference::button(9, 8))
         );
@@ -3842,7 +3915,7 @@ mod tests {
         assert_eq!(super::operation_reference(&unsupported), None);
     }
 
-    /// `refresh_seconds_of` reads the field from the four variants that carry one, and
+    /// `refresh_seconds_of` reads the field from the five variants that carry one, and
     /// reports 0 (the same as an absent/zero field) for the three that never do.
     #[test]
     fn refresh_seconds_of_reads_the_field_or_reports_zero() {
@@ -3855,6 +3928,11 @@ mod tests {
             reference: super::Reference::button(1, 2),
             path: "x.txt".to_string(),
             refresh_seconds: 7,
+        };
+        let text_value = super::SceneOp::TextValue {
+            reference: super::Reference::button(1, 7),
+            text: "hello".to_string(),
+            refresh_seconds: 9,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(1, 3),
@@ -3887,6 +3965,7 @@ mod tests {
         };
         assert_eq!(super::refresh_seconds_of(&image), 5);
         assert_eq!(super::refresh_seconds_of(&text), 7);
+        assert_eq!(super::refresh_seconds_of(&text_value), 9);
         assert_eq!(super::refresh_seconds_of(&text_exec), 11);
         assert_eq!(super::refresh_seconds_of(&image_exec), 13);
         assert_eq!(super::refresh_seconds_of(&launch), 0);
@@ -4537,6 +4616,24 @@ mod tests {
             }]
         );
         assert!(super::scene_operations("main", &scenes).is_err());
+    }
+
+    /// A `text_value` entry is the literal text itself (with references expanded), not a
+    /// path, and carries its refresh.
+    #[test]
+    fn scene_operations_resolve_text_value_inline() {
+        let scenes = json!({
+            "main": { "setup": { "1b01": { "type": "text_value", "params": "dir=$dir", "refresh": 2 } } }
+        });
+        let operations = super::scene_operations_with("main", &scenes, &scene_variables()).unwrap();
+        assert_eq!(
+            operations,
+            vec![super::SceneOp::TextValue {
+                reference: crate::baseplane::Reference::button(1, 1),
+                text: "dir=a".to_string(),
+                refresh_seconds: 2,
+            }]
+        );
     }
 
     /// `resolve_scene_op` re-expands from the current values each time, so a refresh tick

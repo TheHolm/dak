@@ -11,7 +11,7 @@
     "on_start": {
       "setup": {
         "1b01": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 },
-        "1b02": { "type": "text_exec", "params": "/bin/echo $defaults.button_brightness%", "refresh": 1 }
+        "1b02": { "type": "text_value", "params": "$defaults.button_brightness%", "refresh": 1 }
       },
       "actions": {
         "1e03": {

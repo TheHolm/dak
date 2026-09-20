@@ -11,9 +11,10 @@ helper tools it mentions.
   `$defaults.button_brightness ~= $(echo $defaults.button_brightness + $step | bc)`.
   `~=` clamps silently at 0 and 100, so winding past either end is a no-op rather than
   an error or a warning. The same config shows a live clock on button 1 and the current
-  brightness on button 2, both using a per-button `refresh`; button 2's
-  `"/bin/echo $defaults.button_brightness%"` is re-expanded on every tick, so it tracks
-  the encoder's changes (the `%` is literal text, ending the reference name).
+  brightness on button 2, both using a per-button `refresh`; button 2 is a `text_value`
+  showing `"$defaults.button_brightness%"` directly (no `echo` needed), re-expanded on
+  every tick so it tracks the encoder's changes (the `%` is literal text, ending the
+  reference name).
 
 See the README's [Variables](../README.markdown#variables) section for the syntax these
 examples use.

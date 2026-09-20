@@ -1606,6 +1606,30 @@ fn allows_reading_read_only_defaults() {
     assert!(config.is_ok(), "{:?}", config.err());
 }
 
+/// A `text_value` setup entry accepts its params as display text (references included),
+/// and rejects empty params.
+#[test]
+fn validates_text_value_setup_entries() {
+    let path = write_variables_config(
+        r#"{"name": {"type": "str", "value": "Bob"}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": "Hello $name", "refresh": 1}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": ""}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("text_value params must be text"),
+        "{errors}"
+    );
+}
+
 /// A timer key may be an int variable reference.
 #[test]
 fn timer_key_may_reference_an_int_variable() {
