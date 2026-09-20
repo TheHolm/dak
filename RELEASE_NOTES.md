@@ -5,6 +5,109 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.10.0 — Config variables: declared values, assignment, and command substitution in actions and scene params
+
+### User-facing changes
+- New optional top-level `variables` section: declare global, typed variables
+  (`int` or `str`), each with an optional range (int) or maximum length (str)
+  and an initial value. Every variable must be declared; referencing an
+  undeclared one is a config-load error.
+- `$name` (or `$var.name`) reads a variable, and `$defaults.<name>` reads a
+  `defaults` value, anywhere an action string or setup `params` is used and in
+  a timer's seconds key. Values are resolved when they are used, so they always
+  reflect the current state. Escape the next character with `\` to end a name
+  (`$name\-kun`, `$name\ kun`); `\$` is a literal dollar sign. Breaking change:
+  a literal `$` in a command or path must now be written `\$`.
+- New assignment actions `$<target> <op> <value>`:
+  - the target is a declared variable or a writable `defaults` parameter
+    (`button_brightness`, `encoder_brightness`; the timing constants stay
+    read-only);
+  - `:=` clamps/truncates and warns, `~=` clamps/truncates silently, and `=`
+    rejects an out-of-range or over-long value (both operators were previously
+    rejected as "not implemented");
+  - the value is an integer literal, a quoted string, another variable, or a
+    `$(command)` substitution whose output is converted to the target's type.
+    A result that cannot be converted/exited cleanly leaves the variable
+    unchanged for `=`, while `:=`/`~=` fall back to the target's default.
+- Commands now use a shell only when they need one: a command containing an
+  unquoted shell operator (`|`, redirection, `;`, `&`, parentheses, ...) runs
+  through `sh -c`, so pipelines work in action commands, `image_exec`/
+  `text_exec`/`launch` params and `$(...)`; anything else runs directly with no
+  shell.
+- New `text_value` setup type: render text directly on a button, with `$`
+  references expanded, without reading a file or shelling out to `echo`. Useful
+  for showing a variable's value, and supports `refresh`.
+- Scene `setup` params and timer seconds are re-resolved from the current
+  variables every time they are used (on scene entry and on every refresh
+  tick), so a refreshing button follows variable changes.
+- A `variables` sample was added to `config.json.example`, and a new
+  `examples/` folder holds complete, copyable configs indexed by
+  `examples/EXAMPLES.md` (starting with an encoder that changes screen
+  brightness using `bc`).
+- Version bumped to `0.10.0`.
+
+### Details
+Added `src/variables.rs`:
+- `VarType`/`VarDef`/`VarValue`/`VariableStore`, `Variables` (the global
+  runtime state: the user store plus the current `defaults` values plus the
+  loaded `Defaults` for failure fallbacks).
+- `check_variables`/`check_variable`: name grammar (`^[A-Za-z][A-Za-z0-9_]*$`),
+  mandatory `type`, only type-appropriate keys, `min <= max`, `1..=65535`
+  `max_length` (default 255), and an in-range initial `value`; unknown keys,
+  reserved names (`var`/`defaults`/`version`/`scenes`/`devices`) and
+  wrong-type declarations are hard errors.
+- `expand_with`/`references_in`/`parse_lone_reference`: the `$` grammar
+  (`$name`, `$scope.name` only when the prefix is a known scope keyword so
+  `$name.png` stays a path, greedy names, `\$`/`\\`/post-reference escapes,
+  unknown scopes and undefined refs).
+- The `defaults` scope is readable as `button_brightness`,
+  `encoder_brightness`, `short_press_duration` and `double_click_gap` (all
+  int), with the first two writable.
+
+`actions.rs` assignment model:
+- Replaced `Action::SetConfig`/`AssignedValue`/`ParamClass`/
+  `classify_config_path`/`parse_set_config` with `AssignTarget`
+  (`Variable`/`Default`), `AssignRhs` (`Int`/`Str`/`Variable`/`Command`),
+  `AssignOp` and `Action::Assign`, plus `parse_assignment`/`parse_rhs`/
+  `classify_target`/`classify_assign_target_syntax`.
+- `apply_assignment` clamps ints and truncates strings per operator, applying
+  defaults-side effects on the device; `clamp_int`/`truncate_str` hold the
+  policy.
+- `start_command_assignment`/`prepare_command_assignment`/`convert_output`/
+  `conversion_failure`/`default_value`: `$(...)` runs on its own task, takes
+  the first non-empty trimmed line for an int or the whole output with trailing
+  newlines stripped for a str, and reports through a new
+  `ExecEvent::Assignment`/`CompletedAssign` (applied by the input loop, which
+  owns the device). `resolve_action` expands ordinary values but never an
+  assignment target.
+- `build_command`/`command_needs_shell`: quote-aware shell-operator detection,
+  used by action commands, `params_command` (exec/launch) and command
+  substitution.
+
+Runtime wiring:
+- One `Arc<Mutex<Variables>>` created in `main`, shared by every device and
+  held by `SceneRunner` via `set_variables`; `run_action`/`run_actions`/
+  `run_bound_action`/`run_pressable_edge` thread it through, and timer
+  arm/rearm uses `timer_for_scene_with`.
+- `scene_operations` split into `raw_scene_operations` + `resolve_scene_op`
+  (and `scene_operations_with`); `SceneRunner` keeps each button's raw entry in
+  `refresh_sources` and `refresh_button` re-resolves it, so refresh ticks pick
+  up variable changes.
+- `SceneOp::TextValue` added and handled alongside `Text` (screenless skip,
+  accessors, validation accepting `text_value` and rejecting empty params).
+
+Tests: unit coverage for declaration validation, expansion/escapes/scopes,
+the reference scanner, assignment parse/apply/clamp/truncate, conversion and
+its failure policy, shell detection, scene-op resolution/re-resolution, timer
+seconds, and renderer accessors; integration coverage in `tests/` for loading
+valid/invalid variable sections, references in scenes and timers, assignment
+validation, command substitution, and that every example config loads.
+
+Still to come (README TODO): per-scene variables, arithmetic/expression
+right-hand sides (calculations are delegated to external tools such as `bc`),
+explicit `str(...)`/`int(...)` conversions, an `env.` scope, and a per-scene
+"compute" section.
+
 ## v0.9.1 — Recognizes the wider Ajazz/Mirabox device family; configurable per-device protocol version; documents the AKP03E rev.2 protocol/image-format investigation
 
 ### User-facing changes
