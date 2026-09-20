@@ -8,7 +8,7 @@ use crate::baseplane::{Kind, Reference};
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::press::Defaults;
-use crate::variables::{self, VarDef};
+use crate::variables::{check_variables, references_in, VarDef, VarRef, VarType, Variables};
 use image::DynamicImage;
 use mirajazz::device::Device;
 use mirajazz::error::MirajazzError;
@@ -249,7 +249,6 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     let scenes = map.get("scenes").expect("checked above");
-    check_scenes(scenes, &mut warnings, &mut errors);
     let devices = map.get("devices").expect("checked above");
     let by_id = check_devices(devices, &mut errors);
     let defaults = map
@@ -258,8 +257,13 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         .unwrap_or_default();
     let variables = map
         .get("variables")
-        .map(|variables| variables::check_variables(variables, &mut errors))
+        .map(|variables| check_variables(variables, &mut errors))
         .unwrap_or_default();
+
+    // References are validated against the declarations with each variable at its initial
+    // value; only existence/type matter here, not the (runtime) values themselves.
+    let runtime_variables = Variables::new(variables.clone(), &defaults);
+    check_scenes(&runtime_variables, scenes, &mut warnings, &mut errors);
 
     if !errors.is_empty() {
         return Err(errors);
@@ -361,7 +365,12 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
 }
 
 /// Validates the `scenes` section: an object whose keys are scene names.
-fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<String>) {
+fn check_scenes(
+    variables: &Variables,
+    scenes: &Value,
+    warnings: &mut Vec<String>,
+    errors: &mut Vec<String>,
+) {
     let map = match scenes.as_object() {
         Some(map) => map,
         None => {
@@ -372,7 +381,39 @@ fn check_scenes(scenes: &Value, warnings: &mut Vec<String>, errors: &mut Vec<Str
     };
 
     for (scene_name, scene) in map {
-        check_scene(scenes, scene_name, scene, warnings, errors);
+        check_scene(variables, scenes, scene_name, scene, warnings, errors);
+    }
+}
+
+/// Validates every `$` reference in `text`, pushing an error for each malformed or
+/// undeclared one, and returns the references found (empty when the text has none or is
+/// malformed).
+///
+/// Callers use the result to decide whether a value is fully known at load time: a value
+/// containing a reference can only be resolved at runtime, so checks against literal
+/// content (a scene name, an executable path) are skipped for it.
+fn check_references(
+    scene_name: &str,
+    path: &str,
+    text: &str,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+) -> Vec<VarRef> {
+    match references_in(text) {
+        Ok(refs) => {
+            for reference in &refs {
+                if variables.kind_of(reference).is_none() {
+                    errors.push(format!(
+                        "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+                    ));
+                }
+            }
+            refs
+        }
+        Err(error) => {
+            errors.push(format!("scene \"{scene_name}\": {path}: {error}"));
+            Vec::new()
+        }
     }
 }
 
@@ -444,6 +485,7 @@ pub fn discovered_device_matches(
 /// (`type`/`params` dictionaries), the reserved `actions` key holds per-key action
 /// bindings. No other scene keys are allowed.
 fn check_scene(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     scene: &Value,
@@ -460,8 +502,8 @@ fn check_scene(
 
     for (key, value) in map {
         match key.as_str() {
-            "setup" => check_setup(scene_name, value, warnings, errors),
-            "actions" => check_actions(scenes, scene_name, value, errors, warnings),
+            "setup" => check_setup(variables, scene_name, value, warnings, errors),
+            "actions" => check_actions(variables, scenes, scene_name, value, errors, warnings),
             other => errors.push(format!(
                 "scene \"{scene_name}\": unknown key \"{other}\", expected \"setup\" or \"actions\""
             )),
@@ -472,6 +514,7 @@ fn check_scene(
 /// Validates the `setup` dictionary of a scene: numbered button entries with a known
 /// `type` and a `params` string suited to that type.
 fn check_setup(
+    variables: &Variables,
     scene_name: &str,
     setup: &Value,
     warnings: &mut Vec<String>,
@@ -488,13 +531,14 @@ fn check_setup(
     };
 
     for (key, value) in map {
-        check_button_op(scene_name, key, value, warnings, errors);
+        check_button_op(variables, scene_name, key, value, warnings, errors);
     }
 }
 
 /// Validates one numbered button entry of a scene: a dictionary with a known `type`
 /// and a `params` string suited to that type.
 fn check_button_op(
+    variables: &Variables,
     scene_name: &str,
     key: &str,
     value: &Value,
@@ -561,6 +605,17 @@ fn check_button_op(
         None => "",
     };
 
+    // References in params are validated here; a value that contains one can only be
+    // resolved at runtime, so literal checks (file/program existence) are skipped for it.
+    let param_refs = check_references(
+        scene_name,
+        &format!("{location} params"),
+        params,
+        variables,
+        errors,
+    );
+    let dynamic_params = !param_refs.is_empty();
+
     // "refresh" (seconds) is optional and defaults to 0, meaning "apply once on scene
     // entry, never again". A nonzero value only makes sense for the types that redraw
     // something: "clear" has nothing left to redraw, and "launch" fires a detached
@@ -591,7 +646,7 @@ fn check_button_op(
                 errors.push(format!(
                     "scene \"{scene_name}\": {location} {kind} params must be a path"
                 ));
-            } else {
+            } else if !dynamic_params {
                 check_file_exists(scene_name, &location, params, warnings);
             }
         }
@@ -603,7 +658,11 @@ fn check_button_op(
             } else {
                 match parse_command_line(params) {
                     Ok(command) => {
-                        check_executable(scene_name, &location, &command.program, warnings);
+                        // The program itself may be a reference resolved only at runtime;
+                        // only check a literal program path.
+                        if matches!(references_in(&command.program), Ok(refs) if refs.is_empty()) {
+                            check_executable(scene_name, &location, &command.program, warnings);
+                        }
                     }
                     Err(error) => {
                         errors.push(format!("scene \"{scene_name}\": {location}: {error}"))
@@ -623,6 +682,7 @@ fn check_button_op(
 /// Validates the `actions` dictionary of a scene: key entries must be object of string events,
 /// and the special `timer` key is validated separately.
 fn check_actions(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     actions: &Value,
@@ -639,7 +699,7 @@ fn check_actions(
 
     for (key, action) in map {
         if key == "timer" {
-            check_timer(scenes, scene_name, action, errors, warnings);
+            check_timer(variables, scenes, scene_name, action, errors, warnings);
             continue;
         }
 
@@ -666,13 +726,16 @@ fn check_actions(
 
         for (event, value) in events {
             let path = format!("actions.\"{key}\".{event}");
-            check_action_values(scenes, scene_name, &path, value, errors, warnings);
+            check_action_values(
+                variables, scenes, scene_name, &path, value, errors, warnings,
+            );
         }
     }
 }
 
 /// Validates the `timer` entry: it must be a single-entry `{ seconds: action }` object.
 fn check_timer(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     timer: &Value,
@@ -698,12 +761,31 @@ fn check_timer(
     }
 
     let (seconds, value) = entries.iter().next().unwrap();
-    if seconds.parse::<u64>().is_err() {
-        errors.push(format!(
-            "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
-        ));
+    let seconds_refs = check_references(scene_name, "actions.timer", seconds, variables, errors);
+    if seconds_refs.is_empty() {
+        if seconds.parse::<u64>().is_err() {
+            errors.push(format!(
+                "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
+            ));
+        }
+    } else {
+        for reference in &seconds_refs {
+            if matches!(variables.kind_of(reference), Some(kind) if kind != VarType::Int) {
+                errors.push(format!(
+                    "scene \"{scene_name}\": actions.timer key \"{seconds}\" uses non-integer \"{reference}\", but timer seconds must be an int"
+                ));
+            }
+        }
     }
-    check_action_values(scenes, scene_name, "actions.timer", value, errors, warnings);
+    check_action_values(
+        variables,
+        scenes,
+        scene_name,
+        "actions.timer",
+        value,
+        errors,
+        warnings,
+    );
 }
 
 /// Validates an action value: either a single string (see [`check_action_value`]) or an
@@ -713,6 +795,7 @@ fn check_timer(
 /// spell "bound but no action" for the array form (matching `""` for the string form);
 /// an empty string *inside* a non-empty array is rejected instead of silently ignored.
 fn check_action_values(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     path: &str,
@@ -721,7 +804,7 @@ fn check_action_values(
     warnings: &mut Vec<String>,
 ) {
     if let Some(value) = value.as_str() {
-        check_action_value(scenes, scene_name, path, value, errors, warnings);
+        check_action_value(variables, scenes, scene_name, path, value, errors, warnings);
         return;
     }
     let Some(items) = value.as_array() else {
@@ -750,7 +833,7 @@ fn check_action_values(
         if item.starts_with('@') {
             scene_changing += 1;
         }
-        check_action_value(scenes, scene_name, path, item, errors, warnings);
+        check_action_value(variables, scenes, scene_name, path, item, errors, warnings);
     }
     if scene_changing > 1 {
         errors.push(format!(
@@ -764,10 +847,15 @@ fn check_action_values(
 /// value of the right type and in range, and anything else is treated as a command
 /// whose executable is checked.
 ///
+/// Every `$` reference is validated against the declarations first. A value that contains
+/// one is only fully known at runtime, so the literal checks (scene existence, executable
+/// path) are skipped for it.
+///
 /// Breaking change: `~` is no longer special-cased here (it used to mean "stay") - a
 /// literal `"~"` value now falls through to the command branch below, same as any other
 /// string that isn't `@`/`$`-prefixed.
 fn check_action_value(
+    variables: &Variables,
     scenes: &Value,
     scene_name: &str,
     path: &str,
@@ -776,9 +864,12 @@ fn check_action_value(
     warnings: &mut Vec<String>,
 ) {
     if let Some(reference) = value.strip_prefix('@') {
+        let refs = check_references(scene_name, path, value, variables, errors);
         if reference.is_empty() {
             // A bare "@": stay on the current scene. Nothing to validate.
-        } else if !scenes.as_object().unwrap().contains_key(reference) {
+        } else if refs.is_empty() && !scenes.as_object().unwrap().contains_key(reference) {
+            // A literal scene name must exist; a `$`-reference can only be resolved at
+            // runtime, so its target scene is checked when the action fires.
             errors.push(format!(
                 "scene \"{scene_name}\": {path} references undefined scene \"@{reference}\""
             ));
@@ -790,9 +881,13 @@ fn check_action_value(
         return;
     }
 
-    let executable = value.split_whitespace().next().unwrap_or_default();
-    if !executable.is_empty() {
-        check_executable(scene_name, path, executable, warnings);
+    // A command's executable is only checkable when it is not built from references.
+    let refs = check_references(scene_name, path, value, variables, errors);
+    if refs.is_empty() {
+        let executable = value.split_whitespace().next().unwrap_or_default();
+        if !executable.is_empty() {
+            check_executable(scene_name, path, executable, warnings);
+        }
     }
 }
 

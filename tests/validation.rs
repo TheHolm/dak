@@ -1397,3 +1397,97 @@ fn rejects_invalid_variable_declarations() {
         );
     }
 }
+
+// -- variable references in scenes --
+
+/// Declared variables may be referenced from setup params and action commands; a dynamic
+/// image path suppresses the literal file-existence warning.
+#[test]
+fn accepts_references_to_declared_variables() {
+    let path = write_variables_config(
+        r#"{"name": {"type": "str", "value": "Bob"}, "count": {"type": "int", "value": 3}}"#,
+        r#"{
+            "on_start": {
+                "setup": { "1b01": { "type": "image", "params": "/tmp/$name.png" } },
+                "actions": { "1b02": { "pressed": "/bin/echo $count $name" } }
+            }
+        }"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(
+        !config.warnings.iter().any(|w| w.contains("file not found")),
+        "{:?}",
+        config.warnings
+    );
+}
+
+/// An undeclared reference anywhere in a scene is a hard error naming the variable.
+#[test]
+fn rejects_undefined_variable_references() {
+    for scenes in [
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/$missing.png"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $missing"}}}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "@$missing"}}}}"#,
+    ] {
+        let path = write_variables_config(r#"{}"#, scenes);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains("undefined variable"), "{errors}");
+    }
+}
+
+/// A malformed `$` reference (not followed by a name) is a hard error.
+#[test]
+fn rejects_malformed_variable_reference() {
+    let path = write_variables_config(
+        r#"{"x": {"type": "int", "value": 1}}"#,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $ x"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("must be followed by a variable name"),
+        "{errors}"
+    );
+}
+
+/// Read-only `$defaults.*` constants may be read (e.g. from a command) even though they
+/// cannot be assigned.
+#[test]
+fn allows_reading_read_only_defaults() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "/bin/echo $defaults.short_press_duration"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A timer key may be an int variable reference.
+#[test]
+fn timer_key_may_reference_an_int_variable() {
+    let path = write_variables_config(
+        r#"{"period": {"type": "int", "min": 1, "value": 5}}"#,
+        r#"{"on_start": {"actions": {"timer": {"$period": "@"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A timer key referencing a non-int variable is rejected.
+#[test]
+fn timer_key_rejects_non_int_variable() {
+    let path = write_variables_config(
+        r#"{"period": {"type": "str", "value": "5"}}"#,
+        r#"{"on_start": {"actions": {"timer": {"$period": "@"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("timer seconds must be an int"), "{errors}");
+}

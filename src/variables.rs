@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::actions::value_type;
+use crate::press::Defaults;
 
 /// The default `max_length` of a `str` variable when the declaration omits it.
 pub const DEFAULT_MAX_LENGTH: usize = 255;
@@ -400,6 +401,263 @@ fn json_i32(value: &Value) -> Option<i32> {
     value.as_i64().and_then(|number| i32::try_from(number).ok())
 }
 
+/// The address space a `$` reference's name is resolved against.
+///
+/// A bare `$name` is shorthand for the variables scope (`$var.name`); other scopes are
+/// written explicitly. More scopes (e.g. `env`) are expected in the future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The user-declared variables (the default scope).
+    Var,
+    /// The built-in `defaults` parameters, which behave like variables but also drive
+    /// the device (see [`Variables`]).
+    Defaults,
+}
+
+impl Scope {
+    /// Parses a scope name, or `None` when it is not a known scope.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "var" => Some(Scope::Var),
+            "defaults" => Some(Scope::Defaults),
+            _ => None,
+        }
+    }
+}
+
+/// A fully parsed `$` reference: a scope and a name within it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarRef {
+    /// The scope the name is resolved in.
+    pub scope: Scope,
+    /// The variable/parameter name.
+    pub name: String,
+}
+
+impl std::fmt::Display for VarRef {
+    /// Renders the reference in its source form: `$name` for the default scope, or
+    /// `$scope.name` otherwise.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.scope {
+            Scope::Var => write!(f, "${}", self.name),
+            Scope::Defaults => write!(f, "$defaults.{}", self.name),
+        }
+    }
+}
+
+/// Reads a variable name starting at `index`: an ASCII letter followed by ASCII letters,
+/// digits or underscores. Advances `index` past the name.
+fn parse_name(chars: &[char], index: &mut usize) -> Option<String> {
+    let start = *index;
+    match chars.get(*index) {
+        Some(c) if c.is_ascii_alphabetic() => *index += 1,
+        _ => return None,
+    }
+    while let Some(c) = chars.get(*index) {
+        if c.is_ascii_alphanumeric() || *c == '_' {
+            *index += 1;
+        } else {
+            break;
+        }
+    }
+    Some(chars[start..*index].iter().collect())
+}
+
+/// Expands every `$` reference in `text`, using `resolve` to turn a reference into its
+/// replacement text.
+///
+/// Reference syntax is `$name` (the variables scope) or `$scope.name`; names are greedy
+/// over letters/digits/underscores. Backslash is the escape character: `\$` produces a
+/// literal `$` and `\\` a literal backslash. A backslash immediately *after* a reference
+/// terminates its name and escapes the next character (`$name\kun` is `<value>kun`);
+/// every other backslash is passed through untouched so the downstream command tokenizer
+/// still sees it. A `$` not followed by a variable name, an unknown scope, or a reference
+/// `resolve` rejects is an error describing the first problem found.
+pub fn expand_with<F>(text: &str, mut resolve: F) -> Result<String, String>
+where
+    F: FnMut(&VarRef) -> Result<String, String>,
+{
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let c = chars[index];
+        if c == '\\' {
+            match chars.get(index + 1) {
+                Some(next @ ('$' | '\\')) => {
+                    out.push(*next);
+                    index += 2;
+                }
+                _ => {
+                    out.push('\\');
+                    index += 1;
+                }
+            }
+        } else if c == '$' {
+            index += 1;
+            let Some(first) = parse_name(&chars, &mut index) else {
+                return Err(format!(
+                    "\"$\" in \"{text}\" must be followed by a variable name"
+                ));
+            };
+            // A dot only separates a scope from a name when the leading token is a known
+            // scope keyword (`var`, `defaults`, ...). Otherwise it is literal text, so
+            // `$name.png` is the variable `name` followed by `.png`, not scope `name`.
+            // Scope keywords are therefore reserved and cannot also name a variable.
+            let scope = Scope::parse(&first);
+            let reference = if scope.is_some() && chars.get(index) == Some(&'.') {
+                let scope = scope.expect("checked just above");
+                index += 1;
+                let Some(name) = parse_name(&chars, &mut index) else {
+                    return Err(format!(
+                        "\"$\" in \"{text}\" must name a variable after \"{first}.\""
+                    ));
+                };
+                VarRef { scope, name }
+            } else {
+                VarRef {
+                    scope: Scope::Var,
+                    name: first,
+                }
+            };
+            out.push_str(&resolve(&reference)?);
+            // A backslash directly after a reference ends its name: consume it and emit
+            // the escaped character, so it cannot leak into the downstream tokenizer.
+            if chars.get(index) == Some(&'\\') {
+                if let Some(next) = chars.get(index + 1) {
+                    out.push(*next);
+                    index += 2;
+                } else {
+                    out.push('\\');
+                    index += 1;
+                }
+            }
+        } else {
+            out.push(c);
+            index += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Syntax-only scan: returns every `$` reference in `text` in source order, erroring on
+/// the same malformed syntax [`expand_with`] rejects. Values are not resolved, so this is
+/// what config validation uses to check references against the declarations.
+pub fn references_in(text: &str) -> Result<Vec<VarRef>, String> {
+    let mut refs = Vec::new();
+    expand_with(text, |reference| {
+        refs.push(reference.clone());
+        Ok(String::new())
+    })?;
+    Ok(refs)
+}
+
+/// The current state of every variable and `defaults` parameter.
+///
+/// `defaults` entries live in the same namespace as user variables but are fixed (their
+/// names are known) and, for the writable ones, also change device behaviour when
+/// assigned - see the assignment code in `actions.rs`. Variable reads always return the
+/// current value here, never the declaration's initial value.
+#[derive(Debug, Clone)]
+pub struct Variables {
+    /// User-declared variables and their current values.
+    store: VariableStore,
+    /// Current button/screen LCD brightness (0-100).
+    button_brightness: i32,
+    /// Current encoder LED-ring brightness (0-100).
+    encoder_brightness: i32,
+    /// Current short-press threshold in milliseconds.
+    short_press_duration_ms: i64,
+    /// Current double-click gap in milliseconds.
+    double_click_gap_ms: i64,
+}
+
+impl Variables {
+    /// Builds the runtime state from validated declarations and the loaded `defaults`.
+    pub fn new(defs: BTreeMap<String, VarDef>, defaults: &Defaults) -> Self {
+        Self {
+            store: VariableStore::new(defs),
+            button_brightness: defaults.button_brightness as i32,
+            encoder_brightness: defaults.encoder_brightness as i32,
+            short_press_duration_ms: duration_millis(defaults.short_press_duration),
+            double_click_gap_ms: duration_millis(defaults.double_click_gap),
+        }
+    }
+
+    /// The user-variable store, for direct access by callers that need definitions or
+    /// raw values (e.g. assignment).
+    pub fn store(&self) -> &VariableStore {
+        &self.store
+    }
+
+    /// Mutable access to the user-variable store.
+    pub fn store_mut(&mut self) -> &mut VariableStore {
+        &mut self.store
+    }
+
+    /// Resolves `reference` to its current text: an integer as decimal, a string as-is.
+    pub fn read(&self, reference: &VarRef) -> Result<String, String> {
+        match reference.scope {
+            Scope::Var => match self.store.get(&reference.name) {
+                Some(value) => Ok(value.to_text()),
+                None => Err(format!("undefined variable \"{reference}\"")),
+            },
+            Scope::Defaults => match reference.name.as_str() {
+                "button_brightness" => Ok(self.button_brightness.to_string()),
+                "encoder_brightness" => Ok(self.encoder_brightness.to_string()),
+                "short_press_duration" => Ok(self.short_press_duration_ms.to_string()),
+                "double_click_gap" => Ok(self.double_click_gap_ms.to_string()),
+                _ => Err(format!("undefined variable \"{reference}\"")),
+            },
+        }
+    }
+
+    /// The declared type of `reference`, or `None` when it names nothing.
+    pub fn kind_of(&self, reference: &VarRef) -> Option<VarType> {
+        match reference.scope {
+            Scope::Var => self.store.def(&reference.name).map(|def| def.kind),
+            Scope::Defaults => match reference.name.as_str() {
+                "button_brightness"
+                | "encoder_brightness"
+                | "short_press_duration"
+                | "double_click_gap" => Some(VarType::Int),
+                _ => None,
+            },
+        }
+    }
+
+    /// Expands every `$` reference in `text` from the current state.
+    pub fn expand(&self, text: &str) -> Result<String, String> {
+        expand_with(text, |reference| self.read(reference))
+    }
+
+    /// The current button/screen brightness (0-100).
+    pub fn button_brightness(&self) -> i32 {
+        self.button_brightness
+    }
+
+    /// The current encoder LED-ring brightness (0-100).
+    pub fn encoder_brightness(&self) -> i32 {
+        self.encoder_brightness
+    }
+
+    /// Sets the button/screen brightness (the caller clamps it to 0-100 first).
+    pub fn set_button_brightness(&mut self, value: i32) {
+        self.button_brightness = value;
+    }
+
+    /// Sets the encoder LED-ring brightness (the caller clamps it to 0-100 first).
+    pub fn set_encoder_brightness(&mut self, value: i32) {
+        self.encoder_brightness = value;
+    }
+}
+
+/// A duration in whole milliseconds as an `i64`, saturating rather than wrapping on an
+/// absurdly large configured value.
+fn duration_millis(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,6 +807,134 @@ mod tests {
         assert_eq!(
             VarValue::Str("he said \"hi\"".to_string()).to_text(),
             "he said \"hi\""
+        );
+    }
+
+    /// Builds a runtime state for expansion tests: an int `count`, a str `name` and the
+    /// built-in [`Defaults`].
+    fn test_variables() -> Variables {
+        let mut defs = BTreeMap::new();
+        defs.insert("count".to_string(), VarDef::int(0, 100, 7));
+        defs.insert("name".to_string(), VarDef::string(50, "Bob".to_string()));
+        Variables::new(defs, &Defaults::default())
+    }
+
+    /// A bare `$name` and the explicit `$var.name` form resolve identically, ints render
+    /// decimally and `$defaults.*` reads return the current defaults values.
+    #[test]
+    fn expand_resolves_variables_and_defaults() {
+        let variables = test_variables();
+        assert_eq!(variables.expand("hello $name").unwrap(), "hello Bob");
+        assert_eq!(variables.expand("$var.name").unwrap(), "Bob");
+        assert_eq!(variables.expand("$count").unwrap(), "7");
+        assert_eq!(
+            variables.expand("$defaults.button_brightness").unwrap(),
+            "50"
+        );
+        assert_eq!(
+            variables.expand("$defaults.short_press_duration").unwrap(),
+            "300"
+        );
+        // A dot after a non-scope name is literal text, not a scope separator.
+        assert_eq!(variables.expand("$name.png").unwrap(), "Bob.png");
+        assert_eq!(variables.expand("$var.name.png").unwrap(), "Bob.png");
+        assert_eq!(variables.expand("no reference").unwrap(), "no reference");
+    }
+
+    /// Backslash escapes a literal `$`/`\`, terminates a reference name, and is otherwise
+    /// left in place for the downstream command tokenizer.
+    #[test]
+    fn expand_handles_escapes_and_delimiters() {
+        let variables = test_variables();
+        assert_eq!(variables.expand(r"$name-kun").unwrap(), "Bob-kun");
+        assert_eq!(variables.expand(r"$name\kun").unwrap(), "Bobkun");
+        assert_eq!(variables.expand(r"\$name").unwrap(), "$name");
+        assert_eq!(variables.expand(r"a\\b").unwrap(), r"a\b");
+        assert_eq!(variables.expand(r"$count$count").unwrap(), "77");
+        assert_eq!(
+            variables.expand(r"/bin/echo a\ b").unwrap(),
+            r"/bin/echo a\ b"
+        );
+    }
+
+    /// Malformed or unresolvable references are rejected with a descriptive error.
+    #[test]
+    fn expand_rejects_bad_references() {
+        let variables = test_variables();
+        for (input, needle) in [
+            ("$", "must be followed by a variable name"),
+            ("$ x", "must be followed by a variable name"),
+            ("$1abc", "must be followed by a variable name"),
+            ("$var.", "must name a variable"),
+            ("$env.HOME", "undefined variable"),
+            ("$missing", "undefined variable"),
+            ("$defaults.nope", "undefined variable"),
+        ] {
+            let error = variables.expand(input).unwrap_err();
+            assert!(
+                error.contains(needle),
+                "expected {input:?} to fail with {needle:?}, got {error:?}"
+            );
+        }
+    }
+
+    /// `references_in` lists references in source order without resolving them, and
+    /// ignores escaped ones.
+    #[test]
+    fn references_in_collects_unresolved_references() {
+        assert_eq!(
+            references_in("a $x then $var.y and $defaults.button_brightness").unwrap(),
+            vec![
+                VarRef {
+                    scope: Scope::Var,
+                    name: "x".to_string()
+                },
+                VarRef {
+                    scope: Scope::Var,
+                    name: "y".to_string()
+                },
+                VarRef {
+                    scope: Scope::Defaults,
+                    name: "button_brightness".to_string()
+                },
+            ]
+        );
+        assert!(references_in(r"\$x and a\\b").unwrap().is_empty());
+        assert!(references_in("plain").unwrap().is_empty());
+    }
+
+    /// `kind_of` reports declared types (defaults are all ints) and `None` for unknown
+    /// names.
+    #[test]
+    fn kind_of_reports_declared_types() {
+        let variables = test_variables();
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Var,
+                name: "count".to_string()
+            }),
+            Some(VarType::Int)
+        );
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Var,
+                name: "name".to_string()
+            }),
+            Some(VarType::Str)
+        );
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Defaults,
+                name: "button_brightness".to_string()
+            }),
+            Some(VarType::Int)
+        );
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Var,
+                name: "missing".to_string()
+            }),
+            None
         );
     }
 }
