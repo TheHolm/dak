@@ -4208,6 +4208,10 @@ mod tests {
         let mut defs = std::collections::BTreeMap::new();
         defs.insert("count".to_string(), crate::variables::VarDef::int(0, 10, 5));
         defs.insert(
+            "other".to_string(),
+            crate::variables::VarDef::int(0, 100, 7),
+        );
+        defs.insert(
             "name".to_string(),
             crate::variables::VarDef::string(3, "abc".to_string()),
         );
@@ -4329,6 +4333,31 @@ mod tests {
         assert_eq!(variables.button_brightness(), 100);
     }
 
+    /// A bare user-variable right-hand side (`$a := $b`) copies the source's current
+    /// value, clamping it into the target's range.
+    #[test]
+    fn apply_assignment_copies_bare_user_variable() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        let reference = crate::variables::VarRef {
+            scope: crate::variables::Scope::Var,
+            name: "other".to_string(),
+        };
+        super::apply_assignment(
+            &super::AssignTarget::Variable("count".to_string()),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Variable(reference),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            variables.store().get("count"),
+            Some(&crate::variables::VarValue::Int(7)),
+            "count takes other's value of 7"
+        );
+    }
+
     /// `parse_assignment` splits the target from the operator and parses each kind of
     /// right-hand side, without mistaking a character inside the right-hand side for the
     /// assignment's own operator.
@@ -4430,6 +4459,13 @@ mod tests {
             super::resolve_action("/bin/echo $dir", &variables).unwrap(),
             super::Action::Command {
                 command: "/bin/echo a".to_string()
+            }
+        );
+        // A value that is exactly one reference expands to just its value.
+        assert_eq!(
+            super::resolve_action("$dir", &variables).unwrap(),
+            super::Action::Command {
+                command: "a".to_string()
             }
         );
         assert!(super::resolve_action("/bin/echo $missing", &variables).is_err());
@@ -4633,6 +4669,34 @@ mod tests {
                 text: "dir=a".to_string(),
                 refresh_seconds: 2,
             }]
+        );
+    }
+
+    /// A `text_value` whose params are exactly one reference renders just that value -
+    /// the "bare variable" case - for both a str and an int.
+    #[test]
+    fn scene_operations_resolve_bare_text_value() {
+        let scenes = json!({
+            "main": { "setup": {
+                "1b01": { "type": "text_value", "params": "$dir" },
+                "1b02": { "type": "text_value", "params": "$period" }
+            } }
+        });
+        let operations = super::scene_operations_with("main", &scenes, &scene_variables()).unwrap();
+        assert_eq!(
+            operations,
+            vec![
+                super::SceneOp::TextValue {
+                    reference: crate::baseplane::Reference::button(1, 1),
+                    text: "a".to_string(),
+                    refresh_seconds: 0,
+                },
+                super::SceneOp::TextValue {
+                    reference: crate::baseplane::Reference::button(1, 2),
+                    text: "7".to_string(),
+                    refresh_seconds: 0,
+                },
+            ]
         );
     }
 
