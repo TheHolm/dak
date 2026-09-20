@@ -1283,7 +1283,7 @@ impl ButtonDevice for Device {
 pub struct SceneRunner<'a, D: ButtonDevice> {
     device: &'a D,
     image_format: ImageFormat,
-    tracker: ExecTracker,
+    pub tracker: ExecTracker,
     /// Output filter: debug lines for scene/device events only print when enabled.
     log: Log,
     /// Config number of the device this runner drives. Operations targeting another
@@ -1309,7 +1309,7 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     refresh_handles: std::collections::HashMap<u8, tokio::task::JoinHandle<()>>,
     /// Sender for refresh ticks: a spawned task sleeps for a button's `refresh_seconds`
     /// then sends its key here; the receiving end drives [`SceneRunner::refresh_button`].
-    refresh_tx: mpsc::Sender<u8>,
+    pub refresh_tx: mpsc::Sender<u8>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
