@@ -331,6 +331,42 @@ mod tests {
         assert_eq!(Kind::from_vid_pid(AJAZZ_VID, 0xffff), None); // Ajazz VID, unknown PID
     }
 
+    /// Every vendor/product ID pair [`QUERIES`] matches must resolve, through
+    /// [`Kind::from_vid_pid`] itself, to the exact `Kind` that pair is documented as
+    /// belonging to. `every_query_resolves_to_a_kind_and_back` above deliberately
+    /// avoids calling `from_vid_pid` (its own doc comment explains why) so that test
+    /// alone never actually exercises `from_vid_pid`'s match arms; this test drives
+    /// the function directly with the same thirteen pairs `QUERIES` is built from,
+    /// so every arm (and its round trip back through the pair it was matched on) is
+    /// covered.
+    #[test]
+    fn from_vid_pid_resolves_every_known_pair() {
+        let pairs = [
+            (AJAZZ_VID, 0x1001, Kind::Akp03),
+            (AJAZZ_VID, 0x1002, Kind::Akp03E),
+            (AJAZZ_VID, 0x1003, Kind::Akp03R),
+            (AJAZZ_VID, 0x3002, Kind::Akp03ERev2),
+            (AJAZZ_VID, 0x3003, Kind::Akp03RRev2),
+            (MIRABOX_6602_VID, 0x1000, Kind::MiraboxN3_6602_1000),
+            (MIRABOX_6602_VID, 0x1002, Kind::MiraboxN3_6602_1002),
+            (MIRABOX_6603_VID, 0x1002, Kind::MiraboxN3_6603_1002),
+            (MIRABOX_6603_VID, 0x1003, Kind::MiraboxN3_6603_1003),
+            (SOOMFON_VID, 0x3001, Kind::SoomfonSe),
+            (MARS_GAMING_VID, 0x1001, Kind::MarsGamingMsdTwo),
+            (TREASLIN_VID, 0x1001, Kind::TreasLinN3),
+            (REDRAGON_VID, 0x2000, Kind::RedragonSs551),
+        ];
+        assert_eq!(pairs.len(), QUERIES.len());
+
+        for (vendor_id, product_id, expected) in pairs {
+            assert_eq!(
+                Kind::from_vid_pid(vendor_id, product_id),
+                Some(expected),
+                "vendor {vendor_id:04x} product {product_id:04x} should resolve to {expected:?}"
+            );
+        }
+    }
+
     /// The one hardware-verified [`Kind`] keeps the values this project has
     /// actually shipped and tested, regardless of what the rest of this module's
     /// data-driven table would otherwise compute for it.

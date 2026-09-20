@@ -948,7 +948,7 @@ fn device_summary_line(
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -973,7 +973,23 @@ mod tests {
         last_button_brightness: Mutex<Option<u8>>,
         /// The last value passed to `set_led_brightness`, if any.
         last_encoder_brightness: Mutex<Option<u8>>,
+        /// When set, `set_brightness`/`set_led_brightness` fail instead of
+        /// succeeding, for exercising `run_action`'s `SetConfig` failure branch.
+        fail_brightness: AtomicBool,
     }
+
+    /// [`MockButtonDevice`]'s error type: a fixed message, only ever produced when a
+    /// test has explicitly armed a failure via `fail_brightness_calls`.
+    #[derive(Debug)]
+    struct MockWriteError(&'static str);
+
+    impl std::fmt::Display for MockWriteError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for MockWriteError {}
 
     impl MockButtonDevice {
         /// Every `clear`/`flush`/`set`/`set_brightness`/`set_led_brightness` the runner
@@ -991,10 +1007,16 @@ mod tests {
         fn last_encoder_brightness(&self) -> Option<u8> {
             *self.last_encoder_brightness.lock().unwrap()
         }
+
+        /// Makes every future `set_brightness`/`set_led_brightness` call fail.
+        fn fail_brightness_calls(&self, yes: bool) {
+            self.fail_brightness
+                .store(yes, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl ButtonDevice for MockButtonDevice {
-        type Error = std::convert::Infallible;
+        type Error = MockWriteError;
 
         async fn set_button_image(
             &self,
@@ -1022,12 +1044,24 @@ mod tests {
 
         async fn set_brightness(&self, percent: u8) -> Result<(), Self::Error> {
             self.calls.lock().unwrap().push("set_brightness");
+            if self
+                .fail_brightness
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(MockWriteError("device brightness write refused"));
+            }
             *self.last_button_brightness.lock().unwrap() = Some(percent);
             Ok(())
         }
 
         async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error> {
             self.calls.lock().unwrap().push("set_led_brightness");
+            if self
+                .fail_brightness
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(MockWriteError("device LED brightness write refused"));
+            }
             *self.last_encoder_brightness.lock().unwrap() = Some(percent);
             Ok(())
         }
@@ -1620,6 +1654,79 @@ mod tests {
         assert_eq!(mock.last_button_brightness(), None);
     }
 
+    /// When the device rejects a `$defaults.button_brightness := N` write, the
+    /// failure is logged rather than propagated, and neither the current nor the
+    /// previous scene changes: a `SetConfig` action never touches scene state either
+    /// way, success or failure.
+    #[tokio::test]
+    async fn run_action_set_config_logs_when_brightness_write_fails() {
+        let mock = MockButtonDevice::default();
+        mock.fail_brightness_calls(true);
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.button_brightness := 80",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            mock.last_button_brightness(),
+            None,
+            "the write failed, so the mock never recorded a percent"
+        );
+        assert_eq!(mock.calls(), vec!["set_brightness"]);
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
+    /// The same failure-logging behavior as
+    /// `run_action_set_config_logs_when_brightness_write_fails`, but for
+    /// `$defaults.encoder_brightness` (`set_led_brightness`) instead of
+    /// `button_brightness` (`set_brightness`) - the two `SetConfig` targets dispatch
+    /// to distinct device methods, so each needs its own failing-write coverage.
+    #[tokio::test]
+    async fn run_action_set_config_logs_when_led_brightness_write_fails() {
+        let mock = MockButtonDevice::default();
+        mock.fail_brightness_calls(true);
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.encoder_brightness := 15",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            mock.last_encoder_brightness(),
+            None,
+            "the write failed, so the mock never recorded a percent"
+        );
+        assert_eq!(mock.calls(), vec!["set_led_brightness"]);
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+    }
+
     /// An `@scene` action still switches even when the target scene has a button that
     /// fails to draw: the scene name and `previous_scene` update before the setup runs,
     /// and the failing button draws the red "Error" label instead of stopping the
@@ -1664,7 +1771,88 @@ mod tests {
         );
     }
 
-    /// A spawned command action's completion is logged on both outcomes: this drives
+    /// A bare `@` action whose current scene is not defined at all (as opposed to
+    /// defined but containing a button that fails to draw, covered by
+    /// `run_action_stay_keeps_scene_when_reapply_fails`) fails `enter_scene` itself;
+    /// that failure is logged and swallowed rather than propagated, and the scene's
+    /// timer is still (re)armed with whatever `arm_scene_timer` makes of the same
+    /// undefined scene name (nothing, here, since it has no `actions.timer`).
+    #[tokio::test]
+    async fn run_action_stay_logs_and_continues_when_scene_is_undefined() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({});
+        let mut current_scene = String::from("missing");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "missing",
+            "a failed reapply must not change the scene name"
+        );
+        assert!(previous_scene.is_none());
+        assert!(
+            mock.calls().is_empty(),
+            "enter_scene must fail before touching the device: {:?}",
+            mock.calls()
+        );
+        assert!(
+            state.timer_handle.is_none(),
+            "an undefined scene has no timer to arm"
+        );
+    }
+
+    /// An `@scene` action targeting a scene that is not defined at all fails
+    /// `enter_scene` itself, mirroring
+    /// `run_action_stay_logs_and_continues_when_scene_is_undefined` for `SwitchScene`
+    /// instead of `Stay`: the scene name and `previous_scene` still update (the switch
+    /// itself does not depend on the target existing), the failure is logged and
+    /// swallowed, and no device call is ever attempted.
+    #[tokio::test]
+    async fn run_action_switch_scene_logs_and_continues_when_target_is_undefined() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@Missing",
+            &mut state.timer_handle,
+            &state.timer_tx,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "Missing",
+            "the scene name updates even though the target scene does not exist"
+        );
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+        assert!(
+            mock.calls().is_empty(),
+            "enter_scene must fail before touching the device: {:?}",
+            mock.calls()
+        );
+    }
+
     /// the background task to completion so `run_action_command`'s success and
     /// failure branches both run, not just the `tokio::spawn` call itself.
     #[tokio::test]

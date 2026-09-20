@@ -2474,7 +2474,7 @@ pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, 
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2500,6 +2500,27 @@ mod tests {
             match &self.0 {
                 Some(old) => std::env::set_var("HOME", old),
                 None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Temporarily unsets `HOME` entirely, restoring the previous value (if any) when
+    /// dropped. Distinct from [`SetHome`], which always leaves `HOME` set to something -
+    /// this is for exercising the "no `$HOME` at all" fallback of [`expand_tilde`].
+    struct UnsetHome(Option<std::ffi::OsString>);
+
+    impl UnsetHome {
+        fn new() -> Self {
+            let old = std::env::var_os("HOME");
+            std::env::remove_var("HOME");
+            UnsetHome(old)
+        }
+    }
+
+    impl Drop for UnsetHome {
+        fn drop(&mut self) {
+            if let Some(old) = &self.0 {
+                std::env::set_var("HOME", old);
             }
         }
     }
@@ -3055,6 +3076,16 @@ mod tests {
         assert_eq!(super::expand_tilde("/etc/passwd"), "/etc/passwd");
     }
 
+    /// With `$HOME` unset entirely (not merely empty), a leading `~` is left
+    /// untouched rather than expanding to nothing or panicking.
+    #[test]
+    fn expand_tilde_leaves_value_unchanged_when_home_is_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _unset_home = UnsetHome::new();
+        assert_eq!(super::expand_tilde("~/foo/bar.png"), "~/foo/bar.png");
+        assert_eq!(super::expand_tilde("~"), "~");
+    }
+
     /// `parse_command_line` expands a leading `~` in both the program name and every
     /// argument.
     #[test]
@@ -3274,6 +3305,42 @@ mod tests {
             "$defaults.button_brightness := high", // unquoted non-numeric
         ] {
             assert_eq!(super::parse_set_config(value), None, "for {value}");
+        }
+    }
+
+    /// [`action_values`] reads a single non-empty string as a one-element list and a
+    /// non-empty array of strings as-is, filtering out empty and non-string entries;
+    /// anything else it cannot make sense of (a bool, number, null, or object) - which
+    /// `check_action_values` already rejects at config-load time, so a real config can
+    /// never actually reach this function with one - falls back to an empty list
+    /// rather than panicking, exactly like an absent or empty value does.
+    #[test]
+    fn action_values_reads_strings_and_arrays_and_ignores_other_types() {
+        assert_eq!(
+            super::action_values(&Value::String("@Test".to_string())),
+            ["@Test"]
+        );
+        assert_eq!(
+            super::action_values(&Value::String(String::new())),
+            Vec::<&str>::new(),
+            "an explicitly empty string is treated as no action"
+        );
+        assert_eq!(
+            super::action_values(&Value::Array(vec![
+                Value::String("@A".to_string()),
+                Value::String(String::new()),
+                Value::Bool(true),
+                Value::String("@B".to_string()),
+            ])),
+            ["@A", "@B"],
+            "empty strings and non-string array entries are dropped"
+        );
+        for value in [Value::Bool(true), Value::Null, Value::from(5), json!({})] {
+            assert_eq!(
+                super::action_values(&value),
+                Vec::<&str>::new(),
+                "a value that is neither a string nor an array yields no actions: {value:?}"
+            );
         }
     }
 }

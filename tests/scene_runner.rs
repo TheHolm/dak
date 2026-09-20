@@ -149,6 +149,7 @@ impl std::error::Error for WriteError {}
 #[derive(Default)]
 struct FailingButtonDevice {
     fail_set_image: AtomicBool,
+    fail_clear_image: AtomicBool,
     fail_flush: AtomicBool,
     fail_brightness: AtomicBool,
     attempts: Mutex<Vec<&'static str>>,
@@ -163,6 +164,11 @@ impl FailingButtonDevice {
     /// Makes every future `set_button_image` call fail.
     fn fail_image_writes(&self, yes: bool) {
         self.fail_set_image.store(yes, Ordering::SeqCst);
+    }
+
+    /// Makes every future `clear_button_image` call fail.
+    fn fail_clear_writes(&self, yes: bool) {
+        self.fail_clear_image.store(yes, Ordering::SeqCst);
     }
 
     /// Makes every future `flush` call fail.
@@ -195,7 +201,11 @@ impl ButtonDevice for FailingButtonDevice {
 
     async fn clear_button_image(&self, _key: u8) -> Result<(), Self::Error> {
         self.attempts.lock().unwrap().push("ClearImage");
-        Ok(())
+        if self.fail_clear_image.load(Ordering::SeqCst) {
+            Err(WriteError("device clear refused"))
+        } else {
+            Ok(())
+        }
     }
 
     async fn flush(&self) -> Result<(), Self::Error> {
@@ -1387,7 +1397,111 @@ async fn screenless_buttons_are_not_skipped_for_clear() {
     assert_eq!(mock.keys(&calls), [6]);
 }
 
-/// When `image_exec` output decodes fine but staging it on the device fails, the
+/// A static `image` operation (not an `image_exec`) whose draw the device refuses is
+/// logged and does not stop the scene from finishing: the trailing scene-level flush
+/// still runs, distinctly from `exec_output_write_failure_is_logged` below, which
+/// covers the same draw failure for `image_exec`'s async output instead of a plain
+/// `image` operation applied directly by `enter_scene`.
+#[tokio::test]
+async fn set_image_op_write_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let image_path = write_temp_image();
+    let scenes = scenes_with_buttons(json!({
+        "1b03": { "type": "image", "params": image_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let attempts = device.attempts();
+    assert_eq!(
+        attempts,
+        vec!["SetImage", "Flush"],
+        "the failing draw is attempted and the scene's trailing flush still runs: \
+         {attempts:?}"
+    );
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A static `text` operation whose rendered draw the device refuses is logged and
+/// does not stop the scene from finishing, mirroring
+/// `set_image_op_write_failure_is_logged` for the `text` operation kind instead of
+/// `image`.
+#[tokio::test]
+async fn text_op_write_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let text_path = write_temp_text("hello");
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text", "params": text_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let attempts = device.attempts();
+    assert_eq!(
+        attempts,
+        vec!["SetImage", "Flush"],
+        "the failing draw is attempted and the scene's trailing flush still runs: \
+         {attempts:?}"
+    );
+    let _ = std::fs::remove_file(&text_path);
+}
+
+/// A `clear` operation whose device write is refused is logged and does not stop the
+/// scene from finishing: the trailing scene-level flush still runs. No other test
+/// makes `clear_button_image` itself fail (`screenless_buttons_are_not_skipped_for_clear`
+/// above exercises the same operation kind but always against a device that succeeds).
+#[tokio::test]
+async fn clear_op_write_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_clear_writes(true);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+    );
+
+    let scenes = scenes_with_buttons(json!({ "1b01": { "type": "clear" } }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let attempts = device.attempts();
+    assert_eq!(
+        attempts,
+        vec!["ClearImage", "Flush"],
+        "the failing clear is attempted and the scene's trailing flush still runs: \
+         {attempts:?}"
+    );
+}
+
 /// failure is logged and no further flush happens for that output.
 #[tokio::test]
 async fn exec_output_write_failure_is_logged() {
