@@ -297,8 +297,8 @@ untouched, and there is no `~user` support.
 Assignment to a variable or a writable default happens immediately, without touching
 `config.json` and without persisting across a reconnect - e.g.
 `"$defaults.button_brightness := 100"` sets the device's brightness, and
-`"$count = $count"` copies a variable into itself. See [Variables](#variables) for the
-full syntax, targets, operators and right-hand sides.
+`"$name := $other"` copies one variable into another. See [Variables](#variables) for
+the full syntax, targets, operators and right-hand sides.
 
 An event's value (and the `timer` value) may be a plain string, as above, or an array
 of them, e.g. `"short_press": ["/usr/bin/notify-send hi", "@Main"]`, to trigger more
