@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.10.0 (declared as `0.10.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.11.0 (declared as `0.11.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -54,6 +54,9 @@ under other platforms.
   button B, encoder E) that scene configs and control references use
 - `src/press.rs` — complex press-event detection: turns a button's raw
   press/release timeline into `short_press`/`long_press`/`double_click` events
+- `src/color.rs` — button colours: parsing the `background`/`text_color` config
+  values (hex or CSS colour names) and alpha-compositing transparent images onto
+  an opaque background
 - `src/text.rs` — text rendering for button LCDs using a font embedded in the binary
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
   (`device`/`scene`/`action`) by `-d`/`--debug`

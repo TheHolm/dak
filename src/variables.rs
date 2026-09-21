@@ -16,6 +16,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 use crate::actions::value_type;
+use crate::color::Color;
 use crate::press::Defaults;
 
 /// The default `max_length` of a `str` variable when the declaration omits it.
@@ -618,6 +619,12 @@ pub struct Variables {
     short_press_duration_ms: i64,
     /// Current double-click gap in milliseconds.
     double_click_gap_ms: i64,
+    /// Current button background colour (the canvas transparent pixels and text are
+    /// drawn on), set from `defaults.background` and mutable via `$defaults.background`.
+    background: Color,
+    /// Current text colour, set from `defaults.text_color` and mutable via
+    /// `$defaults.text_color`.
+    text_color: Color,
     /// The `defaults` values the program started with, kept so a failed command-output
     /// assignment can reset a writable brightness parameter to its configured default.
     defaults: Defaults,
@@ -632,7 +639,9 @@ impl Variables {
             encoder_brightness: defaults.encoder_brightness as i32,
             short_press_duration_ms: duration_millis(defaults.short_press_duration),
             double_click_gap_ms: duration_millis(defaults.double_click_gap),
-            defaults: *defaults,
+            background: defaults.background.clone(),
+            text_color: defaults.text_color.clone(),
+            defaults: defaults.clone(),
         }
     }
 
@@ -665,6 +674,8 @@ impl Variables {
                 "encoder_brightness" => Ok(self.encoder_brightness.to_string()),
                 "short_press_duration" => Ok(self.short_press_duration_ms.to_string()),
                 "double_click_gap" => Ok(self.double_click_gap_ms.to_string()),
+                "background" => Ok(self.background.text().to_string()),
+                "text_color" => Ok(self.text_color.text().to_string()),
                 _ => Err(format!("undefined variable \"{reference}\"")),
             },
         }
@@ -679,6 +690,7 @@ impl Variables {
                 | "encoder_brightness"
                 | "short_press_duration"
                 | "double_click_gap" => Some(VarType::Int),
+                "background" | "text_color" => Some(VarType::Str),
                 _ => None,
             },
         }
@@ -707,6 +719,26 @@ impl Variables {
     /// Sets the encoder LED-ring brightness (the caller clamps it to 0-100 first).
     pub fn set_encoder_brightness(&mut self, value: i32) {
         self.encoder_brightness = value;
+    }
+
+    /// The current background colour.
+    pub fn background(&self) -> &Color {
+        &self.background
+    }
+
+    /// The current text colour.
+    pub fn text_color(&self) -> &Color {
+        &self.text_color
+    }
+
+    /// Sets the background colour.
+    pub fn set_background(&mut self, value: Color) {
+        self.background = value;
+    }
+
+    /// Sets the text colour.
+    pub fn set_text_color(&mut self, value: Color) {
+        self.text_color = value;
     }
 }
 
@@ -908,10 +940,35 @@ mod tests {
             variables.expand("$defaults.short_press_duration").unwrap(),
             "300"
         );
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "#000000");
+        assert_eq!(variables.expand("$defaults.text_color").unwrap(), "#ffffff");
         // A dot after a non-scope name is literal text, not a scope separator.
         assert_eq!(variables.expand("$name.png").unwrap(), "Bob.png");
         assert_eq!(variables.expand("$var.name.png").unwrap(), "Bob.png");
         assert_eq!(variables.expand("no reference").unwrap(), "no reference");
+    }
+
+    /// The default colours are seeded from `Defaults` and a setter updates both the
+    /// parsed colour and the text `$defaults.*` reads back.
+    #[test]
+    fn default_colours_are_seeded_and_settable() {
+        let defaults = Defaults {
+            background: crate::color::Color::parse("red").unwrap(),
+            text_color: crate::color::Color::parse("#00ff00").unwrap(),
+            ..Defaults::default()
+        };
+        let mut variables = Variables::new(BTreeMap::new(), &defaults);
+
+        assert_eq!(variables.background().channels(), [0xff, 0x00, 0x00]);
+        assert_eq!(variables.background().text(), "red");
+        assert_eq!(variables.text_color().channels(), [0x00, 0xff, 0x00]);
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "red");
+
+        variables.set_background(crate::color::Color::parse("blue").unwrap());
+        variables.set_text_color(crate::color::Color::parse("#000000").unwrap());
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "blue");
+        assert_eq!(variables.background().channels(), [0x00, 0x00, 0xff]);
+        assert_eq!(variables.expand("$defaults.text_color").unwrap(), "#000000");
     }
 
     /// Backslash escapes a literal `$`/`\`, terminates a reference name, and is otherwise
@@ -976,8 +1033,8 @@ mod tests {
         assert!(references_in("plain").unwrap().is_empty());
     }
 
-    /// `kind_of` reports declared types (defaults are all ints) and `None` for unknown
-    /// names.
+    /// `kind_of` reports declared types (the numeric defaults are ints, the colour
+    /// defaults str) and `None` for unknown names.
     #[test]
     fn kind_of_reports_declared_types() {
         let variables = test_variables();
@@ -1001,6 +1058,21 @@ mod tests {
                 name: "button_brightness".to_string()
             }),
             Some(VarType::Int)
+        );
+        // The colour defaults are string-like, so a str right-hand side is accepted.
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Defaults,
+                name: "background".to_string()
+            }),
+            Some(VarType::Str)
+        );
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Defaults,
+                name: "text_color".to_string()
+            }),
+            Some(VarType::Str)
         );
         assert_eq!(
             variables.kind_of(&VarRef {

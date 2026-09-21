@@ -5,6 +5,100 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.11.0 — Configurable button background/text colours (transparent icons no longer turn white)
+
+### User-facing changes
+- Transparent button images (icons/PNGs with an alpha channel) no longer
+  render with a white background. The transparent pixels are now composited
+  onto a configurable colour, black by default, which matches the device's own
+  black screen and the text rendering. This is a visible change for any config
+  whose icons have transparent areas: those areas are now black unless you say
+  otherwise.
+- New `defaults.background` (default `#000000`) and `defaults.text_color`
+  (default `#ffffff`) settings. `background` is composited under transparent
+  image pixels and is the canvas button text is drawn on; `text_color` is the
+  colour button text is drawn in, so a light theme is
+  `"background": "#ffffff", "text_color": "#000000"`.
+- An individual `setup` entry may override either colour for its own button
+  with a `background`/`text_color` key. The override belongs to the button, not
+  the scene: like the rest of a button's content it is kept until a later scene
+  explicitly redefines that button.
+- Both colours are writable at runtime, like brightness:
+  `$defaults.background := "red"` and `$defaults.text_color := "#000000"`.
+  They are also readable (`$defaults.background` expands to the string it was
+  set from, name or hex). A colour change affects the next draw; buttons
+  already on screen are not repainted.
+- Colour values accept a `#RRGGBB` literal or a CSS basic colour name
+  (`black`, `silver`, `gray`/`grey`, `white`, `maroon`, `red`, `purple`,
+  `fuchsia`/`magenta`, `green`, `lime`, `olive`, `yellow`, `navy`, `blue`,
+  `teal`, `aqua`/`cyan`, plus `orange`). The `#RGB` shorthand and alpha are not
+  accepted. A bad colour in the `defaults` section or in a literal per-button
+  `background`/`text_color` is a config-load error.
+- The red "Error" label is deliberately unaffected: it stays red on black.
+- Version bumped to `0.11.0`.
+
+### Details
+- New `src/color.rs`: `Color { rgb, text }` keeps the parsed channels plus the
+  exact source text, so `$defaults.background`/`text_color` reads round-trip
+  (`Color::parse`, `Color::channels`, `Color::text`; equality compares
+  channels, so `red == #ff0000`). `flatten(image, background)` alpha-composites
+  an image with an alpha channel onto an opaque background layer
+  (`imageops::overlay`) and returns an RGB image; an image without alpha is
+  returned untouched.
+- The fix for the white background: mirajazz encodes button images with
+  `DynamicImage::into_rgb8()`, which merely drops the alpha channel and keeps
+  the hidden RGB (usually white). `flatten` runs before the image reaches the
+  device in every draw path - `SceneOp::SetImage`, `image_exec` output, and the
+  test-only `set_image_from_file` - so the pixels are already the intended
+  colour.
+- `Defaults` gained `background`/`text_color` and lost `Copy` (a `Color`
+  contains a `String`); consumers now borrow or clone (`ClickDetector::new`
+  takes `&Defaults`, `run_pressable_edge` takes `&Defaults`, `run_device`
+  clones once per device).
+- `src/text.rs`: new `render_text_colored(lines, background, text_color,
+  format)`; the shared `render_image` fills the canvas with the background and
+  alpha-blends glyph coverage over it (`fg*a + bg*(1-a)`) instead of replacing
+  pixels, so anti-aliased edges are correct on a non-black background.
+  `render_text` stays a white-on-black wrapper (used by `--map` and the
+  hardware tests) and `render_error_image` stays red-on-black.
+- `src/actions.rs`: `DEFAULTS_KEYS` and `check_defaults` accept the two colour
+  keys; `check_button_op` gains a `check_colour_field` helper that allows
+  `background` on `image`/`image_exec`/`text`/`text_value`/`text_exec` and
+  `text_color` on the three text types only, parses literal colours at load,
+  and defers `$`-referenced colours to runtime. `RawSceneOp`/`SceneOp` carry the
+  colours as expanded `Option<String>`; the runner parses them at draw time and
+  falls back to the global default with a warning when a `$` reference resolves
+  to a non-colour (`SceneRunner::draw_colour`/`active_background`/
+  `active_text_color`), rather than failing the scene. `SceneRunner` gained
+  `set_background`/`set_text_color`.
+- Runtime mutability reuses the existing assignment machinery:
+  `SettableDefault` gained `Background`/`TextColor`, `Constraint` gained
+  `Color`, `classify_target`/`classify_assign_target_syntax` recognise the two
+  paths, and `check_default_assignment` type-checks them (a colour target takes
+  a string RHS that parses as a colour). A `Color` has no range to clamp into,
+  so an invalid value is discarded in favour of the configured default instead:
+  a literal is a load error under `=`, a warning under `:=` and silent under
+  `~=`; a value from a variable or command is only known at runtime and is
+  always lenient (`=` behaves like `:=`). `apply_assignment` now returns a
+  `DefaultEffect` (`Brightness`/`Color`), and command substitution gained
+  `Conversion::Color` (its `default_value` is the configured colour's text,
+  re-parsed by `apply_completed_assignment`).
+- `src/variables.rs`: `Variables` stores the two colours, reads them back as
+  their source text, reports them as `str` (`kind_of`), and exposes
+  `background`/`text_color` getters and setters.
+- `src/main.rs`: `run_device` passes the configured colours to the runner;
+  assignment side effects push a colour with `set_background`/`set_text_color`.
+- Docs: `man/dak-config.5` gained a `COLOURS` section and documents the two
+  defaults, the per-button overrides and the assignment/read behaviour;
+  `man/dak.1` was regenerated for the version bump; `README.markdown` and
+  `config.json.example` describe the new keys.
+- Tests: `src/color.rs` unit tests (parse/aliases/rejects, source text,
+  `flatten` opaque/transparent/partial-alpha), `src/text.rs` colour rendering,
+  `src/actions.rs` assignment/validation units, plus the existing
+  `tests/scene_operations.rs`/`tests/scene_runner.rs` literal updates and new
+  runner tests for a composited transparent image and a runtime colour
+  assignment.
+
 ## v0.10.1 — Man pages, richer `--help`, stricter event validation, and worked examples
 
 ### User-facing changes

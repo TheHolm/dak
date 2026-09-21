@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::baseplane::{Kind, Reference};
+use crate::color::Color;
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::press::Defaults;
@@ -58,6 +59,8 @@ pub const DEFAULTS_KEYS: &[&str] = &[
     "double_click_gap",
     "button_brightness",
     "encoder_brightness",
+    "background",
+    "text_color",
 ];
 
 /// The scene `setup` operation types (the allowed `"type"` values). Setup validation
@@ -335,8 +338,9 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
 }
 
 /// Validates the optional `defaults` section: an object holding the press-detection
-/// timing knobs (positive millisecond durations) and the connect-time brightness
-/// levels (0-100 percent). Missing keys fall back to [`Defaults::default`].
+/// timing knobs (positive millisecond durations), the connect-time brightness levels
+/// (0-100 percent) and the button background/text colours. Missing keys fall back to
+/// [`Defaults::default`].
 fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
     let map = match defaults.as_object() {
         Some(map) => map,
@@ -401,6 +405,23 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
                     "button_brightness" => result.button_brightness = percent,
                     "encoder_brightness" => result.encoder_brightness = percent,
                     _ => unreachable!("checked above"),
+                }
+            }
+            "background" | "text_color" => {
+                let Some(text) = value.as_str() else {
+                    errors.push(format!(
+                        "defaults.{key} must be a colour (#RRGGBB or a colour name), got {}",
+                        value_type(value)
+                    ));
+                    continue;
+                };
+                match Color::parse(text) {
+                    Ok(colour) => match key.as_str() {
+                        "background" => result.background = colour,
+                        "text_color" => result.text_color = colour,
+                        _ => unreachable!("checked above"),
+                    },
+                    Err(error) => errors.push(format!("defaults.{key}: {error}")),
                 }
             }
             _ => unreachable!("unknown keys are rejected above"),
@@ -557,7 +578,8 @@ fn check_scene(
 }
 
 /// Validates the `setup` dictionary of a scene: numbered button entries with a known
-/// `type` and a `params` string suited to that type.
+/// `type`, a `params` string suited to that type, and optional `refresh`/`background`/
+/// `text_color` fields.
 fn check_setup(
     variables: &Variables,
     scene_name: &str,
@@ -609,9 +631,14 @@ fn check_button_op(
         }
     };
     for field in object.keys() {
-        if field != "type" && field != "params" && field != "refresh" {
+        if field != "type"
+            && field != "params"
+            && field != "refresh"
+            && field != "background"
+            && field != "text_color"
+        {
             errors.push(format!(
-                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected \"type\", \"params\" and \"refresh\""
+                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected \"type\", \"params\", \"refresh\", \"background\" and \"text_color\""
             ));
         }
     }
@@ -696,6 +723,27 @@ fn check_button_op(
         return;
     }
 
+    // The optional colour fields: literals are parsed here (a bad colour is a load-time
+    // error); a value built from references is resolved and parsed at runtime.
+    check_colour_field(
+        variables,
+        scene_name,
+        &location,
+        "background",
+        kind,
+        object,
+        errors,
+    );
+    check_colour_field(
+        variables,
+        scene_name,
+        &location,
+        "text_color",
+        kind,
+        object,
+        errors,
+    );
+
     match kind {
         "image" | "text" => {
             if params.is_empty() {
@@ -743,6 +791,62 @@ fn check_button_op(
             errors.push(format!(
                 "scene \"{scene_name}\": {location} unsupported type \"{other}\", expected {}",
                 SETUP_KINDS.join(", ")
+            ));
+        }
+    }
+}
+
+/// Validates one optional `background`/`text_color` field of a numbered setup entry.
+///
+/// The field is only meaningful on the types that actually draw something with a colour:
+/// `background` on the image and text types, `text_color` on the text types only. The
+/// value must be a string; a literal colour is parsed here, so a bad colour is a
+/// config-load error, while a value containing `$` references can only have its
+/// references checked and is parsed at runtime (see `SceneRunner`).
+fn check_colour_field(
+    variables: &Variables,
+    scene_name: &str,
+    location: &str,
+    field: &str,
+    kind: &str,
+    object: &serde_json::Map<String, Value>,
+    errors: &mut Vec<String>,
+) {
+    let allowed = match field {
+        "background" => matches!(
+            kind,
+            "image" | "image_exec" | "text" | "text_value" | "text_exec"
+        ),
+        "text_color" => matches!(kind, "text" | "text_value" | "text_exec"),
+        other => unreachable!("check_colour_field called for {other}"),
+    };
+    let Some(value) = object.get(field) else {
+        return;
+    };
+    if !allowed {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} {field} cannot be used with type \"{kind}\""
+        ));
+        return;
+    }
+    let Some(text) = value.as_str() else {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} {field} must be a colour string (#RRGGBB or a colour name), got {}",
+            value_type(value)
+        ));
+        return;
+    };
+    let refs = check_references(
+        scene_name,
+        &format!("{location} {field}"),
+        text,
+        variables,
+        errors,
+    );
+    if refs.is_empty() {
+        if let Err(error) = Color::parse(text) {
+            errors.push(format!(
+                "scene \"{scene_name}\": {location} {field}: {error}"
             ));
         }
     }
@@ -1126,8 +1230,13 @@ fn validate_command_rhs(
     }
 }
 
-/// Validates the right-hand side of an assignment to a writable `defaults` parameter,
-/// which is always numeric.
+/// Validates the right-hand side of an assignment to a writable `defaults` parameter.
+///
+/// A brightness parameter is numeric (an int, an int variable or a command); a colour
+/// parameter is string-like and must parse as a colour. A literal colour is checked here
+/// (a bad one is an error under `=`, a warning under `:=` and silent under `~=`), while
+/// a variable/command colour can only be checked for its references and is parsed when
+/// the action fires.
 fn check_default_assignment(
     scene_name: &str,
     path: &str,
@@ -1138,27 +1247,58 @@ fn check_default_assignment(
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) {
-    let Constraint::NumberRange { min, max } = param.constraint();
     let label = param.path();
-    match rhs {
-        AssignRhs::Int(number) => {
-            check_number_range(scene_name, path, label, op, *number, min, max, errors, warnings);
-        }
-        AssignRhs::Str(text) => errors.push(format!(
-            "scene \"{scene_name}\": {path} sets \"{label}\" to a string (\"{text}\"), but it requires a number"
-        )),
-        AssignRhs::Variable(reference) => match variables.kind_of(reference) {
-            None => errors.push(format!(
-                "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+    match param.constraint() {
+        Constraint::NumberRange { min, max } => match rhs {
+            AssignRhs::Int(number) => {
+                check_number_range(scene_name, path, label, op, *number, min, max, errors, warnings);
+            }
+            AssignRhs::Str(text) => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets \"{label}\" to a string (\"{text}\"), but it requires a number"
             )),
-            Some(VarType::Int) => {}
-            Some(VarType::Str) => errors.push(format!(
-                "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a string, but it requires a number"
-            )),
+            AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+                None => errors.push(format!(
+                    "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+                )),
+                Some(VarType::Int) => {}
+                Some(VarType::Str) => errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a string, but it requires a number"
+                )),
+            },
+            AssignRhs::Command(inner) => {
+                validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
+            }
         },
-        AssignRhs::Command(inner) => {
-            validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
-        }
+        Constraint::Color => match rhs {
+            AssignRhs::Int(number) => errors.push(format!(
+                "scene \"{scene_name}\": {path} sets \"{label}\" to the number {number}, but it requires a colour (\"#RRGGBB\" or a colour name)"
+            )),
+            AssignRhs::Str(text) => {
+                if let Err(error) = Color::parse(text) {
+                    match op {
+                        AssignOp::Strict => {
+                            errors.push(format!("scene \"{scene_name}\": {path} sets \"{label}\" to {error}"))
+                        }
+                        AssignOp::ClampWarn => warnings.push(format!(
+                            "scene \"{scene_name}\": {path} sets \"{label}\" to {error} via \":=\" - the default colour is used instead"
+                        )),
+                        AssignOp::ClampSilent => {}
+                    }
+                }
+            }
+            AssignRhs::Variable(reference) => match variables.kind_of(reference) {
+                None => errors.push(format!(
+                    "scene \"{scene_name}\": {path} references undefined variable \"{reference}\""
+                )),
+                Some(VarType::Str) => {}
+                Some(VarType::Int) => errors.push(format!(
+                    "scene \"{scene_name}\": {path} sets \"{label}\" to \"{reference}\", which is a number, but it requires a colour"
+                )),
+            },
+            AssignRhs::Command(inner) => {
+                validate_command_rhs(scene_name, path, inner, variables, errors, warnings);
+            }
+        },
     }
 }
 
@@ -1317,46 +1457,59 @@ impl CommandSpec {
 pub enum SceneOp {
     /// Load `path` as the image for a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-applies this operation on its own, independent of
-    /// any scene switch.
+    /// any scene switch. `background` is the button's configured background colour (the
+    /// expanded config text, parsed at draw time), or `None` to use the global default.
     SetImage {
         reference: Reference,
         path: String,
         refresh_seconds: u64,
+        background: Option<String>,
     },
     /// Show the first lines of `path` as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-applies this operation on its own, independent of
-    /// any scene switch.
+    /// any scene switch. `background`/`text_color` are the button's configured colours
+    /// (expanded config text, parsed at draw time), or `None` for the global defaults.
     Text {
         reference: Reference,
         path: String,
         refresh_seconds: u64,
+        background: Option<String>,
+        text_color: Option<String>,
     },
     /// Render `text` directly on a button. Unlike [`SceneOp::Text`] the value is the text
     /// itself (already expanded from any `$` references), not a file path, so a variable
     /// can be shown without shelling out to `echo`. References are physical buttons
     /// (1-based). `refresh_seconds` (0 = never) re-applies this operation on its own,
     /// independent of any scene switch - and, like every refreshed entry, re-expands its
-    /// `text` from the current variable values each time.
+    /// `text` from the current variable values each time. `background`/`text_color` are
+    /// the button's configured colours, or `None` for the global defaults.
     TextValue {
         reference: Reference,
         text: String,
         refresh_seconds: u64,
+        background: Option<String>,
+        text_color: Option<String>,
     },
     /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
-    /// scene switch.
+    /// scene switch. `background`/`text_color` are the button's configured colours, or
+    /// `None` for the global defaults.
     TextExec {
         reference: Reference,
         command: CommandSpec,
         refresh_seconds: u64,
+        background: Option<String>,
+        text_color: Option<String>,
     },
     /// Run `command` and set its stdout (an image file) as the button image. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
-    /// scene switch.
+    /// scene switch. `background` is the button's configured background colour, or `None`
+    /// for the global default.
     ImageExec {
         reference: Reference,
         command: CommandSpec,
         refresh_seconds: u64,
+        background: Option<String>,
     },
     /// Run `command` detached from this program: own process group, no stdio, and not
     /// killed when the program exits. The decoy reference is only a config slot;
@@ -1388,6 +1541,10 @@ pub struct RawSceneOp {
     pub params: String,
     /// The entry's `refresh` seconds (0 = never; unused by launch/clear).
     pub refresh_seconds: u64,
+    /// The entry's raw `background` colour text, if any.
+    pub background: Option<String>,
+    /// The entry's raw `text_color` colour text, if any.
+    pub text_color: Option<String>,
 }
 
 /// Parses a scene's `setup` into raw entries without expanding or parsing anything.
@@ -1435,6 +1592,14 @@ pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawS
         // Validated at config-load time only (check_button_op); trusted here, same as
         // "type"/"params" already are.
         let refresh_seconds = object.get("refresh").and_then(Value::as_u64).unwrap_or(0);
+        let background = object
+            .get("background")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let text_color = object
+            .get("text_color")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         operations.push(RawSceneOp {
             scene: scene_name.to_string(),
@@ -1442,6 +1607,8 @@ pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawS
             kind: kind.to_string(),
             params,
             refresh_seconds,
+            background,
+            text_color,
         });
     }
 
@@ -1457,31 +1624,54 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
     let params = variables
         .expand(&raw.params)
         .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))?;
+    // Colour texts are expanded here but parsed at draw time (see `SceneRunner`), so a
+    // value a reference resolves to that is not a colour falls back to the default with
+    // a warning instead of failing the whole scene.
+    let expand_colour = |field: &str, value: &Option<String>| -> Result<Option<String>, String> {
+        value
+            .as_deref()
+            .map(|text| {
+                variables.expand(text).map_err(|error| {
+                    format!("scene \"{scene_name}\": key \"{key}\": {field}: {error}")
+                })
+            })
+            .transpose()
+    };
+    let background = expand_colour("background", &raw.background)?;
+    let text_color = expand_colour("text_color", &raw.text_color)?;
     Ok(match raw.kind.as_str() {
         "image" => SceneOp::SetImage {
             reference,
             path: expand_tilde(&params),
             refresh_seconds: raw.refresh_seconds,
+            background,
         },
         "text" => SceneOp::Text {
             reference,
             path: expand_tilde(&params),
             refresh_seconds: raw.refresh_seconds,
+            background,
+            text_color,
         },
         "text_value" => SceneOp::TextValue {
             reference,
             text: params,
             refresh_seconds: raw.refresh_seconds,
+            background,
+            text_color,
         },
         "text_exec" => SceneOp::TextExec {
             reference,
             command: params_command(scene_name, &key, "text_exec", &params)?,
             refresh_seconds: raw.refresh_seconds,
+            background,
+            text_color,
         },
         "image_exec" => SceneOp::ImageExec {
             reference,
             command: params_command(scene_name, &key, "image_exec", &params)?,
             refresh_seconds: raw.refresh_seconds,
+            background,
         },
         "launch" => SceneOp::Launch {
             reference,
@@ -1769,6 +1959,14 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// Physical button numbers (1-based) that have no display on this device. Image
     /// operations targetting them are skipped with a warning: the hardware ignores them.
     screenless_buttons: std::collections::HashSet<u8>,
+    /// The global default background colour, applied to every button whose setup entry
+    /// has no `background` override (and as the fallback when an override is invalid).
+    /// Mutable at runtime via `$defaults.background`, so it always reflects the current
+    /// value.
+    background: Color,
+    /// The global default text colour, applied to every button whose setup entry has no
+    /// `text_color` override. Mutable at runtime via `$defaults.text_color`.
+    text_color: Color,
     /// The operation currently active on each physical button (1-based), i.e. whatever
     /// the most recent explicit scene entry applied there. Consulted by
     /// [`SceneRunner::refresh_button`] to redraw just that button on its own schedule,
@@ -1798,6 +1996,9 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     ///
     /// `screenless_buttons` lists the device buttons that have no display; image
     /// assignment to them is skipped with a warning (see [`SceneRunner`]).
+    /// `background`/`text_color` are the global default button colours (see
+    /// [`SceneRunner::set_background`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_number: u8,
         device: &'a D,
@@ -1806,6 +2007,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         refresh_tx: mpsc::Sender<u8>,
         log: Log,
         screenless_buttons: &std::collections::HashSet<u8>,
+        background: Color,
+        text_color: Color,
     ) -> Self {
         Self {
             device,
@@ -1815,12 +2018,26 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             device_number,
             changed_keys: std::collections::HashSet::new(),
             screenless_buttons: screenless_buttons.clone(),
+            background,
+            text_color,
             active_setup: std::collections::HashMap::new(),
             refresh_handles: std::collections::HashMap::new(),
             refresh_sources: std::collections::HashMap::new(),
             refresh_tx,
             variables: None,
         }
+    }
+
+    /// Sets the global background colour, e.g. from a `$defaults.background := ...`
+    /// action. Takes effect on the next draw: nothing already on a button is repainted.
+    pub fn set_background(&mut self, background: Color) {
+        self.background = background;
+    }
+
+    /// Sets the global text colour, e.g. from a `$defaults.text_color := ...` action.
+    /// Same next-draw-only effect as [`SceneRunner::set_background`].
+    pub fn set_text_color(&mut self, text_color: Color) {
+        self.text_color = text_color;
     }
 
     /// Attaches the shared variable/default state, so `setup` params are resolved (and,
@@ -1839,6 +2056,51 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             }
             None => resolve_scene_op(raw, &empty_variables()),
         }
+    }
+
+    /// Parses an expanded per-button colour, falling back to `default` with a warning
+    /// when the value is not a colour.
+    ///
+    /// A literal colour was already validated at config-load time, so a failure here can
+    /// only come from a `$` reference that resolved to something else; the button uses
+    /// the default rather than failing the whole scene, exactly as requested.
+    fn draw_colour(&self, key: u8, field: &str, text: Option<&str>, default: &Color) -> Color {
+        match text {
+            None => default.clone(),
+            Some(value) => match Color::parse(value) {
+                Ok(colour) => colour,
+                Err(error) => {
+                    self.log.warn(format!(
+                        "button {key}: {field} {error}; using the default colour"
+                    ));
+                    default.clone()
+                }
+            },
+        }
+    }
+
+    /// The background colour for `key`: the button's active per-button override when it
+    /// has one, otherwise the global default. Used for async (`*_exec`) results, whose
+    /// operation is looked up from [`SceneRunner::active_setup`] - only the two exec
+    /// variants can be active when an exec result arrives, a stale one having been
+    /// dropped by the tracker's generation check.
+    fn active_background(&self, key: u8) -> Color {
+        let text = match self.active_setup.get(&key) {
+            Some(SceneOp::ImageExec { background, .. })
+            | Some(SceneOp::TextExec { background, .. }) => background.as_deref(),
+            _ => None,
+        };
+        self.draw_colour(key, "background", text, &self.background)
+    }
+
+    /// The text colour for `key`: the button's active per-button override when it has
+    /// one, otherwise the global default. See [`SceneRunner::active_background`].
+    fn active_text_color(&self, key: u8) -> Color {
+        let text = match self.active_setup.get(&key) {
+            Some(SceneOp::TextExec { text_color, .. }) => text_color.as_deref(),
+            _ => None,
+        };
+        self.draw_colour(key, "text_color", text, &self.text_color)
     }
 
     /// Applies the numbered button operations of `scene_name` to the device.
@@ -2024,12 +2286,17 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         match operation {
             // config references are physical buttons numbered from 1; mirajazz keys are 0-based
             SceneOp::SetImage {
-                reference: _, path, ..
+                reference: _,
+                path,
+                background,
+                ..
             } => {
                 self.log.debug(
                     Subsystem::Scene,
                     format!("set image from \"{path}\" on key {key}"),
                 );
+                let background =
+                    self.draw_colour(key, "background", background.as_deref(), &self.background);
                 // Errors are stringified immediately, before any match/await: the
                 // concrete error types here are not guaranteed `Send`, and
                 // `apply_one_operation`'s future is spawned onto the runtime (via
@@ -2040,6 +2307,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     .map_err(|error| error.to_string())
                 {
                     Ok(image) => {
+                        let image = crate::color::flatten(image, &background);
                         if let Err(error) = self
                             .device
                             .set_button_image(key.saturating_sub(1), self.image_format, image)
@@ -2065,20 +2333,30 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 }
             }
             SceneOp::Text {
-                reference: _, path, ..
+                reference: _,
+                path,
+                background,
+                text_color,
+                ..
             } => {
                 self.log.debug(
                     Subsystem::Scene,
                     format!("render text from \"{path}\" on key {key}"),
                 );
+                let background =
+                    self.draw_colour(key, "background", background.as_deref(), &self.background);
+                let text_color =
+                    self.draw_colour(key, "text_color", text_color.as_deref(), &self.text_color);
                 // See the `SetImage` branch above: errors are stringified immediately.
                 let text_result = read_text_file_bounded(path)
                     .await
                     .map_err(|error| error.to_string());
                 match text_result {
                     Ok(content) => {
-                        let render_result = crate::text::render_text(
+                        let render_result = crate::text::render_text_colored(
                             &crate::text::button_text(&content),
+                            &background,
+                            &text_color,
                             self.image_format,
                         )
                         .map_err(|error| error.to_string());
@@ -2124,16 +2402,28 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 }
             }
             SceneOp::TextValue {
-                reference: _, text, ..
+                reference: _,
+                text,
+                background,
+                text_color,
+                ..
             } => {
                 self.log.debug(
                     Subsystem::Scene,
                     format!("render value on key {key}: \"{text}\""),
                 );
+                let background =
+                    self.draw_colour(key, "background", background.as_deref(), &self.background);
+                let text_color =
+                    self.draw_colour(key, "text_color", text_color.as_deref(), &self.text_color);
                 // See the `SetImage` branch above: errors are stringified immediately.
-                let render_result =
-                    crate::text::render_text(&crate::text::button_text(text), self.image_format)
-                        .map_err(|error| error.to_string());
+                let render_result = crate::text::render_text_colored(
+                    &crate::text::button_text(text),
+                    &background,
+                    &text_color,
+                    self.image_format,
+                )
+                .map_err(|error| error.to_string());
                 match render_result {
                     Ok(image) => {
                         if let Err(error) = self
@@ -2279,6 +2569,10 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 if !self.tracker.is_current(key, generation) {
                     return;
                 }
+                // Colours come from the button's active setup entry (the exec operation
+                // was recorded there before its task reported back).
+                let background = self.active_background(key);
+                let text_color = self.active_text_color(key);
                 let image = match kind {
                     ExecOutputKind::Text => {
                         let text = match String::from_utf8(stdout) {
@@ -2294,8 +2588,10 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                                 return;
                             }
                         };
-                        match crate::text::render_text(
+                        match crate::text::render_text_colored(
                             &crate::text::button_text(&text),
+                            &background,
+                            &text_color,
                             self.image_format,
                         ) {
                             Ok(image) => image,
@@ -2308,7 +2604,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                         }
                     }
                     ExecOutputKind::Image => match image::load_from_memory(&stdout) {
-                        Ok(image) => image,
+                        Ok(image) => crate::color::flatten(image, &background),
                         Err(error) => {
                             self.log.error(format!(
                                 "button {key}: output is not a valid image: {error}"
@@ -2726,16 +3022,19 @@ async fn read_text_file_bounded(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Loads the image at `path` and sets it on the given device key (mirajazz 0-based).
+/// Loads the image at `path` and sets it on the given device key (mirajazz 0-based),
+/// compositing transparent pixels onto `background`.
 pub async fn set_image_from_file<D: ButtonDevice>(
     device: &D,
     key: u8,
     image_format: ImageFormat,
     path: &str,
+    background: &Color,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let image = load_image_file(path)
         .await
         .map_err(|error| -> Box<dyn std::error::Error> { error })?;
+    let image = crate::color::flatten(image, background);
     device.set_button_image(key, image_format, image).await?;
     Ok(())
 }
@@ -2743,13 +3042,15 @@ pub async fn set_image_from_file<D: ButtonDevice>(
 /// A writable `defaults` parameter, settable at runtime by an assignment action.
 ///
 /// The `defaults` address space behaves like variables that also drive the device: a
-/// write updates the stored value and pushes the matching hardware setting. Its other
-/// members (`short_press_duration`, `double_click_gap`) are read-only - see
-/// [`classify_target`].
+/// write updates the stored value and pushes the matching hardware setting (a colour
+/// change affects the next draw). Its other members (`short_press_duration`,
+/// `double_click_gap`) are read-only - see [`classify_target`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettableDefault {
     ButtonBrightness,
     EncoderBrightness,
+    Background,
+    TextColor,
 }
 
 impl SettableDefault {
@@ -2759,31 +3060,65 @@ impl SettableDefault {
         match self {
             SettableDefault::ButtonBrightness => "defaults.button_brightness",
             SettableDefault::EncoderBrightness => "defaults.encoder_brightness",
+            SettableDefault::Background => "defaults.background",
+            SettableDefault::TextColor => "defaults.text_color",
         }
     }
 
-    /// The inclusive numeric range the parameter accepts, matching
-    /// `mirajazz::Device::set_brightness`/`set_led_brightness`'s own internal
-    /// `percent.clamp(0, 100)`.
+    /// The constraint the parameter enforces: a numeric range for the brightness keys,
+    /// or "must parse as a colour" for the colour keys.
     fn constraint(&self) -> Constraint {
-        Constraint::NumberRange { min: 0, max: 100 }
+        match self {
+            SettableDefault::ButtonBrightness | SettableDefault::EncoderBrightness => {
+                Constraint::NumberRange { min: 0, max: 100 }
+            }
+            SettableDefault::Background | SettableDefault::TextColor => Constraint::Color,
+        }
     }
 
     /// The value a non-strict assignment resets the parameter to when a command's output
-    /// cannot be converted: the configured `defaults` value loaded at startup.
+    /// cannot be converted: the configured `defaults` value loaded at startup. Only the
+    /// numeric parameters have such a fallback; the colour ones fall back to their
+    /// configured colour via [`SettableDefault::default_colour`].
     pub fn default_value(&self, defaults: &Defaults) -> i32 {
         match self {
             SettableDefault::ButtonBrightness => defaults.button_brightness as i32,
             SettableDefault::EncoderBrightness => defaults.encoder_brightness as i32,
+            SettableDefault::Background | SettableDefault::TextColor => {
+                unreachable!("colour defaults have no numeric default")
+            }
+        }
+    }
+
+    /// Whether this parameter is a colour (as opposed to a brightness percentage).
+    pub fn is_colour(&self) -> bool {
+        matches!(
+            self,
+            SettableDefault::Background | SettableDefault::TextColor
+        )
+    }
+
+    /// The configured colour this parameter resets to when a non-strict colour
+    /// assignment produces something that is not a colour.
+    pub fn default_colour(&self, defaults: &Defaults) -> Color {
+        match self {
+            SettableDefault::Background => defaults.background.clone(),
+            SettableDefault::TextColor => defaults.text_color.clone(),
+            SettableDefault::ButtonBrightness | SettableDefault::EncoderBrightness => {
+                unreachable!("brightness defaults have no colour default")
+            }
         }
     }
 }
 
-/// The numeric constraint an assignment clamps into (`:=`/`~=`) or hard-errors against
-/// (`=`).
+/// What an assignment enforces on its right-hand side: a numeric range that `:=`/`~=`
+/// clamp into (`=` hard-errors against), or "a value that parses as a colour", for which
+/// there is nothing to clamp.
 enum Constraint {
     /// A number must fall within `min..=max` (inclusive on both ends).
     NumberRange { min: i64, max: i64 },
+    /// The value must parse as a colour (see [`crate::color::Color::parse`]).
+    Color,
 }
 
 /// The target of an assignment action.
@@ -2844,13 +3179,15 @@ enum TargetClass {
 /// `devices.*`/`scenes.*` (and the whole `version`/`scenes`/`devices`/`defaults` keys)
 /// are read-only wholesale rather than field-by-field, since their shapes are
 /// config-author-chosen. `defaults.*` has an exact, fixed field list: the two brightness
-/// keys are writable, the two timing keys are read-only, and anything else under
-/// `defaults` does not exist. Everything else is a variable reference (`$name` or
-/// `$var.name`), declared or not.
+/// keys and the two colour keys are writable, the two timing keys are read-only, and
+/// anything else under `defaults` does not exist. Everything else is a variable reference
+/// (`$name` or `$var.name`), declared or not.
 fn classify_target(path: &str, variables: &Variables) -> TargetClass {
     match path {
         "defaults.button_brightness" => TargetClass::Default(SettableDefault::ButtonBrightness),
         "defaults.encoder_brightness" => TargetClass::Default(SettableDefault::EncoderBrightness),
+        "defaults.background" => TargetClass::Default(SettableDefault::Background),
+        "defaults.text_color" => TargetClass::Default(SettableDefault::TextColor),
         "defaults.short_press_duration" | "defaults.double_click_gap" => {
             TargetClass::ReadOnly(path.to_string())
         }
@@ -2946,6 +3283,8 @@ fn classify_assign_target_syntax(path: &str) -> Option<AssignTarget> {
         "defaults.encoder_brightness" => {
             Some(AssignTarget::Default(SettableDefault::EncoderBrightness))
         }
+        "defaults.background" => Some(AssignTarget::Default(SettableDefault::Background)),
+        "defaults.text_color" => Some(AssignTarget::Default(SettableDefault::TextColor)),
         _ => {
             if let Some(name) = path.strip_prefix("var.") {
                 is_valid_name(name).then(|| AssignTarget::Variable(name.to_string()))
@@ -3039,6 +3378,16 @@ enum Scalar {
     Str(String),
 }
 
+/// The device-facing side effect of a writable `defaults` assignment, returned by
+/// [`apply_assignment`] so the caller can push the new value to the [`SceneRunner`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefaultEffect {
+    /// A brightness parameter's new percent.
+    Brightness(SettableDefault, i32),
+    /// A colour parameter's new colour.
+    Color(SettableDefault, Color),
+}
+
 /// Applies an assignment whose value is known now - a literal or another variable's
 /// current value. Returns the writable default and its new value when the target is one,
 /// so the caller can push it to the device; returns `None` for a variable target or a
@@ -3054,7 +3403,7 @@ pub fn apply_assignment(
     variables: &mut Variables,
     warn: bool,
     log: Log,
-) -> Option<(SettableDefault, i32)> {
+) -> Option<DefaultEffect> {
     let scalar = match rhs {
         AssignRhs::Int(number) => Scalar::Int(*number),
         AssignRhs::Str(text) => Scalar::Str(text.clone()),
@@ -3137,19 +3486,74 @@ pub fn apply_assignment(
             }
             None
         }
-        AssignTarget::Default(param) => {
-            let Scalar::Int(number) = scalar else {
-                log.error(format!("assignment to {} requires a number", param.path()));
-                return None;
-            };
-            let Constraint::NumberRange { min, max } = param.constraint();
-            let value = clamp_int(number, min, max, op, param.path(), warn, log)?;
-            match param {
-                SettableDefault::ButtonBrightness => variables.set_button_brightness(value),
-                SettableDefault::EncoderBrightness => variables.set_encoder_brightness(value),
+        AssignTarget::Default(param) => match param.constraint() {
+            Constraint::NumberRange { min, max } => {
+                let Scalar::Int(number) = scalar else {
+                    log.error(format!("assignment to {} requires a number", param.path()));
+                    return None;
+                };
+                let value = clamp_int(number, min, max, op, param.path(), warn, log)?;
+                match param {
+                    SettableDefault::ButtonBrightness => variables.set_button_brightness(value),
+                    SettableDefault::EncoderBrightness => variables.set_encoder_brightness(value),
+                    _ => unreachable!("numeric constraint on a colour parameter"),
+                }
+                Some(DefaultEffect::Brightness(*param, value))
             }
-            Some((*param, value))
-        }
+            Constraint::Color => {
+                // A colour has no range to clamp into, so a value that is not a colour is
+                // discarded in favour of the configured default. A dynamic value (read
+                // from a variable) is always handled leniently - `=` behaves like `:=` -
+                // since it cannot be validated at config-load time; a literal keeps its
+                // operator (`=` already errored at load, `:=` warned, `~=` stayed silent).
+                let dynamic = matches!(rhs, AssignRhs::Variable(_));
+                let text = match scalar {
+                    Scalar::Str(text) => text,
+                    Scalar::Int(number) => {
+                        log.error(format!(
+                            "assignment to {} requires a colour, not the number {number}",
+                            param.path()
+                        ));
+                        return None;
+                    }
+                };
+                let colour = match Color::parse(&text) {
+                    Ok(colour) => colour,
+                    Err(error) => {
+                        let effective = if dynamic && op == AssignOp::Strict {
+                            AssignOp::ClampWarn
+                        } else {
+                            op
+                        };
+                        match effective {
+                            AssignOp::Strict => {
+                                log.error(format!(
+                                    "assignment to {} rejected {error}",
+                                    param.path()
+                                ));
+                                return None;
+                            }
+                            AssignOp::ClampWarn => {
+                                if warn {
+                                    log.warn(format!(
+                                        "assignment to {} got {error}; using the default colour",
+                                        param.path()
+                                    ));
+                                }
+                            }
+                            AssignOp::ClampSilent => {}
+                        }
+                        param.default_colour(variables.loaded_defaults())
+                    }
+                };
+                match param {
+                    SettableDefault::Background => variables.set_background(colour.clone()),
+                    SettableDefault::TextColor => variables.set_text_color(colour.clone()),
+                    _ => unreachable!("colour constraint on a numeric parameter"),
+                }
+                Some(DefaultEffect::Color(*param, colour))
+            }
+        },
     }
 }
 
@@ -3228,6 +3632,10 @@ enum Conversion {
     /// Use the whole output (trailing newlines stripped), truncated to `max_length`;
     /// `default` is used on a non-strict conversion failure.
     Str { max_length: usize, default: String },
+    /// Parse the first non-empty line (trimmed) as a colour; `default` is used on a
+    /// non-strict conversion failure (a colour has no range to clamp into, so a bad
+    /// value is discarded in favour of the configured default).
+    Color { default: Color },
 }
 
 /// Prepares a `$(command)` assignment: resolves the target's conversion parameters and
@@ -3257,17 +3665,22 @@ fn prepare_command_assignment(
             };
             (conversion, format!("${name}"))
         }
-        AssignTarget::Default(param) => {
-            let Constraint::NumberRange { min, max } = param.constraint();
-            (
+        AssignTarget::Default(param) => match param.constraint() {
+            Constraint::NumberRange { min, max } => (
                 Conversion::Int {
                     min: min as i32,
                     max: max as i32,
                     default: param.default_value(state.loaded_defaults()),
                 },
                 param.path().to_string(),
-            )
-        }
+            ),
+            Constraint::Color => (
+                Conversion::Color {
+                    default: param.default_colour(state.loaded_defaults()),
+                },
+                param.path().to_string(),
+            ),
+        },
     };
     let expanded = state.expand(inner)?;
     let spec = build_command(&expanded)?;
@@ -3368,11 +3781,24 @@ fn convert_output(
             }
             Ok(VarValue::Str(text))
         }
+        Conversion::Color { .. } => {
+            let Some(line) = output.lines().find(|line| !line.trim().is_empty()) else {
+                return conversion_failure(op, conversion, label, "no output", log);
+            };
+            match Color::parse(line.trim()) {
+                Ok(colour) => Ok(VarValue::Str(colour.text().to_string())),
+                Err(error) => conversion_failure(op, conversion, label, &error, log),
+            }
+        }
     }
 }
 
 /// Builds a conversion failure result: a strict assignment fails, `:=` warns and falls
 /// back to the default, `~=` falls back silently.
+///
+/// A colour has no range to clamp into and a command's output is only known now, so a
+/// bad colour is always handled leniently: `=` behaves like `:=` (warn and use the
+/// default) rather than failing at runtime.
 fn conversion_failure(
     op: AssignOp,
     conversion: &Conversion,
@@ -3380,6 +3806,10 @@ fn conversion_failure(
     reason: &str,
     log: Log,
 ) -> Result<VarValue, String> {
+    let op = match conversion {
+        Conversion::Color { .. } if op == AssignOp::Strict => AssignOp::ClampWarn,
+        _ => op,
+    };
     match op {
         AssignOp::Strict => Err(format!(
             "assignment to {label} could not use its command output ({reason})"
@@ -3399,6 +3829,7 @@ fn default_value(conversion: &Conversion) -> VarValue {
     match conversion {
         Conversion::Int { default, .. } => VarValue::Int(*default),
         Conversion::Str { default, .. } => VarValue::Str(default.clone()),
+        Conversion::Color { default } => VarValue::Str(default.text().to_string()),
     }
 }
 
@@ -3919,16 +4350,21 @@ mod tests {
             reference: super::Reference::button(1, 3),
             path: "x.png".to_string(),
             refresh_seconds: 0,
+            background: None,
         };
         let text = super::SceneOp::Text {
             reference: super::Reference::button(2, 4),
             path: "x.txt".to_string(),
             refresh_seconds: 0,
+            background: None,
+            text_color: None,
         };
         let text_value = super::SceneOp::TextValue {
             reference: super::Reference::button(3, 5),
             text: "hello".to_string(),
             refresh_seconds: 0,
+            background: None,
+            text_color: None,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(9, 8),
@@ -3937,6 +4373,8 @@ mod tests {
                 args: vec![],
             },
             refresh_seconds: 0,
+            background: None,
+            text_color: None,
         };
         let image_exec = super::SceneOp::ImageExec {
             reference: super::Reference::button(1, 9),
@@ -3945,6 +4383,7 @@ mod tests {
                 args: vec![],
             },
             refresh_seconds: 0,
+            background: None,
         };
         let launch = super::SceneOp::Launch {
             reference: super::Reference::button(1, 5),
@@ -3998,16 +4437,21 @@ mod tests {
             reference: super::Reference::button(1, 1),
             path: "x.png".to_string(),
             refresh_seconds: 5,
+            background: None,
         };
         let text = super::SceneOp::Text {
             reference: super::Reference::button(1, 2),
             path: "x.txt".to_string(),
             refresh_seconds: 7,
+            background: None,
+            text_color: None,
         };
         let text_value = super::SceneOp::TextValue {
             reference: super::Reference::button(1, 7),
             text: "hello".to_string(),
             refresh_seconds: 9,
+            background: None,
+            text_color: None,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(1, 3),
@@ -4016,6 +4460,8 @@ mod tests {
                 args: vec![],
             },
             refresh_seconds: 11,
+            background: None,
+            text_color: None,
         };
         let image_exec = super::SceneOp::ImageExec {
             reference: super::Reference::button(1, 4),
@@ -4024,6 +4470,7 @@ mod tests {
                 args: vec![],
             },
             refresh_seconds: 13,
+            background: None,
         };
         let launch = super::SceneOp::Launch {
             reference: super::Reference::button(1, 5),
@@ -4403,9 +4850,217 @@ mod tests {
         );
         assert_eq!(
             side_effect,
-            Some((super::SettableDefault::ButtonBrightness, 100))
+            Some(super::DefaultEffect::Brightness(
+                super::SettableDefault::ButtonBrightness,
+                100
+            ))
         );
         assert_eq!(variables.button_brightness(), 100);
+    }
+
+    /// `SettableDefault`'s colour helpers: the dotted path, `is_colour`, and the
+    /// configured default colour each colour parameter resets to.
+    #[test]
+    fn settable_default_reports_colour_parameters() {
+        let defaults = crate::press::Defaults::default();
+        assert_eq!(
+            super::SettableDefault::Background.path(),
+            "defaults.background"
+        );
+        assert_eq!(
+            super::SettableDefault::TextColor.path(),
+            "defaults.text_color"
+        );
+        assert!(super::SettableDefault::Background.is_colour());
+        assert!(super::SettableDefault::TextColor.is_colour());
+        assert!(!super::SettableDefault::ButtonBrightness.is_colour());
+        assert!(!super::SettableDefault::EncoderBrightness.is_colour());
+        assert_eq!(
+            super::SettableDefault::Background
+                .default_colour(&defaults)
+                .text(),
+            "#000000"
+        );
+        assert_eq!(
+            super::SettableDefault::TextColor
+                .default_colour(&defaults)
+                .text(),
+            "#ffffff"
+        );
+    }
+
+    /// `apply_assignment` stores a valid colour default and reports the colour side
+    /// effect, keeping the source text for reads.
+    #[test]
+    fn apply_assignment_sets_colour_defaults() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::Strict,
+                &super::AssignRhs::Str("red".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::Background,
+                crate::color::Color::parse("red").unwrap()
+            ))
+        );
+        assert_eq!(variables.background().text(), "red");
+
+        let effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::TextColor),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Str("#00ff00".to_string()),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            effect,
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::TextColor,
+                crate::color::Color::parse("#00ff00").unwrap()
+            ))
+        );
+        assert_eq!(variables.text_color().text(), "#00ff00");
+    }
+
+    /// An invalid literal colour is rejected under `=` (value unchanged) and reset to
+    /// the configured default under `:=`/`~=`.
+    #[test]
+    fn apply_assignment_handles_invalid_literal_colour() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::Strict,
+                &super::AssignRhs::Str("chartreuse".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            None
+        );
+        assert_eq!(
+            variables.background(),
+            &variables.loaded_defaults().background
+        );
+
+        let effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::Background),
+            super::AssignOp::ClampWarn,
+            &super::AssignRhs::Str("chartreuse".to_string()),
+            &mut variables,
+            false,
+            log,
+        );
+        assert_eq!(
+            effect,
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::Background,
+                variables.loaded_defaults().background.clone()
+            ))
+        );
+
+        // A bare number is not a colour, so even a non-strict operator leaves the value
+        // unchanged (config-load validation rejects this case outright).
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Int(5),
+                &mut variables,
+                false,
+                log,
+            ),
+            None
+        );
+        assert_eq!(
+            variables.background(),
+            &variables.loaded_defaults().background
+        );
+
+        // `~=` on an invalid literal is silent but still resets to the configured
+        // default (a colour has no range to clamp into).
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::ClampSilent,
+                &super::AssignRhs::Str("chartreuse".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::Background,
+                variables.loaded_defaults().background.clone()
+            ))
+        );
+    }
+
+    /// A non-numeric scalar for a numeric default is rejected under every operator, since
+    /// a wrong-type right-hand side is never acceptable (config validation catches the
+    /// literal case before this ever runs).
+    #[test]
+    fn apply_assignment_rejects_non_numeric_scalar_for_brightness() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Str("bright".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            None
+        );
+        assert_eq!(variables.button_brightness(), 50);
+    }
+
+    /// A colour read from a variable is dynamic, so even `=` is handled leniently: an
+    /// invalid value warns and resets to the configured default instead of failing.
+    #[test]
+    fn apply_assignment_treats_dynamic_colour_leniently() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        // "abc" fits `name`'s three-character limit but is not a colour.
+        super::apply_assignment(
+            &super::AssignTarget::Variable("name".to_string()),
+            super::AssignOp::Strict,
+            &super::AssignRhs::Str("abc".to_string()),
+            &mut variables,
+            false,
+            log,
+        );
+        let reference = crate::variables::VarRef {
+            scope: crate::variables::Scope::Var,
+            name: "name".to_string(),
+        };
+
+        let effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::Background),
+            super::AssignOp::Strict,
+            &super::AssignRhs::Variable(reference),
+            &mut variables,
+            true,
+            log,
+        );
+        assert_eq!(
+            effect,
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::Background,
+                variables.loaded_defaults().background.clone()
+            ))
+        );
     }
 
     /// A bare user-variable right-hand side (`$a := $b`) copies the source's current
@@ -4655,7 +5310,54 @@ mod tests {
         );
     }
 
-    /// `default_value` returns the fallback for both conversion kinds.
+    /// `convert_output` parses a colour target's first non-empty line (trimmed), keeping
+    /// the source text, and treats a bad colour leniently: `=` warns and falls back to
+    /// the configured default rather than failing, exactly like `:=`/`~=`.
+    #[test]
+    fn convert_output_converts_colour_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Color {
+            default: crate::color::Color::parse("black").unwrap(),
+        };
+        assert_eq!(
+            super::convert_output(
+                "\n  red \nignored\n",
+                &conversion,
+                super::AssignOp::Strict,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("red".to_string())
+        );
+        assert_eq!(
+            super::convert_output(
+                "chartreuse",
+                &conversion,
+                super::AssignOp::Strict,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("black".to_string()),
+            "= on a bad colour is lenient and uses the default"
+        );
+        assert_eq!(
+            super::convert_output(
+                "",
+                &conversion,
+                super::AssignOp::ClampSilent,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("black".to_string()),
+            "empty output falls back silently"
+        );
+    }
+
+    /// `default_value` returns the fallback for all three conversion kinds, including a
+    /// colour (whose fallback is the configured colour's text).
     #[test]
     fn default_value_matches_conversion_kind() {
         assert_eq!(
@@ -4672,6 +5374,38 @@ mod tests {
                 default: "x".to_string()
             }),
             crate::variables::VarValue::Str("x".to_string())
+        );
+        assert_eq!(
+            super::default_value(&super::Conversion::Color {
+                default: crate::color::Color::parse("black").unwrap()
+            }),
+            crate::variables::VarValue::Str("black".to_string())
+        );
+    }
+
+    /// `prepare_command_assignment` builds a colour conversion (defaulting to the
+    /// configured background) for a colour default, leaving the command line to run.
+    #[test]
+    fn prepare_command_assignment_builds_colour_conversion() {
+        let variables = assignment_variables();
+        let (conversion, spec, label) = super::prepare_command_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::Background),
+            "echo red",
+            &variables,
+        )
+        .unwrap();
+        assert_eq!(label, "defaults.background");
+        assert_eq!(
+            spec,
+            super::CommandSpec {
+                program: "echo".to_string(),
+                args: vec!["red".to_string()],
+            }
+        );
+        assert_eq!(
+            super::default_value(&conversion),
+            crate::variables::VarValue::Str("#000000".to_string()),
+            "the fallback is the configured background's text"
         );
     }
 
@@ -4724,6 +5458,7 @@ mod tests {
                 reference: crate::baseplane::Reference::button(1, 1),
                 path: "/tmp/a.png".to_string(),
                 refresh_seconds: 0,
+                background: None,
             }]
         );
         assert!(super::scene_operations("main", &scenes).is_err());
@@ -4743,6 +5478,8 @@ mod tests {
                 reference: crate::baseplane::Reference::button(1, 1),
                 text: "dir=a".to_string(),
                 refresh_seconds: 2,
+                background: None,
+                text_color: None,
             }]
         );
     }
@@ -4765,11 +5502,15 @@ mod tests {
                     reference: crate::baseplane::Reference::button(1, 1),
                     text: "a".to_string(),
                     refresh_seconds: 0,
+                    background: None,
+                    text_color: None,
                 },
                 super::SceneOp::TextValue {
                     reference: crate::baseplane::Reference::button(1, 2),
                     text: "7".to_string(),
                     refresh_seconds: 0,
+                    background: None,
+                    text_color: None,
                 },
             ]
         );

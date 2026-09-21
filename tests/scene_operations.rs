@@ -32,11 +32,15 @@ fn scene_operations_extract_static_images() {
                 reference: Reference::button(1, 1),
                 path: "/path/one.ico".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
             SceneOp::SetImage {
                 reference: Reference::button(1, 2),
                 path: "/path/two.png".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
         ]
     );
@@ -67,11 +71,15 @@ fn scene_operations_extract_refresh_seconds() {
                 reference: Reference::button(1, 1),
                 path: "/path/one.ico".to_string(),
                 refresh_seconds: 5,
+
+                background: None,
             },
             SceneOp::SetImage {
                 reference: Reference::button(1, 2),
                 path: "/path/two.png".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
         ]
     );
@@ -125,6 +133,8 @@ fn scene_operations_extract_image_exec() {
                 args: vec!["input.png".to_string(), "png:-".to_string()]
             },
             refresh_seconds: 0,
+
+            background: None,
         }]
     );
 }
@@ -151,6 +161,9 @@ fn scene_operations_extract_text() {
             reference: Reference::button(1, 3),
             path: "/tmp/notes.txt".to_string(),
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -185,11 +198,16 @@ fn scene_operations_expands_tilde_in_image_and_text_params() {
                 reference: Reference::button(1, 1),
                 path: home.join("pics/button.png").to_string_lossy().into_owned(),
                 refresh_seconds: 0,
+
+                background: None,
             },
             SceneOp::Text {
                 reference: Reference::button(1, 2),
                 path: home.join("notes.txt").to_string_lossy().into_owned(),
                 refresh_seconds: 0,
+
+                background: None,
+                text_color: None,
             },
         ]
     );
@@ -221,6 +239,9 @@ fn scene_operations_extract_text_exec() {
                 args: vec!["+%H:%M".to_string()]
             },
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -251,6 +272,9 @@ fn scene_operations_extract_text_exec_with_refresh() {
                 args: vec!["+%H:%M".to_string()]
             },
             refresh_seconds: 1,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -275,6 +299,9 @@ fn scene_operations_extract_text_exec_quoted_args() {
                 args: vec![".".to_string(), "-name".to_string(), "*.rs".to_string(),]
             },
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -535,6 +562,58 @@ fn scene_operations_accept_encoder_references() {
             reference: Reference::encoder(2, 1),
             path: "/tmp/notes.txt".to_string(),
             refresh_seconds: 0,
+            background: None,
+            text_color: None,
         }]
     );
+}
+
+/// Per-button `background`/`text_color` setup fields are read into the resolved
+/// operation, so the runner can apply them (the runner parses the strings at draw time).
+#[test]
+fn scene_operations_extract_colour_overrides() {
+    let scenes = json!({
+        "on_start": {
+            "setup": {
+                "1b01": { "type": "image", "params": "/tmp/x.png", "background": "#112233" },
+                "1b02": { "type": "text_value", "params": "hi", "background": "navy", "text_color": "lime" }
+            }
+        }
+    });
+    let operations = scene_operations("on_start", &scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![
+            SceneOp::SetImage {
+                reference: Reference::button(1, 1),
+                path: "/tmp/x.png".to_string(),
+                refresh_seconds: 0,
+                background: Some("#112233".to_string()),
+            },
+            SceneOp::TextValue {
+                reference: Reference::button(1, 2),
+                text: "hi".to_string(),
+                refresh_seconds: 0,
+                background: Some("navy".to_string()),
+                text_color: Some("lime".to_string()),
+            },
+        ]
+    );
+}
+
+/// A `$` reference in a setup colour is expanded when the scene is planned; with no
+/// variables available (the variable-free `scene_operations`) that is an error, and the
+/// message names the field.
+#[test]
+fn scene_operations_reject_unresolvable_colour_reference() {
+    let scenes = json!({
+        "on_start": {
+            "setup": {
+                "1b01": { "type": "image", "params": "/tmp/x.png", "background": "$missing" }
+            }
+        }
+    });
+    let error = scene_operations("on_start", &scenes).unwrap_err();
+    assert!(error.contains("undefined variable"), "{error}");
+    assert!(error.contains("background"), "{error}");
 }

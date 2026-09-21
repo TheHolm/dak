@@ -274,7 +274,7 @@ fn rejects_unknown_defaults_key() {
     let errors = error_texts(config.unwrap_err());
     assert!(
         errors.contains(
-            "defaults: unknown key \"long_press_duration\", expected one of \"short_press_duration\", \"double_click_gap\", \"button_brightness\", \"encoder_brightness\""
+            "defaults: unknown key \"long_press_duration\", expected one of \"short_press_duration\", \"double_click_gap\", \"button_brightness\", \"encoder_brightness\", \"background\", \"text_color\""
         ),
         "{errors}"
     );
@@ -361,6 +361,140 @@ fn rejects_invalid_brightness_defaults_values() {
             "for {defaults}: {errors}"
         );
     }
+}
+
+/// Valid `background`/`text_color` colours (hex and named) override the built-in
+/// black/white and load fine, keeping the source text for reads.
+#[test]
+fn valid_colour_defaults_load_and_apply() {
+    let path = write_config_with_defaults(
+        r##"{"background": "red", "text_color": "#00ff00"}"##,
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert_eq!(config.defaults.background.channels(), [0xff, 0x00, 0x00]);
+    assert_eq!(config.defaults.background.text(), "red");
+    assert_eq!(config.defaults.text_color.channels(), [0x00, 0xff, 0x00]);
+    assert_eq!(config.defaults.text_color.text(), "#00ff00");
+}
+
+/// A bad colour in `defaults` is a hard config error, for both a malformed hex and an
+/// unknown name, and whether the value is not a string at all.
+#[test]
+fn rejects_invalid_colour_defaults() {
+    for defaults in [
+        r##"{"background": "#fff"}"##,
+        r#"{"background": "chartreuse"}"#,
+        r#"{"background": 0}"#,
+        r##"{"text_color": "#12345"}"##,
+    ] {
+        let path = write_config_with_defaults(defaults, r#"{"on_start": {"actions": {}}}"#);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains("background") || errors.contains("text_color"),
+            "for {defaults}: {errors}"
+        );
+    }
+}
+
+/// `background` is allowed on every drawing type and `text_color` on the text types,
+/// with literal colours validated at load.
+#[test]
+fn valid_setup_colour_overrides_load() {
+    let path = write_scenes_config(
+        r##"{
+            "on_start": {
+                "setup": {
+                    "1b01": { "type": "image", "params": "/tmp/x.png", "background": "#112233" },
+                    "1b02": { "type": "image_exec", "params": "true", "background": "red" },
+                    "1b03": { "type": "text", "params": "/tmp/x.txt", "background": "navy", "text_color": "lime" },
+                    "1b04": { "type": "text_value", "params": "hi", "background": "#000000", "text_color": "orange" },
+                    "1b05": { "type": "text_exec", "params": "true", "background": "teal", "text_color": "cyan" }
+                }
+            }
+        }"##,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// A colour field on a type that does not draw it (`text_color` on an image,
+/// `background` on `clear`/`launch`) is a config error.
+#[test]
+fn rejects_colour_on_wrong_setup_type() {
+    for (scenes, expected) in [
+        (
+            r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/x.png", "text_color": "red"}}}}"#,
+            "text_color cannot be used with type \"image\"",
+        ),
+        (
+            r#"{"on_start": {"setup": {"1b01": {"type": "clear", "background": "red"}}}}"#,
+            "background cannot be used with type \"clear\"",
+        ),
+        (
+            r#"{"on_start": {"setup": {"1b01": {"type": "launch", "params": "true", "background": "red"}}}}"#,
+            "background cannot be used with type \"launch\"",
+        ),
+        (
+            r#"{"on_start": {"setup": {"1b01": {"type": "clear", "text_color": "red"}}}}"#,
+            "text_color cannot be used with type \"clear\"",
+        ),
+    ] {
+        let path = write_scenes_config(scenes);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains(expected), "for {scenes}: {errors}");
+    }
+}
+
+/// A literal setup colour that is not a colour, or not a string at all, is a
+/// config-load error.
+#[test]
+fn rejects_invalid_literal_setup_colour() {
+    let path = write_scenes_config(
+        r##"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/x.png", "background": "#gggggg"}}}}"##,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("invalid colour"), "{errors}");
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": "hi", "text_color": 5}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("must be a colour string"), "{errors}");
+}
+
+/// A setup colour built from a `$` reference is not parsed at load; only the reference
+/// itself is validated, so an undefined variable is still an error.
+#[test]
+fn setup_colour_reference_is_deferred() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/x.png", "background": "$theme"}}}}"#,
+    );
+    // `theme` is not a declared variable, so the reference is an error...
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_err(), "undefined variable should be rejected");
+
+    // ...but a declared one loads, even though the variable's value is only known at
+    // runtime (and may not be a colour, which is handled at draw time).
+    let path = write_variables_config(
+        r#"{"theme": {"type": "str", "value": "red"}}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "image", "params": "/tmp/x.png", "background": "$theme"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
 }
 
 /// A scenes section that is not an object of scene names is rejected.
@@ -1332,6 +1466,154 @@ fn assignment_operators_are_all_implemented_for_defaults() {
         r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness = 200"}}}}"#,
         "outside 0..=100",
     );
+}
+
+/// Colour `defaults` targets are type-checked at load: a valid colour loads, `:=` on a
+/// bad literal warns, `=` on one is an error, and a number or an int variable is a
+/// wrong-type right-hand side.
+#[test]
+fn validates_colour_assignments() {
+    for scenes in [
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background := \"red\""}}}}"#,
+        r##"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background ~= \"#112233\""}}}}"##,
+        r##"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.text_color = \"#ffffff\""}}}}"##,
+    ] {
+        let path = write_scenes_config(scenes);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(config.is_ok(), "{scenes}: {:?}", config.err());
+    }
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background := \"chartreuse\""}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        config
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unknown colour")),
+        ":= on a bad literal colour warns"
+    );
+
+    for (scenes, expected) in [
+        (
+            r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background = \"chartreuse\""}}}}"#,
+            "unknown colour",
+        ),
+        (
+            r##"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background = \"#fff\""}}}}"##,
+            "invalid colour",
+        ),
+        (
+            r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background := 5"}}}}"#,
+            "requires a colour",
+        ),
+        (
+            r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.text_color = 5"}}}}"#,
+            "requires a colour",
+        ),
+    ] {
+        let path = write_scenes_config(scenes);
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "{scenes}: expected {expected:?}, got: {errors}"
+        );
+    }
+
+    // A colour sourced from an int variable is a type error; from a str variable it
+    // loads, since the value is only known at runtime.
+    let variables =
+        r#"{"count": {"type": "int", "value": 5}, "name": {"type": "str", "value": "red"}}"#;
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background = $count"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("which is a number"), "{errors}");
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background = $name"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    // `~=` on a bad literal colour is silent: it loads with no error and no warning.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background ~= \"chartreuse\""}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        !config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("colour")),
+        "~= on a bad literal colour is silent: {:?}",
+        config.warnings
+    );
+
+    // A colour target accepts a command substitution; its output is parsed when it runs.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.text_color := $(echo red)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    // A variable reference that is not declared is still an error at load.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background := $missing"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("undefined variable"), "{errors}");
+}
+
+/// Brightness `defaults` targets are type-checked against a variable right-hand side:
+/// an int variable loads, a str variable and an undeclared name are errors.
+#[test]
+fn validates_brightness_default_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 100, "value": 5}, "name": {"type": "str", "value": "bright"}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := $count"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    for (action, expected) in [
+        (
+            "$defaults.button_brightness := $name",
+            "which is a string, but it requires a number",
+        ),
+        (
+            "$defaults.button_brightness = $missing",
+            "references undefined variable",
+        ),
+    ] {
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{action}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains(expected), "{action}: {errors}");
+    }
 }
 
 /// Variable assignments are type-checked and, for literals, range-checked at load time:
