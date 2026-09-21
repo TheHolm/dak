@@ -10,13 +10,16 @@
 
 use std::time::{Duration, Instant};
 
+use crate::color::Color;
+
 /// Default settings read from the config `defaults` section: the timing knobs for
-/// complex press events, plus the brightness levels applied to a device at connect.
+/// complex press events, the brightness levels applied to a device at connect, and the
+/// button background/text colours.
 ///
 /// Durations are expressed in milliseconds, brightness as a 0-100 percent. Values
 /// follow [`Default`] when a config omits the whole `defaults` section or individual
 /// keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Defaults {
     /// A press held at most this long is a short press; longer presses are long.
     pub short_press_duration: Duration,
@@ -35,6 +38,11 @@ pub struct Defaults {
     /// response on the unit that was available, so whether this setting has any
     /// observable effect on real encoder LEDs remains unconfirmed.
     pub encoder_brightness: u8,
+    /// Solid colour transparent pixels of a button image are composited onto, and the
+    /// canvas text is drawn on. Mutable at runtime via `$defaults.background`.
+    pub background: Color,
+    /// Colour button text is drawn in. Mutable at runtime via `$defaults.text_color`.
+    pub text_color: Color,
 }
 
 impl Default for Defaults {
@@ -44,6 +52,8 @@ impl Default for Defaults {
             double_click_gap: Duration::from_millis(300),
             button_brightness: 50,
             encoder_brightness: 50,
+            background: Color::rgb(0x00, 0x00, 0x00),
+            text_color: Color::rgb(0xff, 0xff, 0xff),
         }
     }
 }
@@ -102,7 +112,7 @@ pub struct ClickDetector {
 
 impl ClickDetector {
     /// Builds a detector for the timing knobs in `defaults`.
-    pub fn new(defaults: Defaults) -> Self {
+    pub fn new(defaults: &Defaults) -> Self {
         Self {
             short_press_duration: defaults.short_press_duration,
             double_click_gap: defaults.double_click_gap,
@@ -180,7 +190,7 @@ mod tests {
     #[test]
     fn quick_double_click_resolves_to_double() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
@@ -203,7 +213,7 @@ mod tests {
     #[test]
     fn late_second_click_is_not_double() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
@@ -226,7 +236,7 @@ mod tests {
     #[test]
     fn long_press_fires_on_release() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
@@ -249,7 +259,7 @@ mod tests {
     #[test]
     fn long_second_click_still_double() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
@@ -271,7 +281,7 @@ mod tests {
     #[test]
     fn confirm_single_resets_the_double_reference() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
@@ -291,7 +301,7 @@ mod tests {
     #[test]
     fn exactly_short_threshold_is_short() {
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults());
+        let mut detector = ClickDetector::new(&defaults());
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(
             detector.release(t0 + Duration::from_millis(300)),
@@ -309,7 +319,7 @@ mod tests {
             ..Defaults::default()
         };
         let t0 = Instant::now();
-        let mut detector = ClickDetector::new(defaults);
+        let mut detector = ClickDetector::new(&defaults);
 
         assert_eq!(detector.press(t0), PressDecision::Fresh);
         assert_eq!(

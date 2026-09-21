@@ -32,11 +32,15 @@ fn scene_operations_extract_static_images() {
                 reference: Reference::button(1, 1),
                 path: "/path/one.ico".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
             SceneOp::SetImage {
                 reference: Reference::button(1, 2),
                 path: "/path/two.png".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
         ]
     );
@@ -67,11 +71,15 @@ fn scene_operations_extract_refresh_seconds() {
                 reference: Reference::button(1, 1),
                 path: "/path/one.ico".to_string(),
                 refresh_seconds: 5,
+
+                background: None,
             },
             SceneOp::SetImage {
                 reference: Reference::button(1, 2),
                 path: "/path/two.png".to_string(),
                 refresh_seconds: 0,
+
+                background: None,
             },
         ]
     );
@@ -125,6 +133,8 @@ fn scene_operations_extract_image_exec() {
                 args: vec!["input.png".to_string(), "png:-".to_string()]
             },
             refresh_seconds: 0,
+
+            background: None,
         }]
     );
 }
@@ -151,6 +161,9 @@ fn scene_operations_extract_text() {
             reference: Reference::button(1, 3),
             path: "/tmp/notes.txt".to_string(),
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -185,11 +198,16 @@ fn scene_operations_expands_tilde_in_image_and_text_params() {
                 reference: Reference::button(1, 1),
                 path: home.join("pics/button.png").to_string_lossy().into_owned(),
                 refresh_seconds: 0,
+
+                background: None,
             },
             SceneOp::Text {
                 reference: Reference::button(1, 2),
                 path: home.join("notes.txt").to_string_lossy().into_owned(),
                 refresh_seconds: 0,
+
+                background: None,
+                text_color: None,
             },
         ]
     );
@@ -221,6 +239,9 @@ fn scene_operations_extract_text_exec() {
                 args: vec!["+%H:%M".to_string()]
             },
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -251,6 +272,9 @@ fn scene_operations_extract_text_exec_with_refresh() {
                 args: vec!["+%H:%M".to_string()]
             },
             refresh_seconds: 1,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -275,6 +299,9 @@ fn scene_operations_extract_text_exec_quoted_args() {
                 args: vec![".".to_string(), "-name".to_string(), "*.rs".to_string(),]
             },
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }
@@ -535,6 +562,9 @@ fn scene_operations_accept_encoder_references() {
             reference: Reference::encoder(2, 1),
             path: "/tmp/notes.txt".to_string(),
             refresh_seconds: 0,
+
+            background: None,
+            text_color: None,
         }]
     );
 }

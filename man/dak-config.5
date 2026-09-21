@@ -1,5 +1,5 @@
 .\" Man page for the dak configuration file. See man(7) and groff_man(7).
-.TH DAK-CONFIG 5 "2026-09-20" "dak 0.10.1" "File Formats"
+.TH DAK-CONFIG 5 "2026-09-20" "dak 0.11.0" "File Formats"
 .SH NAME
 dak\-config \- configuration file format for
 .BR dak (1)
@@ -35,7 +35,8 @@ Declared, typed values that actions and setup parameters read and assign. See
 below.
 .TP
 .B defaults
-Press\-detection timing knobs and connect\-time brightness levels. See
+Press\-detection timing knobs, connect\-time brightness levels, and the button
+background and text colours. See
 .B DEFAULTS
 below.
 .TP
@@ -57,15 +58,18 @@ below.
 .SH DEFAULTS
 The optional
 .B defaults
-object tunes press detection and the brightness applied when a device
-connects. Every key is optional and falls back to its built\-in value.
+object tunes press detection, the brightness applied when a device
+connects, and the colours used to draw button images and text. Every key is
+optional and falls back to its built\-in value.
 .nf
 .RS 4
 "defaults": {
   "short_press_duration": 300,
   "double_click_gap": 300,
   "button_brightness": 50,
-  "encoder_brightness": 50
+  "encoder_brightness": 50,
+  "background": "#000000",
+  "text_color": "#ffffff"
 }
 .RE
 .fi
@@ -103,6 +107,73 @@ to
 .BR 50 ),
 applied to every device's encoder LED ring when it connects. Some units have
 no functioning encoder LEDs; the value is sent regardless.
+.TP
+.B background
+A colour (default
+.BR #000000 )
+composited under every image that has an alpha channel, and the canvas text is
+drawn on. Without it, an icon's transparent pixels would keep whatever colour
+is hidden under them (usually white), because the device's image format has no
+alpha. See
+.B COLOURS
+below.
+.TP
+.B text_color
+A colour (default
+.BR #ffffff )
+that button text is drawn in. See
+.B COLOURS
+below.
+.SH COLOURS
+A colour value is either a
+.B #RRGGBB
+hex literal (six digits, case\-insensitive) or one of the named colours
+.BR black ,
+.BR silver ,
+.BR gray " / " grey ,
+.BR white ,
+.BR maroon ,
+.BR red ,
+.BR purple ,
+.BR fuchsia " / " magenta ,
+.BR green ,
+.BR lime ,
+.BR olive ,
+.BR yellow ,
+.BR navy ,
+.BR blue ,
+.BR teal ,
+.BR aqua " / " cyan
+and
+.BR orange .
+The
+.B #RGB
+shorthand and alpha values are not accepted. A bad colour in the
+.B defaults
+section or in a literal setup
+.B background
+or
+.B text_color
+is a hard config error.
+.PP
+.B background
+and
+.B text_color
+are also writable at runtime with a
+.B $defaults
+assignment (see
+.BR "Assigning to a variable" ),
+and a per\-button setup entry can override either with its own
+.B background
+or
+.B text_color
+key (see
+.BR setup ).
+A per\-button override belongs to the button, not the scene: like the rest of a
+button's content it is kept until a later scene explicitly redefines that
+button. Changing a colour at runtime affects the next draw (a scene switch, a
+refresh tick or a new image); buttons already drawn are not repainted.
+
 .SH VARIABLES
 The optional
 .B variables
@@ -176,8 +247,11 @@ parameter
 .RB ( button_brightness ,
 .BR encoder_brightness ,
 .BR short_press_duration ,
-.BR double_click_gap ;
-all int), reflecting any runtime changes.
+.BR double_click_gap ,
+.B background ,
+.BR text_color ;
+the last two are colours, the rest int), reflecting any runtime changes. A
+colour reads back exactly as it was set, so a name stays a name.
 .PP
 References are substituted in every action string, in setup
 .B params
@@ -222,10 +296,14 @@ A declared variable (or
 .BR var.name ),
 or one of the writable
 .B defaults
-parameters
+parameters: the brightness keys
 .B button_brightness
-or
-.BR encoder_brightness .
+and
+.BR encoder_brightness ,
+and the colour keys
+.B background
+and
+.BR text_color .
 The read\-only timing parameters cannot be assigned.
 .TP
 .B <op>
@@ -234,7 +312,7 @@ clamps or truncates and warns,
 .B ~=
 does the same silently, and
 .B =
-rejects an out\-of\-range or over\-long value.
+rejects an out\-of\-range, over\-long or otherwise invalid value.
 .TP
 .B <rhs>
 An integer literal, a
@@ -256,6 +334,23 @@ and a wrong\-type right\-hand side is always a config error. With
 the target's declared default is used when the value cannot be applied, with a
 warning for
 .BR := .
+.PP
+A colour target takes a string right\-hand side that parses as a colour (see
+.BR COLOURS ).
+There is nothing to clamp, so a value that is not a colour is discarded in
+favour of the configured default instead: a bad literal is a config error under
+.BR = ,
+a warning under
+.B :=
+and silent under
+.BR ~= .
+A colour that comes from a variable or a command can only be checked when the
+action fires, and is always handled leniently -
+.B =
+behaves like
+.B :=
+there - so an invalid value warns and resets to the configured default rather
+than failing at runtime.
 Assignments write runtime state only;
 .I config.json
 is never modified.
@@ -263,7 +358,8 @@ is never modified.
 .B $(command)
 runs when the action fires and converts the output to the target's type: an
 int target parses the first non\-empty line (trimmed) and clamps it; a str
-target takes the whole output with trailing newlines stripped and truncates it.
+target takes the whole output with trailing newlines stripped and truncates it;
+a colour target parses the first non\-empty line (trimmed) as a colour.
 For
 .BR = ,
 an unconvertible output, a non\-zero exit or a timeout is an error and the
@@ -271,7 +367,12 @@ variable is left unchanged; for
 .B :=
 and
 .BR ~= ,
-the target's default is used instead.
+the target's default is used instead. A colour is the exception: because its
+output is only known at runtime there is nothing to clamp, so
+.B =
+behaves like
+.B :=
+and an invalid colour warns and uses the configured default.
 .SH SCENES
 The
 .B scenes
@@ -334,7 +435,10 @@ object maps a control reference to an object with a
 and
 .BR params ,
 plus an optional
-.BR refresh .
+.BR refresh ,
+.B background
+and
+.BR text_color .
 .TP
 .B image
 .IB params " is a path"
@@ -378,6 +482,29 @@ exits. Nothing is drawn on the button and nothing is restored on termination.
 .TP
 .B clear
 Clear the button image.
+.TP
+.B background
+A colour override (default: the
+.B defaults.background
+value). Allowed on
+.BR image ,
+.BR image_exec ,
+.BR text ,
+.B text_value
+and
+.BR text_exec .
+For an image it is composited under transparent pixels; for text it is the
+canvas the glyphs are drawn on.
+.TP
+.B text_color
+A colour override for the glyphs (default: the
+.B defaults.text_color
+value). Allowed on
+.BR text ,
+.B text_value
+and
+.BR text_exec
+only.
 .TP
 .B refresh
 Seconds, default

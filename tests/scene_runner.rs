@@ -15,6 +15,7 @@ use std::time::Duration;
 extern crate mirajazz_freebsd as mirajazz;
 
 use dak::actions::{set_image_from_file, ButtonDevice, ExecEvent, ExecOutputKind, SceneRunner};
+use dak::color::Color;
 use dak::log::Log;
 use dak::press::Defaults;
 use dak::variables::{VarDef, VarValue, Variables};
@@ -253,6 +254,17 @@ fn write_temp_image() -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Writes a 4x4 fully transparent PNG (white under zero alpha) to a unique temp file
+/// and returns its path, for checking that transparent pixels pick up the background.
+fn write_transparent_temp_image() -> PathBuf {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = format!("/tmp/dak_runner_alpha_{}_{n}.png", std::process::id());
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 0]))
+        .save(&path)
+        .unwrap();
+    PathBuf::from(path)
+}
+
 /// Encodes a 60x60 green PNG, used as fake `image_exec` output for exec tests.
 fn green_png_bytes() -> Vec<u8> {
     let mut png = Vec::new();
@@ -312,6 +324,8 @@ async fn set_image_op_stages_zero_based_key_and_flushes() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -326,6 +340,162 @@ async fn set_image_op_stages_zero_based_key_and_flushes() {
     assert_eq!(image.dimensions(), (4, 4));
     assert_eq!(image.to_rgb8().get_pixel(2, 2).0, [200, 100, 50]);
     let _ = std::fs::remove_file(&image_path);
+}
+
+/// A transparent image is composited onto the runner's default background before it is
+/// staged, so the white hidden under the alpha never reaches the device.
+#[tokio::test]
+async fn transparent_image_uses_default_background() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_transparent_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 0]);
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A per-button `background` overrides the global default for that button's transparent
+/// image, and the override is per button, not per scene.
+#[tokio::test]
+async fn per_button_background_override_is_used() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_transparent_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap(), "background": "#ff0000" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0xff, 0x00, 0x00]);
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A dynamically-resolved per-button colour that is not a colour falls back to the
+/// global default with a warning instead of failing the scene.
+#[tokio::test]
+async fn invalid_dynamic_background_falls_back_to_default() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_transparent_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Color::rgb(0x11, 0x22, 0x33),
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap(), "background": "not-a-colour" }
+    }));
+    // A literal would be rejected at load; feed the runner directly to model a runtime
+    // value that slipped through (e.g. from a `$` reference).
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0x11, 0x22, 0x33]);
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// `SceneRunner::set_background` changes the colour used for the next draw, so a runtime
+/// `$defaults.background` assignment takes effect without repainting existing buttons.
+#[tokio::test]
+async fn set_background_affects_next_draw() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_transparent_temp_image();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+    runner.set_background(Color::parse("red").unwrap());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "image", "params": image_path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0xff, 0x00, 0x00]);
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// A `text_value` button is drawn with its configured background and text colour.
+#[tokio::test]
+async fn text_value_uses_configured_colours() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "M", "background": "#0000ff", "text_color": "#00ff00" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+    assert!(
+        image
+            .pixels()
+            .any(|p| p.0[1] > 200 && p.0[0] < 60 && p.0[2] < 60),
+        "expected a green glyph pixel"
+    );
 }
 
 /// `SceneRunner::set_button_brightness` delegates straight to the device's
@@ -343,6 +513,8 @@ async fn set_button_brightness_delegates_to_device() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     runner.set_button_brightness(80).await.unwrap();
@@ -365,6 +537,8 @@ async fn set_encoder_brightness_delegates_to_device() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     runner.set_encoder_brightness(15).await.unwrap();
@@ -388,6 +562,8 @@ async fn brightness_setters_propagate_device_errors() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     assert!(runner.set_button_brightness(80).await.is_err());
@@ -410,6 +586,8 @@ async fn text_op_renders_button_text_and_flushes() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -443,6 +621,8 @@ async fn text_op_from_dev_zero_completes_quickly_instead_of_hanging() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -476,6 +656,8 @@ async fn clear_op_calls_zero_based_key_and_flushes() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({ "1b05": { "type": "clear" } }));
@@ -500,6 +682,8 @@ async fn unsupported_op_only_flushes() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -524,6 +708,8 @@ async fn text_exec_output_drawn_on_button() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     // Spawn a slow program so its own result cannot race our explicit event; the
@@ -566,6 +752,8 @@ async fn text_exec_and_image_exec_entries_do_not_block_each_other() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -595,6 +783,8 @@ async fn text_exec_stale_output_dropped() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -627,6 +817,8 @@ async fn image_exec_output_drawn_on_button() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -668,6 +860,8 @@ async fn image_exec_non_image_output_draws_error_label() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -703,6 +897,8 @@ async fn text_exec_non_utf8_output_draws_error_label() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -738,6 +934,8 @@ async fn text_exec_error_draws_red_label() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -772,6 +970,8 @@ async fn text_exec_stale_error_dropped() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -803,6 +1003,8 @@ async fn reassigning_key_kills_running_text_exec_and_draws_error() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     // Unique per test (not just per process): two tests sharing one hardcoded pid
@@ -874,6 +1076,8 @@ async fn reassigning_key_after_finished_text_exec_draws_no_error() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "true" } }));
@@ -909,6 +1113,8 @@ async fn clear_changed_button_images_restores_only_changed_buttons() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let image_path = write_temp_image();
@@ -943,9 +1149,15 @@ async fn set_image_from_file_stages_image_without_flushing() {
     let mock = MockButtonDevice::default();
     let image_path = write_temp_image();
 
-    set_image_from_file(&mock, 3, FORMAT, image_path.to_str().unwrap())
-        .await
-        .expect("staging failed");
+    set_image_from_file(
+        &mock,
+        3,
+        FORMAT,
+        image_path.to_str().unwrap(),
+        &Defaults::default().background,
+    )
+    .await
+    .expect("staging failed");
 
     let calls = mock.calls();
     assert_eq!(mock.kinds(&calls), ["SetImage"]);
@@ -969,6 +1181,8 @@ async fn launch_op_spawns_program_and_touches_no_button() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -1025,6 +1239,8 @@ async fn text_op_missing_file_draws_error_label() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1054,6 +1270,8 @@ async fn image_op_missing_file_draws_error_label() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1084,6 +1302,8 @@ async fn missing_file_on_one_button_does_not_block_siblings() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1139,6 +1359,8 @@ async fn text_op_unrenderable_text_degrades_gracefully() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let path = write_temp_text("hello");
@@ -1174,6 +1396,8 @@ async fn text_exec_unrenderable_output_is_logged_and_skipped() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1212,6 +1436,8 @@ async fn ops_for_absent_device_are_skipped() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1237,6 +1463,8 @@ async fn encoder_ops_are_skipped_as_unsupported() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1262,6 +1490,8 @@ async fn out_of_range_buttons_are_skipped() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1289,6 +1519,8 @@ async fn screenless_buttons_skip_image_ops() {
         refresh_tx,
         Log::default(),
         &screenless,
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1321,6 +1553,8 @@ async fn screenless_buttons_skip_exec_ops() {
         refresh_tx,
         Log::default(),
         &screenless,
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1357,6 +1591,8 @@ async fn drawable_buttons_are_not_skipped() {
         refresh_tx,
         Log::default(),
         &screenless,
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1389,6 +1625,8 @@ async fn screenless_buttons_are_not_skipped_for_clear() {
         refresh_tx,
         Log::default(),
         &screenless,
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({ "1b07": { "type": "clear" } }));
@@ -1418,6 +1656,8 @@ async fn set_image_op_write_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let image_path = write_temp_image();
@@ -1454,6 +1694,8 @@ async fn text_op_write_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let text_path = write_temp_text("hello");
@@ -1490,6 +1732,8 @@ async fn clear_op_write_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({ "1b01": { "type": "clear" } }));
@@ -1519,6 +1763,8 @@ async fn exec_output_write_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -1562,6 +1808,8 @@ async fn exec_output_flush_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -1607,6 +1855,8 @@ async fn exec_error_label_draw_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -1644,6 +1894,8 @@ async fn exec_output_non_utf8_draw_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -1682,6 +1934,8 @@ async fn exec_output_invalid_image_draw_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes =
@@ -1721,6 +1975,8 @@ async fn reassign_kill_error_label_draw_failure_is_logged() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     // Unique per test (not just per process): two tests sharing one hardcoded pid
@@ -1796,6 +2052,8 @@ async fn refresh_absent_never_sends_a_tick() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1828,6 +2086,8 @@ async fn refresh_redraws_the_button_on_its_own_after_the_interval() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = scenes_with_buttons(json!({
@@ -1870,6 +2130,8 @@ async fn refresh_survives_a_scene_switch_that_does_not_redefine_the_button() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scenes = json!({
@@ -1921,6 +2183,8 @@ async fn refresh_is_cancelled_when_the_button_is_redefined() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let scene_a = scenes_with_buttons(json!({
@@ -1957,6 +2221,8 @@ async fn refresh_re_resolves_referenced_params() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let mut defs = std::collections::BTreeMap::new();
@@ -2006,6 +2272,8 @@ async fn text_value_renders_and_refreshes_from_variables() {
         refresh_tx,
         Log::default(),
         &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
     );
 
     let mut defs = std::collections::BTreeMap::new();

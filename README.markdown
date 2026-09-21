@@ -124,14 +124,16 @@ JSON itself has no comment syntax, so `dak` strips comments before parsing: both
 
 ### Defaults
 
-The optional top-level `defaults` section tunes how the complex button presses are detected, plus the brightness levels applied when a device connects. All keys are optional and fall back to their built-in values when missing:
+The optional top-level `defaults` section tunes how the complex button presses are detected, the brightness levels applied when a device connects, and the colours button images and text are drawn with. All keys are optional and fall back to their built-in values when missing:
 
 ```json
 "defaults": {
   "short_press_duration": 300,
   "double_click_gap": 300,
   "button_brightness": 50,
-  "encoder_brightness": 50
+  "encoder_brightness": 50,
+  "background": "#000000",
+  "text_color": "#ffffff"
 }
 ```
 
@@ -139,6 +141,12 @@ The optional top-level `defaults` section tunes how the complex button presses a
 - `double_click_gap` (default `300`, milliseconds) — two presses form a `double_click` when the second one lands within this long of the previous release.
 - `button_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's button/screen LCDs when it connects.
 - `encoder_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's encoder LED ring when it connects. Not verified against real hardware: no Ajazz AKP03E/AKP03R unit with functioning encoder LEDs was available during development, and a brute-force sweep across the underlying LED-color command's index space produced no visible response on the unit that was available - see [TODO.md](TODO.md).
+- `background` (default `#000000`) — the colour composited under any image that has transparency, and the canvas text is drawn on. Without it, an icon's transparent pixels keep whatever colour is hidden under them (usually white): the device's image format has no alpha channel, so there is nothing else to fall back on.
+- `text_color` (default `#ffffff`) — the colour button text is drawn in.
+
+A colour is either a `#RRGGBB` hex literal (six digits, case-insensitive) or one of the CSS basic colour names (`black`, `silver`, `gray`/`grey`, `white`, `maroon`, `red`, `purple`, `fuchsia`/`magenta`, `green`, `lime`, `olive`, `yellow`, `navy`, `blue`, `teal`, `aqua`/`cyan`, plus `orange`). The `#RGB` shorthand and alpha values are not accepted, and a bad colour is a config-load error.
+
+Both colour keys are also writable at runtime with a `$defaults` assignment (see [Assigning to a variable](#assigning-to-a-variable)), and an individual `setup` entry can override either for its own button with a `background`/`text_color` key. An override belongs to the button, not the scene: like the rest of a button's content it is kept until a later scene explicitly redefines that button. Changing a colour at runtime affects the next draw (a scene switch, a refresh tick or a new image) - buttons already on screen are not repainted.
 
 Complex events are decided on the release edge, per pressable control: buttons and
 pushed encoders share the same detection, so a pushed encoder's knob behaves exactly
@@ -182,9 +190,10 @@ referencing an undeclared one is a config-load error.
 A `$` starts a reference. `$name` reads a declared variable; `$var.name` is the same
 thing written with its explicit scope (the `var` scope is the default, so both work).
 `$defaults.<name>` reads a `defaults` parameter: `button_brightness`,
-`encoder_brightness`, `short_press_duration` (milliseconds) and `double_click_gap`
-(milliseconds) - the values [Defaults](#defaults) describes, reflecting any runtime
-changes.
+`encoder_brightness`, `short_press_duration` (milliseconds), `double_click_gap`
+(milliseconds), and the colours `background`/`text_color` - the values
+[Defaults](#defaults) describes, reflecting any runtime changes. A colour reads back
+exactly as it was set, so a name stays a name.
 
 References are substituted in every action string, in `setup` `params` and in the
 `timer` seconds key, resolved when the value is actually used, so they always see the
@@ -206,22 +215,31 @@ Because `$` now always starts a reference, a literal `$` in a command must be wr
 An action value of the form `$<target> <op> <rhs>` assigns:
 
 - `<target>` is a declared variable (or `var.name`) or one of the writable `defaults`
-  parameters (`defaults.button_brightness`, `defaults.encoder_brightness`). The
-  read-only `defaults` timing constants cannot be assigned.
+  parameters (`defaults.button_brightness`, `defaults.encoder_brightness`,
+  `defaults.background`, `defaults.text_color`). The read-only `defaults` timing
+  constants cannot be assigned.
 - `<op>` is `:=` (clamp/truncate and warn), `~=` (same, silently) or `=` (reject an
-  out-of-range/over-long value).
+  out-of-range, over-long or otherwise invalid value).
 - `<rhs>` is an integer literal, a `"quoted string"`, another variable (`$b`) or a
   `$(command)` substitution.
 
 An int is clamped into `min..=max`, a str is truncated to `max_length`, and a wrong-type
-right-hand side is always a config error (`"100"` is a string, not the number `100`).
+right-hand side is always a config error (`"100"` is a string, not the number `100`). A
+colour target instead takes a string that [parses as a colour](#defaults); there is
+nothing to clamp, so an invalid value is discarded in favour of the configured default -
+a config error for a bad literal under `=`, a warning under `:=`, silently under `~=`. A
+colour that comes from a variable or command is only known when the action fires, so it
+is always lenient: `=` behaves like `:=`, warning and resetting to the configured default
+rather than failing.
 
 `$(command)` runs when the action fires and converts the output to the target's type: an
 int target parses the first non-empty line (trimmed) and clamps it; a str target takes
-the whole output with trailing newlines stripped and truncates it. For `=`, an
-unconvertible output, a non-zero exit or a timeout is an error and the variable is left
-unchanged; for `:=`/`~=` the target's default (a variable's declared `value`, or the
-configured brightness default) is used, with a warning for `:=`.
+the whole output with trailing newlines stripped and truncates it; a colour target parses
+the first non-empty line (trimmed) as a colour. For `=`, an unconvertible output, a
+non-zero exit or a timeout is an error and the variable is left unchanged; for `:=`/`~=`
+the target's default (a variable's declared `value`, or the configured brightness/default
+colour) is used, with a warning for `:=`. A colour is the exception: its value is only
+known at runtime, so `=` behaves like `:=` and uses the default colour.
 
 Assignments write runtime state only: `config.json` is never modified.
 
@@ -274,7 +292,7 @@ Rules for the program:
 
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
-- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and an optional `refresh`:
+- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background` and `text_color`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
@@ -282,6 +300,8 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
+  - `background` (optional, colour, default: `defaults.background`) — override the background for this button. Allowed on `image`, `image_exec`, `text`, `text_value` and `text_exec`: for an image it is composited under transparent pixels, for text it is the canvas the glyphs are drawn on. The value may contain `$` references; a reference that resolves to something that is not a colour falls back to the default with a warning rather than failing the scene.
+  - `text_color` (optional, colour, default: `defaults.text_color`) — override the glyph colour for this button. Allowed on `text`, `text_value` and `text_exec` only.
   - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `text_value`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
 - `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 

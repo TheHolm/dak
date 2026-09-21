@@ -9,7 +9,9 @@
     "short_press_duration": 300,
     "double_click_gap": 300,
     "button_brightness": 50,
-    "encoder_brightness": 50
+    "encoder_brightness": 50,
+    "background": "#000000",
+    "text_color": "#ffffff"
   },
   "scenes": {
     "on_start": {

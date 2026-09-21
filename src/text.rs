@@ -6,6 +6,8 @@ use ab_glyph::{point, Font, FontRef, ScaleFont};
 use image::{Rgb, RgbImage};
 use mirajazz::types::ImageFormat;
 
+use crate::color::Color;
+
 /// Maximum number of characters shown per line on a button.
 ///
 /// Matches the config documentation for the `text` and `text_exec` commands.
@@ -19,6 +21,16 @@ pub const MAX_LINES: usize = 3;
 /// DejaVu Sans Mono embedded into the binary, so text rendering works without
 /// any font files installed on the host. Free to redistribute, see `fonts/LICENSE.txt`.
 static FONT_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+
+/// The default text colour (white), used by [`render_text`].
+fn default_text_color() -> Color {
+    Color::rgb(0xff, 0xff, 0xff)
+}
+
+/// The default background colour (black), used by [`render_text`] and [`render_error_image`].
+fn default_background() -> Color {
+    Color::rgb(0x00, 0x00, 0x00)
+}
 
 /// Extracts up to three lines of up to six characters from `text`, as shown on a button.
 ///
@@ -36,29 +48,54 @@ pub fn button_text(text: &str) -> Vec<String> {
 /// The font is scaled so that all lines fit within the button while still using as
 /// much space as possible, and the text block is centered horizontally and vertically.
 /// Returns a white-on-black image; the caller encodes it into the format requested by
-/// `image_format`.
+/// `image_format`. Use [`render_text_colored`] for configurable colours.
 pub fn render_text(
     lines: &[String],
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
-    render_image(lines, Rgb([255, 255, 255]), image_format)
+    render_image(
+        lines,
+        &default_text_color(),
+        &default_background(),
+        image_format,
+    )
+}
+
+/// Renders `lines` in `text_color` onto a `background`-filled button image.
+///
+/// This is [`render_text`] with the button's configured colours: the canvas is filled
+/// with `background` and glyphs are alpha-blended in `text_color`, so anti-aliased edges
+/// stay correct on a non-black background.
+pub fn render_text_colored(
+    lines: &[String],
+    background: &Color,
+    text_color: &Color,
+    image_format: ImageFormat,
+) -> Result<image::DynamicImage, Box<dyn Error>> {
+    render_image(lines, text_color, background, image_format)
 }
 
 /// Renders the label "Error" in red, centered, used when an async command fails,
-/// times out or is interrupted.
+/// times out or is interrupted. Deliberately unaffected by the configured colours.
 pub fn render_error_image(
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
-    render_image(&["Error".to_string()], Rgb([255, 0, 0]), image_format)
+    render_image(
+        &["Error".to_string()],
+        &Color::rgb(0xff, 0x00, 0x00),
+        &default_background(),
+        image_format,
+    )
 }
 
-/// Renders the text of `lines` in `color` onto a button-sized image.
+/// Renders the text of `lines` in `color` onto a `background`-filled button-sized image.
 ///
-/// Shared by [`render_text`] (white) and [`render_error_image`] (red); see
-/// [`render_text`] for an explanation of the geometry.
+/// Shared by [`render_text_colored`] and [`render_error_image`]; see [`render_text`] for
+/// an explanation of the geometry.
 fn render_image(
     lines: &[String],
-    color: Rgb<u8>,
+    color: &Color,
+    background: &Color,
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
     let (width, height) = (image_format.size.0 as u32, image_format.size.1 as u32);
@@ -67,7 +104,9 @@ fn render_image(
     }
 
     let font: FontRef = FontRef::try_from_slice(FONT_BYTES)?;
-    let mut image = RgbImage::new(width, height);
+    let mut image = RgbImage::from_pixel(width, height, background.to_rgb());
+    let foreground = color.channels();
+    let backdrop = background.channels();
 
     // Reference metrics from a 1px scale; every metric scales linearly, so the font
     // size can be solved from the width and height budgets below.
@@ -119,15 +158,19 @@ fn render_image(
                 outline.draw(|px, py, coverage| {
                     let (px, py) = (px as i32 + offset_x, py as i32 + offset_y);
                     if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
-                        let value = (coverage.clamp(0.0, 1.0) * 255.0) as u8;
+                        // Blend the glyph's colour over the background by its coverage,
+                        // so partially covered edge pixels mix rather than replace.
+                        let alpha = coverage.clamp(0.0, 1.0);
+                        let channel = |index: usize| {
+                            (foreground[index] as f32 * alpha
+                                + backdrop[index] as f32 * (1.0 - alpha))
+                                .round()
+                                .clamp(0.0, 255.0) as u8
+                        };
                         image.put_pixel(
                             px as u32,
                             py as u32,
-                            Rgb([
-                                (value as u16 * color[0] as u16 / 255) as u8,
-                                (value as u16 * color[1] as u16 / 255) as u8,
-                                (value as u16 * color[2] as u16 / 255) as u8,
-                            ]),
+                            Rgb([channel(0), channel(1), channel(2)]),
                         );
                     }
                 });
@@ -289,6 +332,35 @@ mod tests {
         assert!(min_row <= 8, "text starts too low at row {min_row}");
         assert!(max_row >= 54, "text ends too high at row {max_row}");
         assert!(min_row < 30 && max_row > 30, "text is not centered");
+    }
+
+    /// `render_text_colored` fills the canvas with the background and draws glyphs in
+    /// the text colour.
+    #[test]
+    fn render_text_colored_uses_configured_colours() {
+        let image = render_text_colored(
+            &["M".to_string()],
+            &Color::parse("#0000ff").unwrap(),
+            &Color::parse("#00ff00").unwrap(),
+            ImageFormat {
+                mode: mirajazz::types::ImageMode::None,
+                size: (60, 60),
+                rotation: mirajazz::types::ImageRotation::Rot0,
+                mirror: mirajazz::types::ImageMirroring::None,
+            },
+        )
+        .expect("render")
+        .to_rgb8();
+        assert!(
+            image.pixels().any(|p| p.0 == [0, 0, 255]),
+            "expected plain blue background pixels"
+        );
+        assert!(
+            image
+                .pixels()
+                .any(|p| p.0[1] > 200 && p.0[0] < 60 && p.0[2] < 60),
+            "expected a green glyph pixel"
+        );
     }
 
     /// The error renderer produces a red-on-black label in the requested size.

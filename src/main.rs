@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use dak::actions::{self, Action};
 use dak::baseplane::Reference;
 use dak::cli::Cli;
+use dak::color::Color;
 use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
@@ -141,7 +142,7 @@ async fn main() -> Result<(), MirajazzError> {
             device_info,
             scenes,
             log,
-            config.defaults,
+            config.defaults.clone(),
             variables.clone(),
         )));
     }
@@ -295,6 +296,8 @@ async fn run_device(
         refresh_tx,
         log,
         &screenless_buttons,
+        defaults.background.clone(),
+        defaults.text_color.clone(),
     );
     // Setup params are expanded against the shared variable state, re-resolved on every
     // refresh tick (see `SceneRunner::set_variables`).
@@ -307,7 +310,7 @@ async fn run_device(
     // double-click gap — so a second press inside the gap can cancel the first
     // click's pending confirmation.
     let (click_tx, mut click_rx) = mpsc::channel::<(Reference, ClickEvent)>(8);
-    let mut click_detector = ClickDetector::new(defaults);
+    let mut click_detector = ClickDetector::new(&defaults);
     let mut pending_shorts: HashMap<Reference, PendingShortPress> = HashMap::new();
 
     if let Err(error) = runner.enter_scene("on_start", &scenes).await {
@@ -386,7 +389,7 @@ async fn run_device(
                             &mut click_detector,
                             &click_tx,
                             &mut pending_shorts,
-                            defaults,
+                            &defaults,
                             &mut timer_handle,
                             &timer_tx,
                             &variables,
@@ -414,7 +417,7 @@ async fn run_device(
                             &mut click_detector,
                             &click_tx,
                             &mut pending_shorts,
-                            defaults,
+                            &defaults,
                             &mut timer_handle,
                             &timer_tx,
                             &variables,
@@ -635,7 +638,7 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
     click_detector: &mut ClickDetector,
     click_tx: &mpsc::Sender<(Reference, ClickEvent)>,
     pending_shorts: &mut HashMap<Reference, PendingShortPress>,
-    defaults: Defaults,
+    defaults: &Defaults,
     timer_handle: &mut Option<tokio::task::JoinHandle<()>>,
     timer_tx: &mpsc::Sender<Vec<String>>,
     variables: &Arc<std::sync::Mutex<Variables>>,
@@ -876,17 +879,25 @@ async fn run_action<D: actions::ButtonDevice>(
                 let mut state = variables.lock().expect("variables mutex poisoned");
                 actions::apply_assignment(&target, op, &rhs, &mut state, warn, log)
             };
-            if let Some((param, value)) = side_effect {
-                let result = match param {
-                    actions::SettableDefault::ButtonBrightness => {
-                        runner.set_button_brightness(value as u8).await
+            if let Some(effect) = side_effect {
+                match effect {
+                    actions::DefaultEffect::Brightness(param, value) => {
+                        let result = match param {
+                            actions::SettableDefault::ButtonBrightness => {
+                                runner.set_button_brightness(value as u8).await
+                            }
+                            actions::SettableDefault::EncoderBrightness => {
+                                runner.set_encoder_brightness(value as u8).await
+                            }
+                            _ => unreachable!("brightness effect on a colour parameter"),
+                        };
+                        if let Err(error) = result {
+                            log.warn(format!("failed to set {}: {error}", param.path()));
+                        }
                     }
-                    actions::SettableDefault::EncoderBrightness => {
-                        runner.set_encoder_brightness(value as u8).await
+                    actions::DefaultEffect::Color(param, colour) => {
+                        apply_colour_default(runner, param, colour);
                     }
-                };
-                if let Err(error) = result {
-                    log.warn(format!("failed to set {}: {error}", param.path()));
                 }
             }
         }
@@ -894,7 +905,7 @@ async fn run_action<D: actions::ButtonDevice>(
 }
 
 /// Applies a finished command-substitution assignment: stores the converted value and,
-/// for a writable default, pushes the new brightness to the device.
+/// for a writable default, pushes the new brightness or colour to the device.
 ///
 /// Called by the input loop, which owns both the shared variable state and the device;
 /// the spawned command task only reports the already-converted result.
@@ -922,34 +933,87 @@ async fn apply_completed_assignment<D: actions::ButtonDevice>(
             None
         }
         actions::AssignTarget::Default(param) => {
-            let VarValue::Int(number) = value else {
-                log.error(format!(
-                    "assignment to {} produced a non-numeric value",
-                    param.path()
-                ));
-                return;
-            };
-            let mut state = variables.lock().expect("variables mutex poisoned");
-            match param {
-                actions::SettableDefault::ButtonBrightness => state.set_button_brightness(number),
-                actions::SettableDefault::EncoderBrightness => state.set_encoder_brightness(number),
+            if param.is_colour() {
+                let VarValue::Str(text) = value else {
+                    log.error(format!(
+                        "assignment to {} produced a non-colour value",
+                        param.path()
+                    ));
+                    return;
+                };
+                let colour = match Color::parse(&text) {
+                    Ok(colour) => colour,
+                    Err(error) => {
+                        log.error(format!("assignment to {}: {error}", param.path()));
+                        return;
+                    }
+                };
+                let mut state = variables.lock().expect("variables mutex poisoned");
+                match param {
+                    actions::SettableDefault::Background => state.set_background(colour.clone()),
+                    actions::SettableDefault::TextColor => state.set_text_color(colour.clone()),
+                    _ => unreachable!("colour parameter expected"),
+                }
+                Some(actions::DefaultEffect::Color(*param, colour))
+            } else {
+                let VarValue::Int(number) = value else {
+                    log.error(format!(
+                        "assignment to {} produced a non-numeric value",
+                        param.path()
+                    ));
+                    return;
+                };
+                let mut state = variables.lock().expect("variables mutex poisoned");
+                match param {
+                    actions::SettableDefault::ButtonBrightness => {
+                        state.set_button_brightness(number)
+                    }
+                    actions::SettableDefault::EncoderBrightness => {
+                        state.set_encoder_brightness(number)
+                    }
+                    _ => unreachable!("numeric parameter expected"),
+                }
+                Some(actions::DefaultEffect::Brightness(*param, number))
             }
-            Some((*param, number))
         }
     };
 
-    if let Some((param, number)) = side_effect {
-        let result = match param {
-            actions::SettableDefault::ButtonBrightness => {
-                runner.set_button_brightness(number as u8).await
+    if let Some(effect) = side_effect {
+        match effect {
+            actions::DefaultEffect::Brightness(param, number) => {
+                let result = match param {
+                    actions::SettableDefault::ButtonBrightness => {
+                        runner.set_button_brightness(number as u8).await
+                    }
+                    actions::SettableDefault::EncoderBrightness => {
+                        runner.set_encoder_brightness(number as u8).await
+                    }
+                    _ => unreachable!("brightness effect on a colour parameter"),
+                };
+                if let Err(error) = result {
+                    log.warn(format!("failed to set {}: {error}", param.path()));
+                }
             }
-            actions::SettableDefault::EncoderBrightness => {
-                runner.set_encoder_brightness(number as u8).await
+            actions::DefaultEffect::Color(param, colour) => {
+                apply_colour_default(runner, param, colour);
             }
-        };
-        if let Err(error) = result {
-            log.warn(format!("failed to set {}: {error}", param.path()));
         }
+    }
+}
+
+/// Pushes a newly assigned colour default to `runner`, which uses it on the next draw.
+///
+/// A `SettableDefault` is always either a brightness or a colour parameter, so this is
+/// only called with the two colour variants.
+fn apply_colour_default<D: actions::ButtonDevice>(
+    runner: &mut actions::SceneRunner<'_, D>,
+    param: actions::SettableDefault,
+    colour: Color,
+) {
+    match param {
+        actions::SettableDefault::Background => runner.set_background(colour),
+        actions::SettableDefault::TextColor => runner.set_text_color(colour),
+        other => unreachable!("not a colour parameter: {}", other.path()),
     }
 }
 
@@ -1232,6 +1296,8 @@ mod tests {
             refresh_tx,
             Log::default(),
             &HashSet::new(),
+            Defaults::default().background,
+            Defaults::default().text_color,
         )
     }
 
@@ -1264,19 +1330,22 @@ mod tests {
         fn new(defaults: Defaults) -> EdgeState {
             let (click_tx, click_rx) = mpsc::channel(8);
             let (timer_tx, _timer_rx) = mpsc::channel(1);
+            // Built before `defaults` is moved into the struct below.
+            let click_detector = ClickDetector::new(&defaults);
+            let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+                std::collections::BTreeMap::new(),
+                &defaults,
+            )));
             EdgeState {
                 down_controls: HashSet::new(),
-                click_detector: ClickDetector::new(defaults),
+                click_detector,
                 click_tx,
                 click_rx,
                 pending_shorts: HashMap::new(),
                 timer_handle: None,
                 timer_tx,
                 defaults,
-                variables: std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
-                    std::collections::BTreeMap::new(),
-                    &defaults,
-                ))),
+                variables,
             }
         }
 
@@ -1323,7 +1392,7 @@ mod tests {
             &mut state.click_detector,
             &state.click_tx,
             &mut state.pending_shorts,
-            state.defaults,
+            &state.defaults,
             &mut state.timer_handle,
             &state.timer_tx,
             &state.variables,
@@ -1830,6 +1899,66 @@ mod tests {
 
         assert_eq!(mock.last_encoder_brightness(), Some(15));
         assert_eq!(mock.last_button_brightness(), None);
+    }
+
+    /// A `$defaults.background := "colour"` action stores the new colour in the shared
+    /// state and pushes it to the runner, distinct from the brightness parameters.
+    #[tokio::test]
+    async fn run_action_set_config_calls_set_background_colour() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.background := \"red\"",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        let variables = state.variables.lock().unwrap();
+        assert_eq!(variables.background().text(), "red");
+        assert_eq!(variables.background().channels(), [0xff, 0x00, 0x00]);
+        assert_eq!(mock.last_button_brightness(), None);
+        assert_eq!(mock.last_encoder_brightness(), None);
+    }
+
+    /// A `$defaults.background = "bad"` action with an invalid colour is rejected at
+    /// runtime (logged, value unchanged), matching every other strict `=` assignment.
+    #[tokio::test]
+    async fn run_action_set_config_rejects_bad_colour() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.background = \"chartreuse\"",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        // The value is unchanged and nothing was pushed to the device.
+        let variables = state.variables.lock().unwrap();
+        assert_eq!(variables.background().text(), "#000000");
     }
 
     /// When the device rejects a `$defaults.button_brightness := N` write, the
