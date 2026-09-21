@@ -1,0 +1,74 @@
+{
+  // A media playback deck. Buttons drive the active MPRIS player through `playerctl`,
+  // and the first encoder (1e01) changes the system volume through `pactl`; both tools
+  // must be installed, and `pactl` needs a running PulseAudio/PipeWire sound server.
+  //
+  // 1b05 shows the current track: a `text_exec` that runs `playerctl metadata` and is
+  // re-run every 3 seconds by its `refresh`, so it tracks the player on its own.
+  //
+  // 1b04's mute is an array action: entries run in parallel, so one press toggles the
+  // mute and raises a desktop notification without either waiting for the other.
+  "version": "1.0",
+  "defaults": {
+    "button_brightness": 70,
+    "encoder_brightness": 40
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "PLAY" },
+        "1b02": { "type": "text_value", "params": "PREV" },
+        "1b03": { "type": "text_value", "params": "NEXT" },
+        "1b04": { "type": "text_value", "params": "MUTE" },
+        "1b05": {
+          "type": "text_exec",
+          "params": "/usr/bin/playerctl metadata --format '{{ artist }} - {{ title }}'",
+          "refresh": 3
+        }
+      },
+      "actions": {
+        "1b01": { "short_press": "/usr/bin/playerctl play-pause" },
+        "1b02": { "short_press": "/usr/bin/playerctl previous" },
+        "1b03": { "short_press": "/usr/bin/playerctl next" },
+        "1b04": {
+          "short_press": [
+            "/usr/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle",
+            "/usr/bin/notify-send dak 'Output mute toggled'"
+          ]
+        },
+        "1e01": {
+          "turn_cw": "/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%",
+          "turn_ccw": "/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%",
+          "short_press": "/usr/bin/playerctl play-pause"
+        }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

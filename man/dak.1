@@ -1,0 +1,105 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH DAK 1 2026-09-20 "dak 0.10.1" "User Commands"
+.SH NAME
+dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
+.SH SYNOPSIS
+\fBdak\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-d\fR|\fB\-\-debug\fR] [\fB\-\-map\fR] [\fB\-h\fR|\fB\-\-help\fR]
+.SH DESCRIPTION
+DAK (Dynamic Ajazz Keyboard) controls an Ajazz AKP03E or AKP03R USB macro keypad, part of the family of "stream controller" keypads that Ajazz and Mirabox sell under different names. It connects to the device, paints the configured images and text labels onto the button LCDs, sets the button and encoder brightness, and reacts to button presses, encoder turns and scene timers described by a JSON configuration file.
+.PP
+All runtime behavior is configurable: scenes swap what the buttons show and do, per\-button bindings distinguish short presses, long presses and double clicks, encoders bind one action per rotation notch, and each scene may run a timer. See dak\-config(5) for the configuration file format.
+.PP
+dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It runs until it is interrupted (Ctrl\-C) or the device disconnects, then restores the button images it changed and shuts the device down.
+.SH OPTIONS
+.TP
+\fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR
+Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory
+.TP
+\fB\-d\fR, \fB\-\-debug\fR \fI<DEBUG>...\fR
+Debug subsystems to enable: device, scene, action. The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
+.TP
+\fB\-\-map\fR
+Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.SH "CONFIG FILE SEARCH"
+When
+.B \-c
+is not given, a file named
+.I config.json
+is loaded from the first location that exists, in this order:
+.IP "1." 4
+.IB ~/.config/dak/config.json
+.IP "2." 4
+.I <current\-directory>/config.json
+.IP "3." 4
+.I <the\-directory\-of\-the\-binary>/config.json
+.PP
+An explicit
+.B \-c
+path is always used as it is and disables the search; a missing file is
+reported and the program exits.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Used to expand a leading
+.B ~
+in command lines and paths, and to find the
+.IB ~/.config/dak
+search location.
+.TP
+.B PATH
+Used to locate a command when an action or setup entry names one without a
+path. A command that contains an unquoted shell operator is run through the
+.BR sh (1)
+found on
+.BR PATH .
+.SH FILES
+.TP
+.I ~/.config/dak/config.json
+The preferred per\-user configuration location.
+.TP
+.I ./config.json
+Configuration in the current directory.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Normal termination, including termination by Ctrl\-C.
+.TP
+.B non\-zero
+No configured device was found, a device could not be connected, or the
+configuration could not be loaded.
+.SH EXAMPLES
+.TP
+.B dak
+Run with the default
+.IR config.json .
+.TP
+.B dak \-c /path/to/config.json
+Run with an explicit configuration path.
+.TP
+.B dak \-d device,scene
+Print device and scene debug output.
+.TP
+.B dak \-\-map
+Capture the connected device's mapping as JSON and exit.
+.SH NOTES
+Only one process may hold the device open at a time; stop any other instance
+of
+.B dak
+(or other program using the keypad) before starting a new one.
+.PP
+The device definition printed by
+.B \-\-map
+is the same JSON that the
+.B devices
+section of the configuration expects; paste it in and adjust it.
+.SH "SEE ALSO"
+.BR dak\-config (5),
+.BR sh (1)
+.PP
+The project README and INSTALL documents ship alongside the binary, and the
+example configurations are under
+.IR examples/ .

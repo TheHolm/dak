@@ -18,6 +18,7 @@ extern crate mirajazz_freebsd as mirajazz;
 
 pub mod actions;
 pub mod baseplane;
+pub mod cli;
 pub mod hardware;
 pub mod log;
 pub mod map;

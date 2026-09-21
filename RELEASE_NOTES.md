@@ -5,6 +5,66 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.10.1 — Man pages, richer `--help`, stricter event validation, and worked examples
+
+### User-facing changes
+- New `dak(1)` and `dak-config(5)` man pages, shipped in the Debian/Ubuntu
+  `.deb` and the FreeBSD `.pkg` packages: the command line (options, config
+  search order, environment, exit status) and the complete `config.json`
+  format (defaults, variables, scenes, devices). `man dak` and
+  `man dak-config` work after a package install; a source checkout has them
+  in `man/`.
+- `dak --help` now shows the full descriptions (with `dak -h` keeping the
+  short summary), because the rich text also feeds the generated man page.
+- An event name a control does not support (e.g. a typo like `short_pres`, or
+  a rotation event on a button) is now a config-load error instead of a
+  binding that silently never fires.
+- Seven new worked example configs, each illustrating one feature area (scene
+  carry-over, media control, scene navigation, push-to-talk, launcher with
+  icons, counters/modes, and a press scene preview), indexed in
+  `examples/EXAMPLES.md`.
+- The README and INSTALL documents now point at the man pages.
+- Version bumped to `0.10.1`.
+
+### Details
+- `man/dak.1` is **generated** from the clap definition in the new
+  `src/cli.rs` (moved out of `src/main.rs`) with `clap_mangen`, so its
+  NAME/SYNOPSIS/DESCRIPTION/OPTIONS cannot drift from the real flags. The
+  sections clap_mangen has no field for (config search order, environment,
+  files, exit status, examples, notes, see-also) are a roff appendix in
+  `tests/man_pages.rs`. Regenerate with
+  `cargo test --test man_pages -- --ignored regenerate_dak_1`.
+- The `Cli` help text was split into short `help` and full `long_help`
+  (plus a `long_about`), which is what `dak --help` and the man page show;
+  `dak -h` keeps the one-line summary.
+- `man/dak-config.5` stays hand-written but is now guarded against the code's
+  vocabulary: `TOP_LEVEL_KEYS`, `DEFAULTS_KEYS`, `SETUP_KINDS`,
+  `CONTROL_EVENTS` and `ENCODER_EVENTS` (`src/actions.rs`) and
+  `VARIABLE_KEYS`/`RESERVED_NAMES` (`src/variables.rs`) are public consts the
+  loader uses, and `tests/man_pages.rs` requires the page to name every entry.
+- `check_actions` now rejects an event outside the reference's set
+  (`CONTROL_EVENTS` for buttons, `ENCODER_EVENTS` for encoders, their knob
+  push included) instead of ignoring it; setup-type validation is now gated on
+  `SETUP_KINDS`.
+- `tests/man_pages.rs` was extended: it compares the committed `dak.1` to a
+  fresh render semantically (normalized token multiset, so `clap_mangen`/`roff`
+  need no version pinning), checks every CLI argument appears, and checks the
+  `dak-config.5` vocabulary. `clap_mangen` is a dev-dependency only.
+- `Cargo.toml` gained a `[package.metadata.deb]` section whose `assets` list
+  keeps cargo-deb's implicit `"$auto"` assets and adds both pages under
+  `usr/share/man/man1/` and `usr/share/man/man5/`; cargo-deb compresses
+  anything under `usr/share/man/` itself, per Debian policy.
+- The FreeBSD `.pkg` step and both `.deb` steps in
+  `.woodpecker/release.yaml` now also assert the pages are present in the
+  built artifact, so a package that silently drops them fails the release.
+- README/INSTALL updated to advertise the pages.
+- Added seven complete example configs under `examples/`
+  (`scene-carry-over.json`, `media-control.json`, `scene-navigation.json`,
+  `push-to-talk.json`, `launcher-with-icons.json`, `counter-and-modes.json`,
+  `press-scene-preview.json`), indexed by `examples/EXAMPLES.md`; the existing
+  `example_configs_load` test in `tests/validation.rs` keeps every file
+  loadable.
+
 ## v0.10.0 — Config variables: declared values, assignment, and command substitution in actions and scene params
 
 ### User-facing changes

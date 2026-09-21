@@ -173,9 +173,18 @@ impl VariableStore {
 /// Names that a variable declaration may not use: the scope keywords (`var`,
 /// `defaults`) and the reserved read-only top-level config keys (`version`, `scenes`,
 /// `devices`). Keeping these reserved means a `$` reference is never ambiguous between a
-/// variable and a built-in scope/config path.
+/// variable and a built-in scope/config path. `tests/man_pages.rs` requires `dak-config.5`
+/// to document every entry.
+pub const RESERVED_NAMES: &[&str] = &["var", "defaults", "version", "scenes", "devices"];
+
+/// The keys a variable declaration may contain; any other key is rejected. The allowed
+/// set depends on the declared type (see [`check_variable`]), but this is the full
+/// vocabulary `dak-config.5` must document.
+pub const VARIABLE_KEYS: &[&str] = &["type", "min", "max", "max_length", "value"];
+
+/// Names that a variable declaration may not use; see [`RESERVED_NAMES`].
 pub fn is_reserved_name(name: &str) -> bool {
-    matches!(name, "var" | "defaults" | "version" | "scenes" | "devices")
+    RESERVED_NAMES.contains(&name)
 }
 
 /// Whether `name` is a valid variable name: a nonempty sequence starting with an ASCII
@@ -243,13 +252,12 @@ fn check_variable(name: &str, declaration: &Value, errors: &mut Vec<String>) -> 
         return None;
     };
 
-    const KNOWN_KEYS: &[&str] = &["type", "min", "max", "max_length", "value"];
     let mut unknown_key = false;
     for key in map.keys() {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
+        if !VARIABLE_KEYS.contains(&key.as_str()) {
             errors.push(format!(
                 "variables.{name}: unknown key \"{key}\", expected one of {}",
-                KNOWN_KEYS
+                VARIABLE_KEYS
                     .iter()
                     .map(|key| format!("\"{key}\""))
                     .collect::<Vec<_>>()

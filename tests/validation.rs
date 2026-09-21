@@ -840,6 +840,49 @@ fn accepts_empty_array_as_no_action() {
     assert!(config.is_ok(), "{:?}", config.err());
 }
 
+/// Every documented button event is accepted on a button, and every documented encoder
+/// event (including both rotation directions) on an encoder.
+#[test]
+fn accepts_the_documented_button_and_encoder_events() {
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {
+            "1b01": { "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+            "1e01": { "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "", "turn_cw": "", "turn_ccw": "" }
+        }}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(config.is_ok(), "{:?}", config.err());
+}
+
+/// An event name a button does not support is a config error, not a silently ignored
+/// binding, so a typo cannot look like a working action.
+#[test]
+fn rejects_unknown_button_event() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"short_pres": "@"}}}}"#,
+        "actions.\"1b01\" has invalid button event \"short_pres\"",
+    );
+}
+
+/// An encoder rejects an event outside its own set just as a button does.
+#[test]
+fn rejects_unknown_encoder_event() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1e01": {"turned": "@"}}}}"#,
+        "actions.\"1e01\" has invalid encoder event \"turned\"",
+    );
+}
+
+/// The rotation events belong to encoders only; binding one on a button is rejected.
+#[test]
+fn rejects_rotation_event_on_button() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"1b01": {"turn_cw": "@"}}}}"#,
+        "actions.\"1b01\" has invalid button event \"turn_cw\"",
+    );
+}
+
 /// A per-reference action object with no events at all is a likely mistake: warned,
 /// not rejected.
 #[test]

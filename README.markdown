@@ -9,9 +9,14 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.10.0**.
+The current version is **v0.10.1**.
 
 ## Usage
+
+Two man pages ship with the binary and are installed by the `.deb`/`.pkg`
+packages: **dak(1)** for the command line and **dak-config(5)** for the
+configuration file format. Read them with `man dak` and `man dak-config` (or
+`man 5 dak-config` where both exist), or see the same information below.
 
 ```
 dak [OPTIONS]
@@ -78,7 +83,10 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 
 ## Config structure
 
-`config.json` drives all runtime behavior. The top level of the config is a dictionary with up to five keys:
+`config.json` drives all runtime behavior. The **dak-config(5)** man page is
+the compact reference for this file format; the rest of this section is the
+same material with more explanation and full examples. The top level of the
+config is a dictionary with up to five keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))

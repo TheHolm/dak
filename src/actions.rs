@@ -47,6 +47,62 @@ pub struct LoadedConfig {
 /// The config `version` assumed when the top-level `version` key is absent.
 pub const DEFAULT_CONFIG_VERSION: &str = "1.0";
 
+/// Every key the top-level config object may contain; anything else is rejected. This is
+/// also the vocabulary `tests/man_pages.rs` requires `dak-config.5` to document.
+pub const TOP_LEVEL_KEYS: &[&str] = &["version", "variables", "defaults", "scenes", "devices"];
+
+/// The keys the optional `defaults` object may contain. Kept in step with the field set of
+/// [`Defaults`](crate::press::Defaults).
+pub const DEFAULTS_KEYS: &[&str] = &[
+    "short_press_duration",
+    "double_click_gap",
+    "button_brightness",
+    "encoder_brightness",
+];
+
+/// The scene `setup` operation types (the allowed `"type"` values). Setup validation
+/// rejects any kind not listed here before dispatching, keeping this list, the `match`
+/// that handles each kind, and `dak-config.5` (checked by `tests/man_pages.rs`) in step.
+pub const SETUP_KINDS: &[&str] = &[
+    "image",
+    "image_exec",
+    "text",
+    "text_value",
+    "text_exec",
+    "launch",
+    "clear",
+];
+
+/// The events a button may bind in a scene's `actions`; an encoder's knob push uses the
+/// same set. Unknown event names are a config error.
+pub const CONTROL_EVENTS: &[&str] = &[
+    "pressed",
+    "released",
+    "short_press",
+    "long_press",
+    "double_click",
+];
+
+/// The events an encoder may bind: [`CONTROL_EVENTS`] plus the two rotation directions.
+pub const ENCODER_EVENTS: &[&str] = &[
+    "pressed",
+    "released",
+    "short_press",
+    "long_press",
+    "double_click",
+    "turn_cw",
+    "turn_ccw",
+];
+
+/// Renders a slice of names as a `"a", "b"` list for error messages.
+fn quoted_list(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Device definitions from the config `devices` section, keyed by logical device id.
 ///
 /// The ids are the digits control references use (`1b01` addresses device `1`). Each
@@ -214,14 +270,10 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     };
 
     for key in map.keys() {
-        if key != "scenes"
-            && key != "devices"
-            && key != "defaults"
-            && key != "variables"
-            && key != "version"
-        {
+        if !TOP_LEVEL_KEYS.contains(&key.as_str()) {
             errors.push(format!(
-                "unknown top-level key \"{key}\", expected \"scenes\", \"devices\", \"defaults\", \"variables\" and \"version\""
+                "unknown top-level key \"{key}\", expected {}",
+                quoted_list(TOP_LEVEL_KEYS)
             ));
         }
     }
@@ -286,13 +338,6 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
 /// timing knobs (positive millisecond durations) and the connect-time brightness
 /// levels (0-100 percent). Missing keys fall back to [`Defaults::default`].
 fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
-    const KNOWN_KEYS: &[&str] = &[
-        "short_press_duration",
-        "double_click_gap",
-        "button_brightness",
-        "encoder_brightness",
-    ];
-
     let map = match defaults.as_object() {
         Some(map) => map,
         None => {
@@ -306,14 +351,10 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
 
     let mut result = Defaults::default();
     for (key, value) in map {
-        if !KNOWN_KEYS.contains(&key.as_str()) {
+        if !DEFAULTS_KEYS.contains(&key.as_str()) {
             errors.push(format!(
                 "defaults: unknown key \"{key}\", expected one of {}",
-                KNOWN_KEYS
-                    .iter()
-                    .map(|key| format!("\"{key}\""))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                quoted_list(DEFAULTS_KEYS)
             ));
             continue;
         }
@@ -644,6 +685,17 @@ fn check_button_op(
         ));
     }
 
+    // SETUP_KINDS is the single vocabulary list; rejecting anything outside it here keeps
+    // the list, the dispatch below and `dak-config.5` (checked by tests/man_pages.rs) in
+    // step, rather than letting an unlisted type fall through to a match arm.
+    if !SETUP_KINDS.contains(&kind) {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} unknown type \"{kind}\", expected {}",
+            SETUP_KINDS.join(", ")
+        ));
+        return;
+    }
+
     match kind {
         "image" | "text" => {
             if params.is_empty() {
@@ -686,8 +738,11 @@ fn check_button_op(
         }
         "clear" => {}
         other => {
+            // Unreachable while SETUP_KINDS and this match stay in step; reported rather
+            // than panicked so a drift is a config error, not a crash.
             errors.push(format!(
-                "scene \"{scene_name}\": {location} unknown type \"{other}\", expected image, image_exec, text, text_value, text_exec, launch or clear"
+                "scene \"{scene_name}\": {location} unsupported type \"{other}\", expected {}",
+                SETUP_KINDS.join(", ")
             ));
         }
     }
@@ -717,10 +772,13 @@ fn check_actions(
             continue;
         }
 
-        if let Err(error) = Reference::parse(key) {
-            errors.push(format!("scene \"{scene_name}\": actions.\"{key}\" {error}"));
-            continue;
-        }
+        let reference = match Reference::parse(key) {
+            Ok(reference) => reference,
+            Err(error) => {
+                errors.push(format!("scene \"{scene_name}\": actions.\"{key}\" {error}"));
+                continue;
+            }
+        };
 
         let events = match action.as_object() {
             Some(events) => events,
@@ -738,7 +796,24 @@ fn check_actions(
             ));
         }
 
+        // Button events and the encoder knob push share one set; encoders add the two
+        // rotation directions. An event outside the reference's set is a config error
+        // rather than a silent no-op, so a typo does not look like a working binding.
+        let allowed_events = match reference.kind {
+            Kind::Button => CONTROL_EVENTS,
+            Kind::Encoder => ENCODER_EVENTS,
+        };
+
         for (event, value) in events {
+            if !allowed_events.contains(&event.as_str()) {
+                errors.push(format!(
+                    "scene \"{scene_name}\": actions.\"{key}\" has invalid {} event \"{event}\", expected one of {}",
+                    reference.kind.label(),
+                    quoted_list(allowed_events)
+                ));
+                continue;
+            }
+
             let path = format!("actions.\"{key}\".{event}");
             check_action_values(
                 variables, scenes, scene_name, &path, value, errors, warnings,

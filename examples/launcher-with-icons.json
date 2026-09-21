@@ -1,0 +1,95 @@
+{
+  // An application launcher. Each home button carries an `image` icon and jumps to a
+  // one-entry scene whose `setup` `launch`es the real application detached; the scene's
+  // `timer` returns home two seconds later, so the pad is ready for the next launch.
+  // The launch reference (1b07, a button without a display) is only a config slot.
+  //
+  // 1b04 shows `image_exec`: a program whose stdout must be a whole image file, here an
+  // ImageMagick v6 `convert` (on v7 use `magick` instead of `convert`). Point the icon
+  // paths at files that exist on your system.
+  "version": "1.0",
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": {
+          "type": "image",
+          "params": "/usr/share/icons/hicolor/48x48/apps/firefox.png"
+        },
+        "1b02": {
+          "type": "image",
+          "params": "/usr/share/icons/hicolor/48x48/apps/utilities-terminal.png"
+        },
+        "1b03": {
+          "type": "image",
+          "params": "/usr/share/icons/hicolor/48x48/apps/accessories-text-editor.png"
+        },
+        "1b04": {
+          "type": "image_exec",
+          "params": "/usr/bin/convert -size 60x60 xc:'#222222' -fill white -pointsize 14 -gravity center -annotate 0 'DAK' png:-"
+        }
+      },
+      "actions": {
+        "1b01": { "short_press": "@Firefox" },
+        "1b02": { "short_press": "@Terminal" },
+        "1b03": { "short_press": "@Editor" }
+      }
+    },
+    "Firefox": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "HOME" },
+        "1b07": { "type": "launch", "params": "/usr/bin/firefox" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@on_start" },
+        "timer": { "2": "@on_start" }
+      }
+    },
+    "Terminal": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "HOME" },
+        "1b07": { "type": "launch", "params": "/usr/bin/x-terminal-emulator" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@on_start" },
+        "timer": { "2": "@on_start" }
+      }
+    },
+    "Editor": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "HOME" },
+        "1b07": { "type": "launch", "params": "/usr/bin/code" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@on_start" },
+        "timer": { "2": "@on_start" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

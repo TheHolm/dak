@@ -40,6 +40,14 @@ fails at the link step looking for libraries (`-lexecinfo`, `-lpthread`,
 ...) under a sysroot path that only exists on the Linux machine you cross-
 compiled from.
 
+## Man pages
+
+The `.deb` and `.pkg` packages install **dak(1)** and **dak-config(5)** into
+the system man tree, so `man dak` and `man dak-config` work after a package
+install. A source checkout has the same pages under `man/`; read them with
+`man ./man/dak.1` and `man ./man/dak-config.5`, or copy
+`man/dak.1`/`man/dak-config.5` into your system's `man1`/`man5` directory.
+
 ## Device permissions
 
 ### Linux

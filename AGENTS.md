@@ -40,7 +40,13 @@ under other platforms.
 ## Layout
 
 - `src/main.rs` — device discovery, connection setup, image upload, input loop
-- `src/actions.rs` — config loading and scene/action handling
+- `src/cli.rs` — the clap `Cli` command-line definition, kept in the library so
+  `man/dak.1` can be generated from exactly the flags the binary parses (the
+  `clap_mangen` dev-dependency renders it; see `man/` below)
+- `src/actions.rs` — config loading and scene/action handling; also the public
+  vocabulary constants (`TOP_LEVEL_KEYS`, `DEFAULTS_KEYS`, `SETUP_KINDS`,
+  `CONTROL_EVENTS`, `ENCODER_EVENTS`) that both validation and
+  `tests/man_pages.rs` use
 - `src/variables.rs` — declared variables and their validation, `$` reference
   expansion/substitution, and the runtime variable/default state
   (`VariableStore`/`Variables`) shared by every device
@@ -63,6 +69,18 @@ under other platforms.
   scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `config.json.example` — checked-in template new users copy to `config.json`
 - `examples/` — complete, copyable example configs, indexed by `examples/EXAMPLES.md`
+- `man/` — roff man pages: `dak.1` (CLI reference) and `dak-config.5` (config
+  file format). `dak.1` is **generated** from `src/cli.rs` plus the roff
+  appendix in `tests/man_pages.rs`; regenerate it after touching either with
+  `cargo test --test man_pages -- --ignored regenerate_dak_1`. `dak-config.5`
+  is hand-written. Installed by the `.deb` (via `[package.metadata.deb]`
+  assets in `Cargo.toml`) and `.pkg` (staged in `.woodpecker/release.yaml`)
+  packages, both of which now also assert the pages made it into the artifact.
+  `tests/man_pages.rs` guards filenames/section/version, compares the committed
+  `dak.1` to a fresh render semantically (normalized tokens, so `clap_mangen`
+  needs no pinning), and checks `dak-config.5` documents every vocabulary
+  constant from `src/actions.rs`/`src/variables.rs`. Both pages' `.TH` version
+  fields must match `Cargo.toml`'s `version`.
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
 - `INSTALL.md` — building from source (both platforms, plus a FreeBSD-specific

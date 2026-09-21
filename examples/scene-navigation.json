@@ -1,0 +1,84 @@
+{
+  // Scene navigation. `on_start` is a small home screen: 1b01 jumps to a live clock,
+  // 1b02 to a system-info screen, and 1b03 exercises the three complex press events
+  // (short_press, long_press, double_click), each raising a different notification.
+  //
+  // `Clock` shows the time with a per-button `refresh` of 1 second and auto-returns
+  // home after 30 seconds via the scene `timer`; 1b02 returns immediately. `System`
+  // leaves 1b03 as a `clear` (blank) button and returns home on short or long press of
+  // its other buttons.
+  "version": "1.0",
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "CLOCK" },
+        "1b02": { "type": "text_value", "params": "SYSTM" },
+        "1b03": { "type": "text_value", "params": "CLICK" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@Clock" },
+        "1b02": { "short_press": "@System" },
+        // One button, three outcomes: tap, hold, and tap twice fire separately.
+        "1b03": {
+          "short_press": "/usr/bin/notify-send dak 'short press'",
+          "long_press": "/usr/bin/notify-send dak 'long press'",
+          "double_click": "/usr/bin/notify-send dak 'double click'"
+        }
+      }
+    },
+    "Clock": {
+      "setup": {
+        "1b01": {
+          "type": "text_exec",
+          "params": "/usr/bin/date +%H:%M:%S",
+          "refresh": 1
+        },
+        "1b02": { "type": "text_value", "params": "BACK" }
+      },
+      "actions": {
+        "1b01": { "long_press": "@on_start" },
+        "1b02": { "short_press": "@on_start" },
+        // Auto-return home half a minute after the clock is opened.
+        "timer": { "30": "@on_start" }
+      }
+    },
+    "System": {
+      "setup": {
+        "1b01": { "type": "text_exec", "params": "/usr/bin/uptime" },
+        "1b02": { "type": "text_exec", "params": "/usr/bin/uname -r" },
+        "1b03": { "type": "clear" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@on_start" },
+        "1b02": { "long_press": "@on_start" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}
