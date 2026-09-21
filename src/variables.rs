@@ -940,10 +940,35 @@ mod tests {
             variables.expand("$defaults.short_press_duration").unwrap(),
             "300"
         );
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "#000000");
+        assert_eq!(variables.expand("$defaults.text_color").unwrap(), "#ffffff");
         // A dot after a non-scope name is literal text, not a scope separator.
         assert_eq!(variables.expand("$name.png").unwrap(), "Bob.png");
         assert_eq!(variables.expand("$var.name.png").unwrap(), "Bob.png");
         assert_eq!(variables.expand("no reference").unwrap(), "no reference");
+    }
+
+    /// The default colours are seeded from `Defaults` and a setter updates both the
+    /// parsed colour and the text `$defaults.*` reads back.
+    #[test]
+    fn default_colours_are_seeded_and_settable() {
+        let defaults = Defaults {
+            background: crate::color::Color::parse("red").unwrap(),
+            text_color: crate::color::Color::parse("#00ff00").unwrap(),
+            ..Defaults::default()
+        };
+        let mut variables = Variables::new(BTreeMap::new(), &defaults);
+
+        assert_eq!(variables.background().channels(), [0xff, 0x00, 0x00]);
+        assert_eq!(variables.background().text(), "red");
+        assert_eq!(variables.text_color().channels(), [0x00, 0xff, 0x00]);
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "red");
+
+        variables.set_background(crate::color::Color::parse("blue").unwrap());
+        variables.set_text_color(crate::color::Color::parse("#000000").unwrap());
+        assert_eq!(variables.expand("$defaults.background").unwrap(), "blue");
+        assert_eq!(variables.background().channels(), [0x00, 0x00, 0xff]);
+        assert_eq!(variables.expand("$defaults.text_color").unwrap(), "#000000");
     }
 
     /// Backslash escapes a literal `$`/`\`, terminates a reference name, and is otherwise
@@ -1008,8 +1033,8 @@ mod tests {
         assert!(references_in("plain").unwrap().is_empty());
     }
 
-    /// `kind_of` reports declared types (defaults are all ints) and `None` for unknown
-    /// names.
+    /// `kind_of` reports declared types (the numeric defaults are ints, the colour
+    /// defaults str) and `None` for unknown names.
     #[test]
     fn kind_of_reports_declared_types() {
         let variables = test_variables();
@@ -1033,6 +1058,21 @@ mod tests {
                 name: "button_brightness".to_string()
             }),
             Some(VarType::Int)
+        );
+        // The colour defaults are string-like, so a str right-hand side is accepted.
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Defaults,
+                name: "background".to_string()
+            }),
+            Some(VarType::Str)
+        );
+        assert_eq!(
+            variables.kind_of(&VarRef {
+                scope: Scope::Defaults,
+                name: "text_color".to_string()
+            }),
+            Some(VarType::Str)
         );
         assert_eq!(
             variables.kind_of(&VarRef {

@@ -453,7 +453,8 @@ fn rejects_colour_on_wrong_setup_type() {
     }
 }
 
-/// A literal setup colour that is not a colour is a config-load error.
+/// A literal setup colour that is not a colour, or not a string at all, is a
+/// config-load error.
 #[test]
 fn rejects_invalid_literal_setup_colour() {
     let path = write_scenes_config(
@@ -463,6 +464,14 @@ fn rejects_invalid_literal_setup_colour() {
     let _ = std::fs::remove_file(&path);
     let errors = error_texts(config.unwrap_err());
     assert!(errors.contains("invalid colour"), "{errors}");
+
+    let path = write_scenes_config(
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": "hi", "text_color": 5}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("must be a colour string"), "{errors}");
 }
 
 /// A setup colour built from a `$` reference is not parsed at load; only the reference
@@ -1537,6 +1546,74 @@ fn validates_colour_assignments() {
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(&path);
     assert!(config.is_ok(), "{:?}", config.err());
+
+    // `~=` on a bad literal colour is silent: it loads with no error and no warning.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background ~= \"chartreuse\""}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let config = config.unwrap();
+    assert!(
+        !config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("colour")),
+        "~= on a bad literal colour is silent: {:?}",
+        config.warnings
+    );
+
+    // A colour target accepts a command substitution; its output is parsed when it runs.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.text_color := $(echo red)"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    // A variable reference that is not declared is still an error at load.
+    let path = write_scenes_config(
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.background := $missing"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("undefined variable"), "{errors}");
+}
+
+/// Brightness `defaults` targets are type-checked against a variable right-hand side:
+/// an int variable loads, a str variable and an undeclared name are errors.
+#[test]
+fn validates_brightness_default_assignments() {
+    let variables = r#"{"count": {"type": "int", "min": 0, "max": 100, "value": 5}, "name": {"type": "str", "value": "bright"}}"#;
+
+    let path = write_variables_config(
+        variables,
+        r#"{"on_start": {"actions": {"1b01": {"pressed": "$defaults.button_brightness := $count"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(config.is_ok(), "{:?}", config.err());
+
+    for (action, expected) in [
+        (
+            "$defaults.button_brightness := $name",
+            "which is a string, but it requires a number",
+        ),
+        (
+            "$defaults.button_brightness = $missing",
+            "references undefined variable",
+        ),
+    ] {
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{action}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(errors.contains(expected), "{action}: {errors}");
+    }
 }
 
 /// Variable assignments are type-checked and, for literals, range-checked at load time:

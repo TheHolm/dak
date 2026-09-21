@@ -274,6 +274,16 @@ fn green_png_bytes() -> Vec<u8> {
     png
 }
 
+/// Encodes a 4x4 fully transparent PNG (white under zero alpha), used as fake
+/// `image_exec` output to check compositing.
+fn transparent_png_bytes() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 0]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .expect("encoding png failed");
+    png
+}
+
 /// Writes `contents` to a unique temp file and returns its path.
 fn write_temp_text(contents: &str) -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -368,8 +378,41 @@ async fn transparent_image_uses_default_background() {
     runner.enter_scene("main", &scenes).await.unwrap();
 
     let image = mock.last_image(0).expect("image was not staged").to_rgb8();
-    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 0]);
+    assert_eq!(image.get_pixel(0, 0).0, [0x00, 0x00, 0x00]);
     let _ = std::fs::remove_file(&image_path);
+}
+
+/// `SceneRunner::set_text_color` changes the glyph colour used for the next text draw.
+#[tokio::test]
+async fn set_text_color_affects_next_draw() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+    runner.set_text_color(Color::parse("lime").unwrap());
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "M" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let image = mock.last_image(0).expect("image was not staged").to_rgb8();
+    assert!(
+        image
+            .pixels()
+            .any(|p| p.0[1] > 200 && p.0[0] < 60 && p.0[2] < 60),
+        "expected a lime glyph pixel"
+    );
 }
 
 /// A per-button `background` overrides the global default for that button's transparent
@@ -844,6 +887,89 @@ async fn image_exec_output_drawn_on_button() {
     let image = mock.last_image(1).expect("output image was not staged");
     assert_eq!(image.dimensions(), (60, 60));
     assert_eq!(image.to_rgb8().get_pixel(30, 30).0, [10, 200, 30]);
+}
+
+/// An `image_exec` result is composited onto the button's configured background, so a
+/// transparent program output does not show the white hidden under the alpha.
+#[tokio::test]
+async fn image_exec_output_uses_configured_background() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b02": { "type": "image_exec", "params": "sleep 10", "background": "#ff0000" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: transparent_png_bytes(),
+        })
+        .await;
+
+    let image = mock
+        .last_image(1)
+        .expect("output image was not staged")
+        .to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0xff, 0x00, 0x00]);
+}
+
+/// A `text_exec` result is drawn with the button's configured background and text
+/// colour.
+#[tokio::test]
+async fn text_exec_output_uses_configured_colours() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+
+    let scenes = scenes_with_buttons(json!({
+        "1b02": { "type": "text_exec", "params": "sleep 10", "background": "#0000ff", "text_color": "#00ff00" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Text,
+            stdout: b"M\n".to_vec(),
+        })
+        .await;
+
+    let image = mock.last_image(1).expect("output was not staged").to_rgb8();
+    assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255]);
+    assert!(
+        image
+            .pixels()
+            .any(|p| p.0[1] > 200 && p.0[0] < 60 && p.0[2] < 60),
+        "expected a green glyph pixel"
+    );
 }
 
 /// A current-generation `image_exec` program not emitting an image draws "Error".

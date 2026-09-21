@@ -562,9 +562,58 @@ fn scene_operations_accept_encoder_references() {
             reference: Reference::encoder(2, 1),
             path: "/tmp/notes.txt".to_string(),
             refresh_seconds: 0,
-
             background: None,
             text_color: None,
         }]
     );
+}
+
+/// Per-button `background`/`text_color` setup fields are read into the resolved
+/// operation, so the runner can apply them (the runner parses the strings at draw time).
+#[test]
+fn scene_operations_extract_colour_overrides() {
+    let scenes = json!({
+        "on_start": {
+            "setup": {
+                "1b01": { "type": "image", "params": "/tmp/x.png", "background": "#112233" },
+                "1b02": { "type": "text_value", "params": "hi", "background": "navy", "text_color": "lime" }
+            }
+        }
+    });
+    let operations = scene_operations("on_start", &scenes).unwrap();
+    assert_eq!(
+        operations,
+        vec![
+            SceneOp::SetImage {
+                reference: Reference::button(1, 1),
+                path: "/tmp/x.png".to_string(),
+                refresh_seconds: 0,
+                background: Some("#112233".to_string()),
+            },
+            SceneOp::TextValue {
+                reference: Reference::button(1, 2),
+                text: "hi".to_string(),
+                refresh_seconds: 0,
+                background: Some("navy".to_string()),
+                text_color: Some("lime".to_string()),
+            },
+        ]
+    );
+}
+
+/// A `$` reference in a setup colour is expanded when the scene is planned; with no
+/// variables available (the variable-free `scene_operations`) that is an error, and the
+/// message names the field.
+#[test]
+fn scene_operations_reject_unresolvable_colour_reference() {
+    let scenes = json!({
+        "on_start": {
+            "setup": {
+                "1b01": { "type": "image", "params": "/tmp/x.png", "background": "$missing" }
+            }
+        }
+    });
+    let error = scene_operations("on_start", &scenes).unwrap_err();
+    assert!(error.contains("undefined variable"), "{error}");
+    assert!(error.contains("background"), "{error}");
 }

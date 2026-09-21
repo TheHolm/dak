@@ -215,6 +215,13 @@ mod tests {
         assert_eq!(colour.text(), "#ff0010");
     }
 
+    /// `to_rgb` returns the parsed channels as an `image` RGB pixel.
+    #[test]
+    fn to_rgb_returns_channels() {
+        assert_eq!(Color::parse("red").unwrap().to_rgb().0, [0xff, 0x00, 0x00]);
+        assert_eq!(Color::rgb(0x12, 0x34, 0x56).to_rgb().0, [0x12, 0x34, 0x56]);
+    }
+
     /// Equality compares channels, not the spelling of the source text.
     #[test]
     fn equality_ignores_source_text() {

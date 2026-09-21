@@ -1234,7 +1234,7 @@ fn validate_command_rhs(
 ///
 /// A brightness parameter is numeric (an int, an int variable or a command); a colour
 /// parameter is string-like and must parse as a colour. A literal colour is checked here
-/// - a bad one is an error under `=`, a warning under `:=` and silent under `~=` - while
+/// (a bad one is an error under `=`, a warning under `:=` and silent under `~=`), while
 /// a variable/command colour can only be checked for its references and is parsed when
 /// the action fires.
 fn check_default_assignment(
@@ -1998,6 +1998,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// assignment to them is skipped with a warning (see [`SceneRunner`]).
     /// `background`/`text_color` are the global default button colours (see
     /// [`SceneRunner::set_background`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_number: u8,
         device: &'a D,
@@ -2080,13 +2081,12 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
 
     /// The background colour for `key`: the button's active per-button override when it
     /// has one, otherwise the global default. Used for async (`*_exec`) results, whose
-    /// operation is looked up from [`SceneRunner::active_setup`].
+    /// operation is looked up from [`SceneRunner::active_setup`] - only the two exec
+    /// variants can be active when an exec result arrives, a stale one having been
+    /// dropped by the tracker's generation check.
     fn active_background(&self, key: u8) -> Color {
         let text = match self.active_setup.get(&key) {
-            Some(SceneOp::SetImage { background, .. })
-            | Some(SceneOp::ImageExec { background, .. })
-            | Some(SceneOp::Text { background, .. })
-            | Some(SceneOp::TextValue { background, .. })
+            Some(SceneOp::ImageExec { background, .. })
             | Some(SceneOp::TextExec { background, .. }) => background.as_deref(),
             _ => None,
         };
@@ -2097,9 +2097,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// one, otherwise the global default. See [`SceneRunner::active_background`].
     fn active_text_color(&self, key: u8) -> Color {
         let text = match self.active_setup.get(&key) {
-            Some(SceneOp::Text { text_color, .. })
-            | Some(SceneOp::TextValue { text_color, .. })
-            | Some(SceneOp::TextExec { text_color, .. }) => text_color.as_deref(),
+            Some(SceneOp::TextExec { text_color, .. }) => text_color.as_deref(),
             _ => None,
         };
         self.draw_colour(key, "text_color", text, &self.text_color)
@@ -4860,6 +4858,37 @@ mod tests {
         assert_eq!(variables.button_brightness(), 100);
     }
 
+    /// `SettableDefault`'s colour helpers: the dotted path, `is_colour`, and the
+    /// configured default colour each colour parameter resets to.
+    #[test]
+    fn settable_default_reports_colour_parameters() {
+        let defaults = crate::press::Defaults::default();
+        assert_eq!(
+            super::SettableDefault::Background.path(),
+            "defaults.background"
+        );
+        assert_eq!(
+            super::SettableDefault::TextColor.path(),
+            "defaults.text_color"
+        );
+        assert!(super::SettableDefault::Background.is_colour());
+        assert!(super::SettableDefault::TextColor.is_colour());
+        assert!(!super::SettableDefault::ButtonBrightness.is_colour());
+        assert!(!super::SettableDefault::EncoderBrightness.is_colour());
+        assert_eq!(
+            super::SettableDefault::Background
+                .default_colour(&defaults)
+                .text(),
+            "#000000"
+        );
+        assert_eq!(
+            super::SettableDefault::TextColor
+                .default_colour(&defaults)
+                .text(),
+            "#ffffff"
+        );
+    }
+
     /// `apply_assignment` stores a valid colour default and reports the colour side
     /// effect, keeping the source text for reads.
     #[test]
@@ -4939,6 +4968,62 @@ mod tests {
                 variables.loaded_defaults().background.clone()
             ))
         );
+
+        // A bare number is not a colour, so even a non-strict operator leaves the value
+        // unchanged (config-load validation rejects this case outright).
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Int(5),
+                &mut variables,
+                false,
+                log,
+            ),
+            None
+        );
+        assert_eq!(
+            variables.background(),
+            &variables.loaded_defaults().background
+        );
+
+        // `~=` on an invalid literal is silent but still resets to the configured
+        // default (a colour has no range to clamp into).
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::Background),
+                super::AssignOp::ClampSilent,
+                &super::AssignRhs::Str("chartreuse".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            Some(super::DefaultEffect::Color(
+                super::SettableDefault::Background,
+                variables.loaded_defaults().background.clone()
+            ))
+        );
+    }
+
+    /// A non-numeric scalar for a numeric default is rejected under every operator, since
+    /// a wrong-type right-hand side is never acceptable (config validation catches the
+    /// literal case before this ever runs).
+    #[test]
+    fn apply_assignment_rejects_non_numeric_scalar_for_brightness() {
+        let log = crate::log::Log::default();
+        let mut variables = assignment_variables();
+        assert_eq!(
+            super::apply_assignment(
+                &super::AssignTarget::Default(super::SettableDefault::ButtonBrightness),
+                super::AssignOp::ClampWarn,
+                &super::AssignRhs::Str("bright".to_string()),
+                &mut variables,
+                false,
+                log,
+            ),
+            None
+        );
+        assert_eq!(variables.button_brightness(), 50);
     }
 
     /// A colour read from a variable is dynamic, so even `=` is handled leniently: an
@@ -5225,7 +5310,54 @@ mod tests {
         );
     }
 
-    /// `default_value` returns the fallback for both conversion kinds.
+    /// `convert_output` parses a colour target's first non-empty line (trimmed), keeping
+    /// the source text, and treats a bad colour leniently: `=` warns and falls back to
+    /// the configured default rather than failing, exactly like `:=`/`~=`.
+    #[test]
+    fn convert_output_converts_colour_output() {
+        let log = crate::log::Log::default();
+        let conversion = super::Conversion::Color {
+            default: crate::color::Color::parse("black").unwrap(),
+        };
+        assert_eq!(
+            super::convert_output(
+                "\n  red \nignored\n",
+                &conversion,
+                super::AssignOp::Strict,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("red".to_string())
+        );
+        assert_eq!(
+            super::convert_output(
+                "chartreuse",
+                &conversion,
+                super::AssignOp::Strict,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("black".to_string()),
+            "= on a bad colour is lenient and uses the default"
+        );
+        assert_eq!(
+            super::convert_output(
+                "",
+                &conversion,
+                super::AssignOp::ClampSilent,
+                "defaults.background",
+                log
+            )
+            .unwrap(),
+            crate::variables::VarValue::Str("black".to_string()),
+            "empty output falls back silently"
+        );
+    }
+
+    /// `default_value` returns the fallback for all three conversion kinds, including a
+    /// colour (whose fallback is the configured colour's text).
     #[test]
     fn default_value_matches_conversion_kind() {
         assert_eq!(
@@ -5242,6 +5374,38 @@ mod tests {
                 default: "x".to_string()
             }),
             crate::variables::VarValue::Str("x".to_string())
+        );
+        assert_eq!(
+            super::default_value(&super::Conversion::Color {
+                default: crate::color::Color::parse("black").unwrap()
+            }),
+            crate::variables::VarValue::Str("black".to_string())
+        );
+    }
+
+    /// `prepare_command_assignment` builds a colour conversion (defaulting to the
+    /// configured background) for a colour default, leaving the command line to run.
+    #[test]
+    fn prepare_command_assignment_builds_colour_conversion() {
+        let variables = assignment_variables();
+        let (conversion, spec, label) = super::prepare_command_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::Background),
+            "echo red",
+            &variables,
+        )
+        .unwrap();
+        assert_eq!(label, "defaults.background");
+        assert_eq!(
+            spec,
+            super::CommandSpec {
+                program: "echo".to_string(),
+                args: vec!["red".to_string()],
+            }
+        );
+        assert_eq!(
+            super::default_value(&conversion),
+            crate::variables::VarValue::Str("#000000".to_string()),
+            "the fallback is the configured background's text"
         );
     }
 

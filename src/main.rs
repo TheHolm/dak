@@ -1160,7 +1160,7 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::sync::mpsc;
 
-    use dak::actions::{ButtonDevice, SceneRunner};
+    use dak::actions::{AssignTarget, ButtonDevice, CompletedAssign, SceneRunner, SettableDefault};
     use dak::cli::Cli;
     use dak::hardware;
     use dak::log::Log;
@@ -1932,6 +1932,35 @@ mod tests {
         assert_eq!(mock.last_encoder_brightness(), None);
     }
 
+    /// A `$defaults.text_color := "#00ff00"` action stores the new colour in the shared
+    /// state, exercising the text-colour side of `apply_colour_default`.
+    #[tokio::test]
+    async fn run_action_set_config_calls_set_text_color() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "$defaults.text_color := \"#00ff00\"",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        let variables = state.variables.lock().unwrap();
+        assert_eq!(variables.text_color().text(), "#00ff00");
+        assert_eq!(variables.text_color().channels(), [0x00, 0xff, 0x00]);
+    }
+
     /// A `$defaults.background = "bad"` action with an invalid colour is rejected at
     /// runtime (logged, value unchanged), matching every other strict `=` assignment.
     #[tokio::test]
@@ -1959,6 +1988,196 @@ mod tests {
         // The value is unchanged and nothing was pushed to the device.
         let variables = state.variables.lock().unwrap();
         assert_eq!(variables.background().text(), "#000000");
+    }
+
+    /// A finished `$(command)` colour assignment stores the converted colour (the
+    /// command-substitution completion path, distinct from a literal assignment).
+    #[tokio::test]
+    async fn apply_completed_assignment_sets_colour() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::TextColor),
+                outcome: Ok(VarValue::Str("#00ff00".to_string())),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(
+            state.variables.lock().unwrap().text_color().text(),
+            "#00ff00"
+        );
+        assert_eq!(mock.last_button_brightness(), None);
+    }
+
+    /// A finished assignment whose converted value is the wrong type for its target is
+    /// logged and discarded, leaving the stored colour unchanged.
+    #[tokio::test]
+    async fn apply_completed_assignment_rejects_non_colour_value() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::Background),
+                outcome: Ok(VarValue::Int(5)),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(
+            state.variables.lock().unwrap().background().text(),
+            "#000000"
+        );
+    }
+
+    /// A colour assignment whose value does not parse as a colour is logged and
+    /// discarded without changing the stored value.
+    #[tokio::test]
+    async fn apply_completed_assignment_ignores_bad_colour_text() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::Background),
+                outcome: Ok(VarValue::Str("chartreuse".to_string())),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(
+            state.variables.lock().unwrap().background().text(),
+            "#000000"
+        );
+    }
+
+    /// A finished `$(command)` brightness assignment stores the converted number and
+    /// pushes it to the device.
+    #[tokio::test]
+    async fn apply_completed_assignment_sets_brightness() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::ButtonBrightness),
+                outcome: Ok(VarValue::Int(73)),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(state.variables.lock().unwrap().button_brightness(), 73);
+        assert_eq!(mock.last_button_brightness(), Some(73));
+    }
+
+    /// A finished assignment to the background colour parameter stores it (the other
+    /// colour arm of the completion path).
+    #[tokio::test]
+    async fn apply_completed_assignment_sets_background_colour() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::Background),
+                outcome: Ok(VarValue::Str("navy".to_string())),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(state.variables.lock().unwrap().background().text(), "navy");
+    }
+
+    /// A finished encoder-brightness assignment reaches `set_led_brightness`; if the
+    /// device refuses the write the failure is logged, not propagated.
+    #[tokio::test]
+    async fn apply_completed_assignment_pushes_encoder_brightness() {
+        let mock = MockButtonDevice::default();
+        mock.fail_brightness_calls(true);
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::EncoderBrightness),
+                outcome: Ok(VarValue::Int(21)),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(state.variables.lock().unwrap().encoder_brightness(), 21);
+        assert_eq!(mock.last_encoder_brightness(), None);
+    }
+
+    /// A finished assignment whose converted value is the wrong type for a brightness
+    /// target is logged and discarded.
+    #[tokio::test]
+    async fn apply_completed_assignment_rejects_non_numeric_value() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::ButtonBrightness),
+                outcome: Ok(VarValue::Str("bright".to_string())),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(state.variables.lock().unwrap().button_brightness(), 50);
+        assert_eq!(mock.last_button_brightness(), None);
+    }
+
+    /// A failed strict command assignment is logged and changes nothing.
+    #[tokio::test]
+    async fn apply_completed_assignment_logs_strict_failure() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let state = EdgeState::new(Defaults::default());
+
+        super::apply_completed_assignment(
+            CompletedAssign {
+                target: AssignTarget::Default(SettableDefault::ButtonBrightness),
+                outcome: Err("command failed".to_string()),
+            },
+            &state.variables,
+            &mut runner,
+            Log::default(),
+        )
+        .await;
+
+        assert_eq!(state.variables.lock().unwrap().button_brightness(), 50);
+        assert_eq!(mock.last_button_brightness(), None);
     }
 
     /// When the device rejects a `$defaults.button_brightness := N` write, the

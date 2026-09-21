@@ -344,4 +344,15 @@ mod tests {
     fn defaults() -> Defaults {
         Defaults::default()
     }
+
+    /// The built-in colours are a black background and white text, matching the device's
+    /// own screen and the text renderer's previous fixed look.
+    #[test]
+    fn default_colours_are_black_background_white_text() {
+        let defaults = Defaults::default();
+        assert_eq!(defaults.background.channels(), [0x00, 0x00, 0x00]);
+        assert_eq!(defaults.background.text(), "#000000");
+        assert_eq!(defaults.text_color.channels(), [0xff, 0xff, 0xff]);
+        assert_eq!(defaults.text_color.text(), "#ffffff");
+    }
 }
