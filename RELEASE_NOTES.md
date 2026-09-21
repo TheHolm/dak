@@ -5,7 +5,7 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
-## v0.10.1 — Man pages, richer `--help`, and stricter event validation
+## v0.10.1 — Man pages, richer `--help`, stricter event validation, and worked examples
 
 ### User-facing changes
 - New `dak(1)` and `dak-config(5)` man pages, shipped in the Debian/Ubuntu
@@ -19,6 +19,10 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
 - An event name a control does not support (e.g. a typo like `short_pres`, or
   a rotation event on a button) is now a config-load error instead of a
   binding that silently never fires.
+- Seven new worked example configs, each illustrating one feature area (scene
+  carry-over, media control, scene navigation, push-to-talk, launcher with
+  icons, counters/modes, and a press scene preview), indexed in
+  `examples/EXAMPLES.md`.
 - The README and INSTALL documents now point at the man pages.
 - Version bumped to `0.10.1`.
 
@@ -54,6 +58,12 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   `.woodpecker/release.yaml` now also assert the pages are present in the
   built artifact, so a package that silently drops them fails the release.
 - README/INSTALL updated to advertise the pages.
+- Added seven complete example configs under `examples/`
+  (`scene-carry-over.json`, `media-control.json`, `scene-navigation.json`,
+  `push-to-talk.json`, `launcher-with-icons.json`, `counter-and-modes.json`,
+  `press-scene-preview.json`), indexed by `examples/EXAMPLES.md`; the existing
+  `example_configs_load` test in `tests/validation.rs` keeps every file
+  loadable.
 
 ## v0.10.0 — Config variables: declared values, assignment, and command substitution in actions and scene params
 
