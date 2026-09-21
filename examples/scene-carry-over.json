@@ -1,0 +1,78 @@
+{
+  // Scene changes are not a clean slate: a scene only replaces what it explicitly
+  // defines. This config makes that visible.
+  //
+  // Content: `on_start` fills all six screen buttons. `Alt` redefines only 1b01 and
+  // clears 1b03; 1b02, 1b04, 1b05 and 1b06 keep whatever `on_start` put there.
+  //
+  // Actions: `Alt` binds only 1b01 (back) and 1b02 (a different message). 1b03, 1b04
+  // and 1b05 have no actions of their own in `Alt`, so they keep running the `on_start`
+  // bindings they were last given, while 1b02's binding is replaced.
+  //
+  // Press 1b01 to toggle between the two scenes and watch which buttons change.
+  "version": "1.0",
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "HOME1" },
+        "1b02": { "type": "text_value", "params": "HOME2" },
+        "1b03": { "type": "text_value", "params": "HOME3" },
+        "1b04": { "type": "text_value", "params": "HOME4" },
+        "1b05": { "type": "text_value", "params": "HOME5" },
+        "1b06": { "type": "text_value", "params": "HOME6" }
+      },
+      "actions": {
+        // 1b01 is the only button whose action Alt overrides (to go back).
+        "1b01": { "short_press": "@Alt" },
+        // These three keep firing while Alt is active, because Alt never rebinds them.
+        "1b02": { "short_press": "/usr/bin/notify-send dak '1b02: on_start binding'" },
+        "1b03": { "short_press": "/usr/bin/notify-send dak '1b03: on_start binding'" },
+        "1b04": { "short_press": "/usr/bin/notify-send dak '1b04: on_start binding'" },
+        "1b05": { "short_press": "/usr/bin/notify-send dak '1b05: on_start binding'" }
+      }
+    },
+    "Alt": {
+      "setup": {
+        // Only these two entries change anything; every other button carries its
+        // on_start content (and refresh, if it had one) straight into Alt.
+        "1b01": { "type": "text_value", "params": "ALT1" },
+        "1b03": { "type": "clear" }
+      },
+      "actions": {
+        // Redefining 1b01 and 1b02 replaces their on_start bindings; leaving 1b03,
+        // 1b04 and 1b05 out inherits the on_start bindings for them.
+        "1b01": { "short_press": "@on_start" },
+        "1b02": {
+          "short_press": "/usr/bin/notify-send dak '1b02: Alt binding (overwrote on_start)'"
+        }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}
