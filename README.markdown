@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/dak-logo.png" alt="DAK logo" width="180">
+</p>
+
 # DAK — Dynamic Ajazz Keyboard
 
 **DAK** (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`). Several other Ajazz/Mirabox-branded devices are wired up the same way and have a good chance of working out of the box even though nobody has confirmed them yet - see [Help me support more devices](#help-me-support-more-devices) for the full list and how verified each one is. Project is loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)

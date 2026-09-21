@@ -54,6 +54,35 @@
    array's index order and the physical/logical encoder numbering used elsewhere
    (`turn_cw`/`turn_ccw`/push references) is unconfirmed - a brute-force sweep setting
    one color-array index at a time across a wide range found no visible correlation
-   before the sweep was cut short by the device repeatedly dropping off USB when
-   hammered with this command. Needs a real unit with working encoder LEDs to
-   properly map and add this safely.
+    before the sweep was cut short by the device repeatedly dropping off USB when
+    hammered with this command. Needs a real unit with working encoder LEDs to
+    properly map and add this safely.
+8. Named pipes (FIFOs) as a button image/text source. Today `image`/`text` read a
+   regular file once on scene entry/refresh (`read_text_file_bounded`, `image::open`)
+   and `image_exec`/`text_exec` spawn a short-lived command and capture its stdout,
+   so an external producer must either rewrite a file and rely on `refresh`, or be
+   re-run each update. A long-lived FIFO would let one producer push updates on its
+   own schedule: `dak` opens it and redraws whenever a writer connects/writes. Open
+   questions to design: avoid blocking startup and spurious EOF between writers
+   (`O_RDWR`/`O_NONBLOCK`), per-write chunk bounding and decoding for images,
+   whether this is a new setup type (`image_fifo`/`text_fifo`) or an extension of
+   the existing `refresh`, and cleanup of the FIFO reader task on scene change.
+   FIFOs are POSIX, so both target platforms are covered.
+9. Signal-driven control: reload the config on `SIGHUP` and optionally run an action
+   (or switch scenes) on `SIGUSR1`/`SIGUSR2`. Only `tokio::signal::ctrl_c()` is
+   handled today; the config is read once at startup and never re-read. A reload
+   must re-validate and diff the new config against live state (connected devices,
+   active scene, running `image_exec`/`text_exec` tasks, armed timers, variables),
+   decide the semantics - preserve the current scene/variables vs. reset - and
+   decide what to do when the new config fails validation (keep running the old one
+   and log the errors). `SIGUSR1`/`SIGUSR2` mapping to a named action overlaps with
+   the existing scene/timer machinery and may be the simpler half to land first.
+   Design-heavy and it interacts with the input/timer loop, so it needs care around
+   reload races.
+10. D-Bus integration to watch and/or submit events (probably not). Would expose
+    button/encoder events on the session bus and/or let `dak` react to other
+    applications' signals (e.g. show now-playing). Adds a dependency (`zbus`/`dbus`),
+    a whole IPC surface and a schema to design and maintain, while most concrete
+    uses are already reachable by composing commands with the existing events - e.g.
+    `playerctl`/`dbus-send` in a `text_exec` or action. Noted as "probably not";
+    revisit only if a wanted use case genuinely cannot be covered by shelling out.
