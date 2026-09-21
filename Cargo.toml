@@ -1,6 +1,6 @@
 [package]
 name = "dak"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"
@@ -9,6 +9,16 @@ description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button i
 # still copies the full text from ./LICENSE into the .deb's debian/copyright.
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/theholm/dak"
+
+# `$auto` keeps cargo-deb's implicit assets (the `dak` binary) and the two man
+# pages are added on top of it, at the paths Debian's man(7) expects. cargo-deb
+# compresses anything under usr/share/man/ itself, per Debian policy.
+[package.metadata.deb]
+assets = [
+    "$auto",
+    { source = "man/dak.1", dest = "usr/share/man/man1/dak.1", mode = "644" },
+    { source = "man/dak-config.5", dest = "usr/share/man/man5/dak-config.5", mode = "644" },
+]
 
 [dependencies]
 chrono = { version = "0.4" }
@@ -19,6 +29,15 @@ serde_json = { version = "1.0.150"}
 serde = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 clap = { version = "4", features = ["derive"] }
+
+# Only used by tests/man_pages.rs to render man/dak.1 from the clap definition in
+# src/cli.rs, so the committed man page cannot drift from the real flags. Dev-only:
+# the shipped binary does not link it. Deliberately not version-pinned - the test
+# compares the generated and committed pages semantically (normalized tokens), not
+# byte-for-byte, so a newer clap_mangen/roff that only changes escaping or wrapping
+# does not spuriously fail. Regenerate with the ignored test in tests/man_pages.rs.
+[dev-dependencies]
+clap_mangen = "0.3"
 
 # HID device access. Every platform but FreeBSD uses the real, unmodified crates.io
 # releases. FreeBSD gets a local fork (vendor/) that adds a `hidraw(4)`-based backend

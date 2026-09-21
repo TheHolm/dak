@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,34 +19,12 @@ use tokio::sync::mpsc;
 
 use dak::actions::{self, Action};
 use dak::baseplane::Reference;
+use dak::cli::Cli;
 use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
 use dak::variables::{VarValue, Variables};
-
-/// Command-line arguments for DAK (Dynamic Ajazz Keyboard), parsed by clap.
-#[derive(Debug, Parser)]
-#[command(
-    name = "dak",
-    about = "DAK (Dynamic Ajazz Keyboard): controls an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config"
-)]
-struct Cli {
-    /// Path to the config file. When omitted, `config.json` is searched for in
-    /// `~/.config/dak/`, then the current directory, then the binary directory.
-    #[arg(short = 'c', long)]
-    config: Option<PathBuf>,
-
-    /// Debug subsystems to enable: device, scene, action.
-    #[arg(short = 'd', long, value_delimiter = ',', num_args = 1..)]
-    debug: Vec<String>,
-
-    /// Run the interactive device-mapping wizard instead of normal operation:
-    /// no config is read and no actions run; the wizard prints the collected
-    /// device mapping as JSON and exits.
-    #[arg(long)]
-    map: bool,
-}
 
 /// Loads the config, matches the config's `devices` definitions against the discovered
 /// hardware, and drives every present device: each connects with its own key/encoder
@@ -1120,10 +1097,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     use dak::actions::{ButtonDevice, SceneRunner};
+    use dak::cli::Cli;
     use dak::hardware;
     use dak::log::Log;
 
-    use super::{Cli, ClickDetector, ClickEvent, Defaults, Reference, VarValue, Variables};
+    use super::{ClickDetector, ClickEvent, Defaults, Reference, VarValue, Variables};
 
     /// A tiny recording keypad for the dispatch-layer tests: scene `setup` operations
     /// that reach the device are recorded so a test can see which scene was applied.

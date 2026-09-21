@@ -1,0 +1,645 @@
+.\" Man page for the dak configuration file. See man(7) and groff_man(7).
+.TH DAK-CONFIG 5 "2026-09-20" "dak 0.10.1" "File Formats"
+.SH NAME
+dak\-config \- configuration file format for
+.BR dak (1)
+.SH DESCRIPTION
+.B dak
+is driven entirely by a JSON configuration file, conventionally named
+.IR config.json .
+The file describes one or more devices and a set of scenes; a scene assigns
+content to the button screens and binds actions to button presses, encoder
+turns and timers.
+.PP
+JSON has no comment syntax, but
+.B dak
+strips comments before parsing, so both
+.B //
+line comments and
+.B /* ... */
+block comments may appear anywhere the JSON grammar allows whitespace.
+Comment markers inside a string are part of the string value.
+.SH "TOP\-LEVEL STRUCTURE"
+The top level is a JSON object with up to five keys, all optional:
+.TP
+.B version
+A config schema version string, defaulting to
+.BR "1.0" .
+It is not currently interpreted (there is only one schema so far); it is
+printed on startup so future schema changes have somewhere to record which
+shape a file was written for.
+.TP
+.B variables
+Declared, typed values that actions and setup parameters read and assign. See
+.B VARIABLES
+below.
+.TP
+.B defaults
+Press\-detection timing knobs and connect\-time brightness levels. See
+.B DEFAULTS
+below.
+.TP
+.B scenes
+The scenes dictionary, including the special
+.B on_start
+scene. See
+.B SCENES
+below.
+.TP
+.B devices
+The individual device definitions, keyed by logical device id. The
+.B \-\-map
+wizard of
+.BR dak (1)
+prints one definition in exactly this shape. See
+.B DEVICES
+below.
+.SH DEFAULTS
+The optional
+.B defaults
+object tunes press detection and the brightness applied when a device
+connects. Every key is optional and falls back to its built\-in value.
+.nf
+.RS 4
+"defaults": {
+  "short_press_duration": 300,
+  "double_click_gap": 300,
+  "button_brightness": 50,
+  "encoder_brightness": 50
+}
+.RE
+.fi
+.TP
+.B short_press_duration
+Milliseconds (default
+.BR 300 ).
+A press released at most this long after it started is a
+.BR short_press ;
+a press held longer is a
+.BR long_press .
+.TP
+.B double_click_gap
+Milliseconds (default
+.BR 300 ).
+Two presses form a
+.B double_click
+when the second lands within this long of the previous release.
+.TP
+.B button_brightness
+Percent
+.B 0
+to
+.B 100
+(default
+.BR 50 ),
+applied to every device's button/screen LCDs when it connects.
+.TP
+.B encoder_brightness
+Percent
+.B 0
+to
+.B 100
+(default
+.BR 50 ),
+applied to every device's encoder LED ring when it connects. Some units have
+no functioning encoder LEDs; the value is sent regardless.
+.SH VARIABLES
+The optional
+.B variables
+object declares named values that actions and scene setup parameters read and
+assign. Variables are global: one set shared by every device and every scene,
+initialized once at startup. Every variable must be declared; referencing an
+undeclared one is a config\-load error.
+.nf
+.RS 4
+"variables": {
+  "count": { "type": "int", "min": 0, "max": 100, "value": 10 },
+  "label": { "type": "str", "max_length": 8, "value": "hello" },
+  "plain": { "type": "int" }
+}
+.RE
+.fi
+.PP
+In each entry the key is the variable name, which must start with a letter and
+contain only letters, digits and underscores. The names
+.BR var ,
+.BR defaults ,
+.BR version ,
+.B scenes
+and
+.B devices
+are reserved and cannot be declared.
+.TP
+.B type
+Required. Either
+.B int
+(a 32\-bit signed integer) or
+.B str
+(a variable\-length unicode string).
+.TP
+.B min ", " max
+Integer variables only, optional and inclusive. They default to the full
+32\-bit range and bound an assigned value.
+.TP
+.B max_length
+String variables only, optional. Defaults to
+.B 255
+and may be at most
+.BR 65535 ;
+an assigned string is truncated to it.
+.TP
+.B value
+Optional. The value the variable starts with, defaulting to
+.B 0
+or the empty string. A value outside the declared range or of the wrong type
+is a hard config error.
+.PP
+Unknown keys and type\-inappropriate parameters (for example
+.B min
+on a
+.BR str )
+are hard config errors.
+.SS "Reading a variable"
+A
+.B $
+starts a reference.
+.B $name
+reads a declared variable;
+.B $var.name
+is the same thing written with its explicit scope (the
+.B var
+scope is the default). The form
+.B $defaults.<name>
+reads a
+.B defaults
+parameter
+.RB ( button_brightness ,
+.BR encoder_brightness ,
+.BR short_press_duration ,
+.BR double_click_gap ;
+all int), reflecting any runtime changes.
+.PP
+References are substituted in every action string, in setup
+.B params
+and in the
+.B timer
+seconds key, and are resolved when the value is actually used, so they always
+see the current value. An int renders as its decimal digits; a str is inserted
+verbatim, with no quotes added.
+.PP
+A name is greedy:
+.B $name_kun
+reads
+.BR name_kun .
+Escape the next character with a backslash to end it:
+.B $name\e-kun
+is the value of
+.B name
+followed by
+.BR \-kun .
+A backslash before a dollar sign,
+.BR \e$ ,
+is a literal dollar sign, and
+.BR \e\e
+is a literal backslash; any other backslash is left alone for the command
+tokenizer. A
+.B $
+not followed by a variable name is a config error.
+.PP
+Because a dollar sign always starts a reference, a literal dollar sign in a
+command must be written
+.BR \e$ .
+This is a change from configs written before variables existed, where a shell
+.B $VAR
+was passed through unchanged.
+.SS "Assigning to a variable"
+An action value of the form
+.B "$<target> <op> <rhs>"
+assigns:
+.TP
+.B <target>
+A declared variable (or
+.BR var.name ),
+or one of the writable
+.B defaults
+parameters
+.B button_brightness
+or
+.BR encoder_brightness .
+The read\-only timing parameters cannot be assigned.
+.TP
+.B <op>
+.B :=
+clamps or truncates and warns,
+.B ~=
+does the same silently, and
+.B =
+rejects an out\-of\-range or over\-long value.
+.TP
+.B <rhs>
+An integer literal, a
+.B "quoted string"
+(which is a string even where a number is expected), another variable
+.RB ( $b ),
+or a
+.B $(command)
+substitution.
+.PP
+An int is clamped into its
+.B min
+to
+.B max
+range, a str is truncated to its
+.BR max_length ,
+and a wrong\-type right\-hand side is always a config error. With
+.B ":= / ~=,"
+the target's declared default is used when the value cannot be applied, with a
+warning for
+.BR := .
+Assignments write runtime state only;
+.I config.json
+is never modified.
+.SS "Command substitution"
+.B $(command)
+runs when the action fires and converts the output to the target's type: an
+int target parses the first non\-empty line (trimmed) and clamps it; a str
+target takes the whole output with trailing newlines stripped and truncates it.
+For
+.BR = ,
+an unconvertible output, a non\-zero exit or a timeout is an error and the
+variable is left unchanged; for
+.B :=
+and
+.BR ~= ,
+the target's default is used instead.
+.SH SCENES
+The
+.B scenes
+object maps scene names to scene definitions. A scene name can be any text;
+the special name
+.B on_start
+is reserved and runs when the program starts.
+.PP
+Each scene has two reserved keys:
+.B setup
+(what the buttons show) and
+.B actions
+(what the controls do). A missing key means "empty". Button content from the
+previous scene is kept for any button the new scene does not mention in
+.BR setup .
+.SS "Control references"
+Buttons and encoders are addressed by references of the form
+.IR <device><b|e><number> :
+.IP \(bu 2
+.I <device>
+is a single digit
+.B 1
+to
+.B 9
+naming a logical device, matching a key under
+.BR devices .
+.IP \(bu 2
+.B b
+addresses a button, and
+.B e
+addresses an encoder.
+.IP \(bu 2
+.I <number>
+is the control number, always written with two digits,
+.B 01
+to
+.BR 99 .
+.PP
+For example,
+.B 1b01
+is button 1 on device 1 and
+.B 2e01
+is encoder 1 on device 2.
+.PP
+References to devices not present are skipped at runtime with a warning.
+Encoder references work in
+.B actions
+but not in
+.BR setup :
+a setup entry on an
+.B e
+key is a config error. Assigning an image to a button without a display is
+skipped at runtime with a warning, and out\-of\-range control numbers are
+skipped with a warning.
+.SS "setup"
+The
+.B setup
+object maps a control reference to an object with a
+.B type
+and
+.BR params ,
+plus an optional
+.BR refresh .
+.TP
+.B image
+.IB params " is a path"
+to an image file to load onto the button.
+.TP
+.B image_exec
+.I params
+is a command run asynchronously whose stdout must be a valid image file. If it
+does not finish within 5 seconds, or the button is changed in the meantime,
+the process is killed, an error is logged, and the button shows the text
+.B Error
+in red.
+.TP
+.B text
+.I params
+is a path to a file; the first 6 characters of its first 3 lines are shown.
+.TP
+.B text_value
+.I params
+is text shown directly, after
+.B $
+references are expanded, without reading a file or running a command. For
+example, a button can show a variable's value with
+.BR "$defaults.button_brightness%" .
+.TP
+.B text_exec
+.I params
+is a command run asynchronously; its stdout is shown the same way as
+.BR text .
+A timeout or a reassignment kills it and draws
+.B Error
+in red, as with
+.BR image_exec .
+.TP
+.B launch
+.I params
+is a command run fully detached: its own process group, no standard
+input/output, re\-parented to init when
+.B dak
+exits. Nothing is drawn on the button and nothing is restored on termination.
+.TP
+.B clear
+Clear the button image.
+.TP
+.B refresh
+Seconds, default
+.BR 0 .
+Allowed on
+.BR image ,
+.BR text ,
+.BR text_value ,
+.B image_exec
+and
+.BR text_exec ;
+re\-applies that entry every
+.B refresh
+seconds without touching other buttons. A value of
+.B 0
+or an omitted key means the entry is applied once on scene entry. A refresh
+restarts an
+.B image_exec
+or
+.B text_exec
+the same way a reassignment does, killing any still\-running process for that
+button. It is not allowed on
+.B clear
+or
+.BR launch .
+.SS "actions"
+The
+.B actions
+object maps a control reference to that control's bindings. A button binds the
+events
+.BR pressed ,
+.BR released ,
+.BR short_press ,
+.B long_press
+and
+.BR double_click ;
+an encoder additionally binds
+.B turn_cw
+and
+.BR turn_ccw ,
+one action per rotation notch, and its knob push uses the same five press
+events.
+.PP
+.B pressed
+and
+.B released
+fire on the down and up edges. The complex events are decided on the release
+edge: a press held longer than
+.B short_press_duration
+fires
+.BR long_press ;
+a second press landing within
+.B double_click_gap
+of the previous release fires
+.BR double_click
+(and its first click never fires
+.BR short_press );
+anything else is a
+.BR short_press ,
+which fires once the gap has passed with no second press.
+.SS "The timer"
+The special key
+.B timer
+maps to a single\-entry object whose key is a number of seconds and whose
+value is an action:
+.nf
+.RS 4
+"timer": { "5": "@Main" }
+.RE
+.fi
+The action runs once that many seconds after the scene is entered.
+.SS "Action values"
+An action value is one of:
+.IP \(bu 2
+.B @
+(stay on the current scene and re\-apply its setup)
+.IP \(bu 2
+.B @scene
+(jump to the named scene)
+.IP \(bu 2
+.B "$<target> <op> <rhs>"
+(assign; see
+.B VARIABLES
+above)
+.IP \(bu 2
+anything else, taken as a command path followed by its arguments
+.IP \(bu 2
+an array of any of the above, whose entries run without waiting on each other
+.PP
+A
+.B $
+reference anywhere in a value is substituted before the value is used.
+.PP
+A value may also be an array, for example
+.B "[\(dq/usr/bin/notify-send hi\(dq, \(dq@Main\(dq],"
+to trigger more than one action from one event. An empty array is the array
+form of "bound but no action"; an empty string inside a non\-empty array is
+rejected. At most one scene\-changing entry
+.RB ( @
+or
+.BR @scene )
+is allowed per array.
+.SS "Commands and the shell"
+A command runs directly when it contains no unquoted shell operator, and
+through
+.B sh \-c
+when it contains one of
+.B "| & ; < > ` ( )"
+or a newline. Pipelines and redirection therefore work when written, while a
+plain command never grows a shell.
+.PP
+A leading
+.B ~
+in a command line, in
+.BR image_exec / text_exec
+params, or in a
+.B launch
+value, is expanded to the home directory:
+.B ~
+alone becomes
+.BR $HOME ,
+and
+.B ~/rest
+becomes
+.BR $HOME/rest .
+This applies to every word of the line. A
+.B ~
+anywhere but the start of a word is left untouched, and there is no
+.B ~user
+support.
+.SS "Parallel execution"
+Actions in an array are not ordered against each other: each command and each
+.B $(command)
+assignment runs on its own task. Do not rely on the order of independent
+assignments within one array.
+.SH DEVICES
+The
+.B devices
+object maps a logical device id (a single digit
+.B 1
+to
+.BR 9 )
+to a device definition. Each definition is the exact JSON that
+.B "dak \-\-map"
+prints:
+.nf
+.RS 4
+{
+  "device_id": "0300:3002",
+  "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+  "serial": "unknown",
+  "key_count": 9,
+  "encoder_count": 3,
+  "screens": 6,
+  "protocol_version": 2,
+  "buttons": [
+    { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 }
+  ],
+  "encoders": [
+    { "number": 1, "cw": 144, "ccw": 145, "press": 146, "release": 146 }
+  ]
+}
+.RE
+.fi
+.TP
+.B device_id
+The device's USB vendor and product id as
+.BR "vvvv:pppp" .
+.TP
+.B device_name
+The name reported over USB, printed when the device connects.
+.TP
+.B serial
+The device serial number, or
+.B unknown
+for devices without one. A definition whose serial is not
+.B unknown
+matches only the device reporting that exact serial, which tells identical
+devices apart. A definition whose serial is
+.B unknown
+falls back to comparing
+.BR device_id .
+.TP
+.B key_count ", " encoder_count
+The number of buttons and encoders the device has.
+.TP
+.B screens
+The number of button LCDs.
+.TP
+.B protocol_version
+Optional. Selects which connection protocol variant to use, overriding the
+value recognized from the device id. Omit it or set it to JSON
+.B null
+to use the default.
+.TP
+.B buttons
+One entry per button, mapping its
+.B number
+to the raw codes reported for press and release, whether it has a
+.B screen
+and its
+.BR draw_id .
+.TP
+.B encoders
+One entry per encoder, mapping its
+.B number
+to its clockwise
+.RB ( cw )
+and counter\-clockwise
+.RB ( ccw )
+turn codes and, after the wizard replays a knob push, its
+.B press
+and
+.B release
+codes. An encoder without push codes still turns, but its knob push is
+ignored.
+.PP
+At startup every definition is matched against the discovered hardware, and
+every matched device is connected and driven with the shared scenes. A device
+defined in config but not found is reported with a warning, and a discovered
+device with no definition is ignored with a warning. When no configured
+device is found, the program exits with an error.
+.SH EXAMPLE
+.nf
+.RS 4
+{
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "image", "params": "/path/reader.ico" }
+      },
+      "actions": {
+        "1b01": { "short_press": "@Main" },
+        "timer": { "1": "@Main" }
+      }
+    },
+    "Main": {
+      "setup": {},
+      "actions": {}
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 }
+      ],
+      "encoders": []
+    }
+  }
+}
+.RE
+.fi
+.SH "SEE ALSO"
+.BR dak (1)
+.PP
+The project README and the
+.I examples/
+directory contain complete, worked configurations.
