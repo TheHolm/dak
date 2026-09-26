@@ -6,7 +6,7 @@ use dak::actions::{load_config, load_config_from_path};
 
 use crate::common::{
     assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
-    write_scenes_config, write_temp_config, write_variables_config, SetHome, ENV_LOCK,
+    write_scenes_config, write_temp_config, write_variables_config, SetHome, SetPath, ENV_LOCK,
 };
 use dak::variables::{VarDef, VarValue};
 use std::os::unix::fs::PermissionsExt;
@@ -1783,6 +1783,82 @@ fn tilde_path_in_exec_program_resolves_against_home() {
             .any(|w| w.contains("program not found") || w.contains("not executable")),
         "{:?}",
         config.warnings
+    );
+}
+
+// -- bare program names resolved through `PATH` --
+
+/// Loads a config whose every program-taking spot (a `launch`, a `text_exec`, a
+/// command action and a `$(...)` substitution) runs the bare program `name`, with
+/// `PATH` set to just `path_dir`, and returns the resulting warnings.
+fn warnings_for_bare_program(name: &str, path_dir: &std::path::Path) -> Vec<String> {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let _set_path = SetPath::new(path_dir.as_os_str());
+    let path = write_variables_config(
+        r#"{"label": {"type": "str", "max_length": 10, "value": ""}}"#,
+        &format!(
+            r#"{{"on_start": {{
+                "setup": {{
+                    "1b01": {{"type": "launch", "params": "{name} --flag"}},
+                    "1b02": {{"type": "text_exec", "params": "{name} +%H:%M"}}
+                }},
+                "actions": {{
+                    "1b03": {{"pressed": "{name} beep"}},
+                    "1b04": {{"pressed": "$label := $({name})"}}
+                }}
+            }}}}"#
+        ),
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    config.unwrap().warnings
+}
+
+/// The reported bug: a bare program name that is an executable in `PATH` used to be
+/// checked against the working directory and warned "program not found", even though
+/// it then ran fine. It must now produce no program warning anywhere.
+#[test]
+fn bare_program_in_path_is_not_warned_about() {
+    let dir = temp_dir();
+    let tool = dir.join("dak-path-tool");
+    std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let warnings = warnings_for_bare_program("dak-path-tool", &dir);
+    assert!(
+        !warnings.iter().any(|w| w.contains("program")),
+        "{warnings:?}"
+    );
+}
+
+/// A bare program name absent from every `PATH` directory is warned about once per
+/// place it is used, naming `PATH` as where it was looked for.
+#[test]
+fn bare_program_missing_from_path_is_warned_about() {
+    let dir = temp_dir();
+    let warnings = warnings_for_bare_program("dak-no-such-tool", &dir);
+    let hits = warnings
+        .iter()
+        .filter(|w| w.contains("program not found in PATH: \"dak-no-such-tool\""))
+        .count();
+    assert_eq!(hits, 4, "{warnings:?}");
+}
+
+/// A bare name whose only `PATH` match is not executable is still "not found":
+/// launching it would skip that file too.
+#[test]
+fn bare_program_non_executable_in_path_is_warned_about() {
+    let dir = temp_dir();
+    let tool = dir.join("dak-plain-file");
+    std::fs::write(&tool, b"").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let warnings = warnings_for_bare_program("dak-plain-file", &dir);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("program not found in PATH")),
+        "{warnings:?}"
     );
 }
 

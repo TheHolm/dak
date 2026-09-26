@@ -1,5 +1,4 @@
 target/
-Cargo.lock
 .bash_history
 config.json
 # Local cross-compile linker config (see NOTES.md) - hardcodes a machine-specific

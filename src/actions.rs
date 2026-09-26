@@ -1367,8 +1367,21 @@ fn check_string_length(
 }
 
 /// Adds a warning if the program does not exist or is not executable.
+///
+/// Mirrors how the program is actually started (`Command::new`, i.e. `execvp`): a name
+/// containing a `/` (after `~` expansion) is checked as a path, relative ones against
+/// the working directory, while a bare name is searched for in `$PATH` - only an
+/// executable match counts, since launching skips non-executable ones too.
 fn check_executable(scene_name: &str, path: &str, executable: &str, warnings: &mut Vec<String>) {
     let resolved = expand_tilde(executable);
+    if !resolved.contains('/') {
+        if find_in_path(&resolved).is_none() {
+            warnings.push(format!(
+                "scene \"{scene_name}\": {path} program not found in PATH: \"{executable}\""
+            ));
+        }
+        return;
+    }
     if !Path::new(&resolved).exists() {
         warnings.push(format!(
             "scene \"{scene_name}\": {path} program not found: \"{executable}\""
@@ -1409,6 +1422,27 @@ pub fn expand_tilde(value: &str) -> String {
         return path.to_string_lossy().into_owned();
     }
     value.to_string()
+}
+
+/// Looks a bare program name up in the current `$PATH`, see [`find_in_path_list`].
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    find_in_path_list(name, std::env::var_os("PATH").as_deref())
+}
+
+/// Returns the first `dir/name` across the `:`-separated `path_list` that is an
+/// executable regular file, like the shell's (and `execvp`'s) program lookup.
+///
+/// `None` when `path_list` is unset, has no such entry, or `name` is empty. Empty
+/// `PATH` components are skipped rather than treated as the working directory: that
+/// legacy meaning is rarely intended, and a miss here only costs a warning.
+fn find_in_path_list(name: &str, path_list: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    std::env::split_paths(path_list?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file() && is_executable(&candidate.to_string_lossy()))
 }
 
 /// Whether the file exists and has at least one execute permission bit set.
@@ -4593,6 +4627,93 @@ mod tests {
         let _unset_home = UnsetHome::new();
         assert_eq!(super::expand_tilde("~/foo/bar.png"), "~/foo/bar.png");
         assert_eq!(super::expand_tilde("~"), "~");
+    }
+
+    /// Writes an (empty) file at `path` with the given unix permission `mode`.
+    fn write_file_with_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `find_in_path_list` returns the first executable match, skipping directories
+    /// where the name is missing and ones where it exists but is not executable.
+    #[test]
+    fn find_in_path_list_returns_first_executable_match() {
+        let empty = temp_dir();
+        let non_exec = temp_dir();
+        let exec_a = temp_dir();
+        let exec_b = temp_dir();
+        write_file_with_mode(&non_exec.join("tool"), 0o644);
+        write_file_with_mode(&exec_a.join("tool"), 0o755);
+        write_file_with_mode(&exec_b.join("tool"), 0o755);
+        let list = std::env::join_paths([&empty, &non_exec, &exec_a, &exec_b]).unwrap();
+
+        assert_eq!(
+            super::find_in_path_list("tool", Some(&list)),
+            Some(exec_a.join("tool"))
+        );
+    }
+
+    /// `find_in_path_list` finds nothing when the only match is non-executable, the
+    /// name is absent, the name is empty, or no `PATH` is given at all.
+    #[test]
+    fn find_in_path_list_misses() {
+        let dir = temp_dir();
+        write_file_with_mode(&dir.join("plain"), 0o644);
+        let list = std::env::join_paths([&dir]).unwrap();
+
+        assert_eq!(super::find_in_path_list("plain", Some(&list)), None);
+        assert_eq!(super::find_in_path_list("absent", Some(&list)), None);
+        assert_eq!(super::find_in_path_list("", Some(&list)), None);
+        assert_eq!(super::find_in_path_list("plain", None), None);
+    }
+
+    /// A directory with the program's name is not a program, even though directories
+    /// usually carry execute bits.
+    #[test]
+    fn find_in_path_list_ignores_directories() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join("tool")).unwrap();
+        let list = std::env::join_paths([&dir]).unwrap();
+        assert_eq!(super::find_in_path_list("tool", Some(&list)), None);
+    }
+
+    /// Empty `PATH` components are skipped instead of meaning the working directory.
+    #[test]
+    fn find_in_path_list_skips_empty_components() {
+        assert_eq!(
+            super::find_in_path_list("Cargo.toml", Some(std::ffi::OsStr::new(":"))),
+            None
+        );
+    }
+
+    /// `check_executable` stays quiet for a bare name found in `PATH` (the reported
+    /// bug: bare names were checked against the working directory instead), and warns
+    /// "not found in PATH" for one that is not.
+    #[test]
+    fn check_executable_searches_path_for_bare_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = temp_dir();
+        write_file_with_mode(&dir.join("dak-test-tool"), 0o755);
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+
+        let mut found = Vec::new();
+        super::check_executable("s", "p", "dak-test-tool", &mut found);
+        let mut missing = Vec::new();
+        super::check_executable("s", "p", "dak-no-such-tool", &mut missing);
+
+        match old {
+            Some(old) => std::env::set_var("PATH", old),
+            None => std::env::remove_var("PATH"),
+        }
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(
+            missing[0].contains("program not found in PATH"),
+            "{missing:?}"
+        );
     }
 
     /// `parse_command_line` expands a leading `~` in both the program name and every
