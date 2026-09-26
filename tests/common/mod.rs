@@ -90,6 +90,27 @@ impl Drop for SetHome {
     }
 }
 
+/// Temporarily sets `PATH` to `path`, restoring the previous value when dropped.
+/// Callers must hold [`ENV_LOCK`] for the guard's entire lifetime.
+pub struct SetPath(Option<std::ffi::OsString>);
+
+impl SetPath {
+    pub fn new(path: &std::ffi::OsStr) -> Self {
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", path);
+        SetPath(old)
+    }
+}
+
+impl Drop for SetPath {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(old) => std::env::set_var("PATH", old),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+}
+
 /// Creates a unique empty temp directory, e.g. for use as a fake `$HOME`.
 pub fn temp_dir() -> PathBuf {
     let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);

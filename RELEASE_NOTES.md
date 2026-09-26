@@ -5,6 +5,44 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.11.1 — No more false "program not found" warnings for programs in PATH
+
+### User-facing changes
+- A config that runs a program by bare name (e.g. `date` instead of
+  `/usr/bin/date`) no longer prints a spurious "program not found" warning at
+  startup. The name is now looked up in `$PATH`, exactly as it is when the
+  program is actually run, so the warning only appears when the program really
+  cannot be started. This applies everywhere a program can be named: `launch`,
+  the `*_exec` setup types, command actions and `$(...)` substitutions.
+- When a bare name genuinely is not found, the warning now reads
+  `program not found in PATH: "<name>"`, making it clear where dak looked.
+- `Cargo.lock` is now committed, so builds from source use the same dependency
+  versions as the release packages.
+- Version bumped to `0.11.1`.
+
+### Details
+- Cause: `check_executable` (`src/actions.rs`) ran `Path::exists()` on the
+  program string, which for a bare name resolves against the working
+  directory, while the program is launched via `Command::new` (`execvp`
+  semantics), which searches `$PATH`.
+- `check_executable` now branches on whether the `~`-expanded name contains a
+  `/`: paths (absolute or relative) keep the old existence and execute-bit
+  checks; bare names go through the new `find_in_path`/`find_in_path_list`
+  helpers, which return the first `dir/name` across `$PATH` that is a regular
+  file with an execute bit. Non-executable matches and directories are skipped,
+  as `execvp` skips them. Empty `PATH` components are skipped rather than
+  treated as the working directory; the worst outcome of that is a warning.
+- `find_in_path_list` takes the `PATH` value as a parameter, so its unit tests
+  do not touch the process environment.
+- Tests: unit tests for `find_in_path_list` (first executable match wins;
+  non-executable files, directories, empty components, empty names and an
+  unset `PATH` all miss) and for `check_executable`'s bare-name path;
+  integration tests in `tests/validation.rs` that drive all four
+  program-taking config spots with a bare name under a temporary `PATH`
+  (found: no warning; missing: one warning per use; non-executable: warned).
+  New `SetPath` guard in `tests/common/mod.rs`, mirroring `SetHome`.
+- `Cargo.lock` removed from `.gitignore` and committed.
+
 ## v0.11.0 — Configurable button background/text colours (transparent icons no longer turn white)
 
 ### User-facing changes
