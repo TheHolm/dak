@@ -133,7 +133,9 @@ The optional top-level `defaults` section tunes how the complex button presses a
   "button_brightness": 50,
   "encoder_brightness": 50,
   "background": "#000000",
-  "text_color": "#ffffff"
+  "text_color": "#ffffff",
+  "device_reconnect_interval": 15,
+  "device_reconnect_max_attempts": 0
 }
 ```
 
@@ -143,6 +145,10 @@ The optional top-level `defaults` section tunes how the complex button presses a
 - `encoder_brightness` (default `50`, percent `0`-`100`) — brightness applied to every device's encoder LED ring when it connects. Not verified against real hardware: no Ajazz AKP03E/AKP03R unit with functioning encoder LEDs was available during development, and a brute-force sweep across the underlying LED-color command's index space produced no visible response on the unit that was available - see [TODO.md](TODO.md).
 - `background` (default `#000000`) — the colour composited under any image that has transparency, and the canvas text is drawn on. Without it, an icon's transparent pixels keep whatever colour is hidden under them (usually white): the device's image format has no alpha channel, so there is nothing else to fall back on.
 - `text_color` (default `#ffffff`) — the colour button text is drawn in.
+- `device_reconnect_interval` (default `15`, whole seconds, at least `1`) — how long to wait between attempts to get a device back after it disappeared (see [Devices](#devices)). The first attempt is made right away.
+- `device_reconnect_max_attempts` (default `0` = unlimited) — how many reconnect attempts to make before giving up on a device.
+
+Both reconnect keys can also be set inside a single device's definition, overriding the `defaults` value for that device only.
 
 A colour is either a `#RRGGBB` hex literal (six digits, case-insensitive) or one of the CSS basic colour names (`black`, `silver`, `gray`/`grey`, `white`, `maroon`, `red`, `purple`, `fuchsia`/`magenta`, `green`, `lime`, `olive`, `yellow`, `navy`, `blue`, `teal`, `aqua`/`cyan`, plus `orange`). The `#RGB` shorthand and alpha values are not accepted, and a bad colour is a config-load error.
 
@@ -191,7 +197,8 @@ A `$` starts a reference. `$name` reads a declared variable; `$var.name` is the 
 thing written with its explicit scope (the `var` scope is the default, so both work).
 `$defaults.<name>` reads a `defaults` parameter: `button_brightness`,
 `encoder_brightness`, `short_press_duration` (milliseconds), `double_click_gap`
-(milliseconds), and the colours `background`/`text_color` - the values
+(milliseconds), `device_reconnect_interval` (seconds), `device_reconnect_max_attempts`,
+and the colours `background`/`text_color` - the values
 [Defaults](#defaults) describes, reflecting any runtime changes. A colour reads back
 exactly as it was set, so a name stays a name.
 
@@ -217,7 +224,7 @@ An action value of the form `$<target> <op> <rhs>` assigns:
 - `<target>` is a declared variable (or `var.name`) or one of the writable `defaults`
   parameters (`defaults.button_brightness`, `defaults.encoder_brightness`,
   `defaults.background`, `defaults.text_color`). The read-only `defaults` timing
-  constants cannot be assigned.
+  and reconnect constants cannot be assigned.
 - `<op>` is `:=` (clamp/truncate and warn), `~=` (same, silently) or `=` (reject an
   out-of-range, over-long or otherwise invalid value).
 - `<rhs>` is an integer literal, a `"quoted string"`, another variable (`$b`) or a
@@ -436,6 +443,16 @@ At startup each definition is matched against the discovered hardware:
 - A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
 
 Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with an error.
+
+A device that disappears while dak is running - the computer goes to sleep, the keypad is unplugged, or the USB bus resets - does not stop the program. dak prints `device #N disconnected (...); waiting for it to come back` and looks for the same device (matched the same way as at startup): right away, then every `device_reconnect_interval` seconds (default 15), for up to `device_reconnect_max_attempts` attempts (default 0 = forever). Both can be set in `defaults` or per device, inside the device's definition:
+
+```json
+"1": { "device_id": "0300:3002", "serial": "unknown", "device_reconnect_interval": 5, "device_reconnect_max_attempts": 60, "...": "..." }
+```
+
+When the attempts run out, dak prints `error: device #N did not come back after M attempts; giving up on it` and stops driving that device; other devices keep running, and once none is left dak exits with a non-zero status (so a service manager can restart it). Once the device is back, dak prints `device #N reconnected (...)`, reapplies the current brightness and repaints exactly what was on the buttons before: the current scene, buttons inherited from earlier scenes, and variables are all kept, refreshing buttons resume, and `text_exec`/`image_exec` programs run again. A key held down at the moment of the disconnect is treated as released. Ctrl-C still exits while waiting. Only the very first connection at startup failing is fatal for a device; other devices keep running either way.
+
+**FreeBSD:** reconnecting may be flaky there and needs more troubleshooting. It worked reliably when the keypad was reset from inside a FreeBSD 15.1 VM (`usbconfig power_off`/`power_on`, `usbconfig reset`), but after unplugging and re-plugging it through VM USB passthrough the keypad once stopped answering and the kernel could not re-enumerate it (`USB_ERR_TIMEOUT`), leaving dak waiting for a device that never came back. It has not been tried on bare-metal FreeBSD yet.
 
 Driving multiple devices at once (multiple entries under `devices`, each on its own connection and input loop) is implemented - see `main.rs`'s `run_device`, spawned once per matched device - but has only been exercised with mocked devices in tests, never against two or more real keypads attached at the same time. Treat it as unverified in practice until someone confirms it against actual hardware.
 

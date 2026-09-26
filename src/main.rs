@@ -17,7 +17,7 @@ use mirajazz::{
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use dak::actions::{self, Action};
+use dak::actions::{self, Action, ButtonDevice};
 use dak::baseplane::Reference;
 use dak::cli::Cli;
 use dak::color::Color;
@@ -25,6 +25,7 @@ use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
+use dak::reconnect::{self, SwappableDevice};
 use dak::variables::{VarValue, Variables};
 
 /// Loads the config, matches the config's `devices` definitions against the discovered
@@ -146,18 +147,28 @@ async fn main() -> Result<(), MirajazzError> {
             variables.clone(),
         )));
     }
+    // Wait for every device task, so one device failing (e.g. its first connection
+    // could not be opened) does not take the other, working devices down with it; the
+    // first failure is still reported as the program's exit status once all are done.
+    let mut first_error: Option<MirajazzError> = None;
     for handle in handles {
         match handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => {
+                log.error(format!("device task ended with an error: {error}"));
+                first_error.get_or_insert(error);
+            }
             Err(error) => {
                 log.error(format!("device task failed unexpectedly: {error}"));
-                return Err(MirajazzError::BadData);
+                first_error.get_or_insert(MirajazzError::BadData);
             }
         }
     }
 
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Runs one present device: connects with the key/encoder counts from its config
@@ -225,53 +236,60 @@ async fn run_device(
         format!("device {device_number}: protocol version {protocol_version}"),
     );
 
-    // Connect to the device using the counts its config definition declares.
-    let device = Device::connect(
+    // Connect to the device using the counts its config definition declares. A failure
+    // here, on the very first connection, is still fatal for this device; only a device
+    // lost *after* it connected is waited for (see the reconnect handling below).
+    let connected = connect_device(
         &device_info,
+        &definition,
         protocol_version,
-        definition.key_count as usize,
-        definition.encoder_count as usize,
+        defaults.button_brightness,
+        defaults.encoder_brightness,
     )
     .await?;
-    let device = device.with_supports_both_keypress_states(true);
-    let device = device.with_supports_both_encoder_states(true);
 
     // Print out some info from the device
     log.debug(
         Subsystem::Device,
-        format!("Connected to '{}'", device.serial_number()),
+        format!("Connected to '{}'", connected.serial_number()),
     );
     log.info(format!(
         "Connected to {} s/n {} as device #{device_number} using protocol version {protocol_version}",
         device_info.name,
-        device.serial_number()
+        connected.serial_number()
     ));
-
-    device.set_brightness(defaults.button_brightness).await?;
-    // Not verified to have any visible effect: see `Defaults::encoder_brightness`'s
-    // doc comment for why (no unit with functioning encoder LEDs was available to
-    // confirm this against). Sent unconditionally anyway, same as `set_brightness`
-    // above, since it costs nothing when the device has no encoders or LEDs.
-    device
-        .set_led_brightness(defaults.encoder_brightness)
-        .await?;
-    device.clear_all_button_images().await?;
+    // How often, and how many times, to try getting this device back if it disappears:
+    // its own settings where the definition has them, else the `defaults` ones.
+    let reconnect_policy = reconnect::ReconnectPolicy::resolve(
+        &defaults,
+        definition.device_reconnect_interval,
+        definition.device_reconnect_max_attempts,
+    );
+    // The runner draws through this handle, whose connection is swapped for a fresh
+    // one whenever the device disappears (host suspend, unplug) and comes back.
+    let device = SwappableDevice::new(connected, reconnect::is_disconnect_error);
+    let connected = device
+        .current()
+        .expect("a freshly wrapped device is connected");
 
     log.debug(
         Subsystem::Device,
-        format!("Key count: {}", device.key_count()),
+        format!("Key count: {}", connected.key_count()),
     );
     log.debug(
         Subsystem::Device,
-        format!("Encoder count: {}", device.encoder_count()),
+        format!("Encoder count: {}", connected.encoder_count()),
     );
     log.debug(
         Subsystem::Device,
         format!(
             "Supports_both_encoder_states: {}",
-            device.supports_both_encoder_states()
+            connected.supports_both_encoder_states()
         ),
     );
+    // Only the swappable handle may keep the connection alive: a reconnect needs every
+    // reference to the old one gone, so its OS handle actually closes.
+    drop(connected);
 
     // async image_exec/text_exec results land on buttons through this runner and its channel
     let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
@@ -314,13 +332,23 @@ async fn run_device(
     let mut pending_shorts: HashMap<Reference, PendingShortPress> = HashMap::new();
 
     if let Err(error) = runner.enter_scene("on_start", &scenes).await {
-        log.warn(format!("failed to apply on_start scene: {error}"));
+        warn_unless_disconnected(
+            log,
+            &runner,
+            format!("failed to apply on_start scene: {error}"),
+        );
     }
 
-    // Flush
-    device.flush().await?;
+    // Flush. A failure is not fatal: if the device already went away, the input loop
+    // below notices and waits for it to come back.
+    if let Err(error) = device.flush().await {
+        warn_unless_disconnected(
+            log,
+            &runner,
+            format!("failed to flush on_start scene: {error}"),
+        );
+    }
 
-    let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
     let mut current_scene = String::from("on_start");
     // Button and pushed-encoder controls currently held down, so repeated press
     // reports of the same widget are not re-dispatched and releases without a
@@ -337,213 +365,492 @@ async fn run_device(
     // so the scene we came from is remembered across scene switches.
     let mut previous_scene: Option<String> = None;
 
-    loop {
-        tokio::select! {
-            data_result = reader.raw_read_data(512) => {
-                let data = match data_result {
-                    Ok(data) => data,
-                    Err(_) => break,
-                };
-                if !data.starts_with(&[65, 67, 75]) {
-                    continue;
-                }
-                // The raw code in the report names a widget by its captured
-                // press/release or turn code, not by its number (buttons without a
-                // display report far larger codes). Translate it through the
-                // definition and skip reports that no widget uses.
-                let code = data[9];
-                let pressed = data[10] != 0;
-                let state = if pressed { "pressed" } else { "released" };
-                log.debug(
-                    Subsystem::Device,
-                    format!("Key {code}, {state}"),
-                );
-
-                let Some(event) = definition.control_event(code, pressed) else {
+    // One pass per connection: the input loop runs until the program is told to stop
+    // (Ctrl-C, a closed channel) or the device goes away; then this waits for the
+    // device to come back, swaps the new connection in, repaints and loops again.
+    'connection: loop {
+        let Some(reader) = device
+            .current()
+            .map(|connection| connection.get_reader(|_, _| Ok(DeviceInput::NoData)))
+        else {
+            // Lost again while repainting after a reconnect.
+            match await_reconnect(
+                device_number,
+                &definition,
+                &device_info,
+                protocol_version,
+                &device,
+                &mut runner,
+                &variables,
+                log,
+                "device lost while reconnecting",
+                reconnect_policy,
+            )
+            .await
+            {
+                Reconnect::Reconnected => continue 'connection,
+                Reconnect::Cancelled => return Ok(()),
+                Reconnect::GaveUp => return Err(MirajazzError::DeviceNotFoundError),
+            }
+        };
+        let end = loop {
+            tokio::select! {
+                data_result = reader.raw_read_data(512) => {
+                    let data = match data_result {
+                        Ok(data) => data,
+                        Err(error) => break SessionEnd::Disconnected(error.to_string()),
+                    };
+                    if !data.starts_with(&[65, 67, 75]) {
+                        continue;
+                    }
+                    // The raw code in the report names a widget by its captured
+                    // press/release or turn code, not by its number (buttons without a
+                    // display report far larger codes). Translate it through the
+                    // definition and skip reports that no widget uses.
+                    let code = data[9];
+                    let pressed = data[10] != 0;
+                    let state = if pressed { "pressed" } else { "released" };
                     log.debug(
                         Subsystem::Device,
-                        format!("no control uses raw code {code}; skipping"),
+                        format!("Key {code}, {state}"),
                     );
-                    continue;
-                };
 
-                match event {
-                    ControlEvent::Button { number } => {
-                        if number > definition.key_count {
-                            log.debug(
-                                Subsystem::Device,
-                                format!("button {number} is out of range (device has {} buttons); skipping", definition.key_count),
-                            );
-                            continue;
-                        }
-                        let reference = Reference::button(device_number, number);
-                        run_pressable_edge(
-                            log,
-                            &mut runner,
-                            &mut current_scene,
-                            &mut previous_scene,
-                            &scenes,
-                            &reference,
-                            pressed,
-                            &mut down_controls,
-                            &mut click_detector,
-                            &click_tx,
-                            &mut pending_shorts,
-                            &defaults,
-                            &mut timer_handle,
-                            &timer_tx,
-                            &variables,
-                        )
-                        .await;
-                    }
-                    ControlEvent::EncoderPress { number } => {
-                        if number > definition.encoder_count {
-                            log.debug(
-                                Subsystem::Device,
-                                format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
-                            );
-                            continue;
-                        }
-                        let reference = Reference::encoder(device_number, number);
-                        run_pressable_edge(
-                            log,
-                            &mut runner,
-                            &mut current_scene,
-                            &mut previous_scene,
-                            &scenes,
-                            &reference,
-                            pressed,
-                            &mut down_controls,
-                            &mut click_detector,
-                            &click_tx,
-                            &mut pending_shorts,
-                            &defaults,
-                            &mut timer_handle,
-                            &timer_tx,
-                            &variables,
-                        )
-                        .await;
-                    }
-                    ControlEvent::EncoderTurn { number, direction } => {
-                        if number > definition.encoder_count {
-                            log.debug(
-                                Subsystem::Device,
-                                format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
-                            );
-                            continue;
-                        }
-                        let event = match direction {
-                            TwistDirection::Clockwise => "turn_cw",
-                            TwistDirection::CounterClockwise => "turn_ccw",
-                        };
-                        run_bound_action(
-                            log,
-                            &mut runner,
-                            &mut current_scene,
-                            &mut previous_scene,
-                            &scenes,
-                            &Reference::encoder(device_number, number),
-                            event,
-                            &mut timer_handle,
-                            &timer_tx,
-                            &variables,
-                        )
-                        .await;
-                    }
-                }
-            }
-            action = timer_rx.recv() => {
-                let Some(actions) = action else {
-                    break;
-                };
-                log.debug(
-                    Subsystem::Actions,
-                    format!("timer for scene \"{current_scene}\" -> {actions:?}"),
-                );
-                let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
-                run_actions(
-                    log,
-                    &mut runner,
-                    &mut current_scene,
-                    &mut previous_scene,
-                    &scenes,
-                    &actions,
-                    &mut timer_handle,
-                    &timer_tx,
-                    &variables,
-                )
-                .await;
-            }
-            click = click_rx.recv() => {
-                let Some((pending_reference, event)) = click else {
-                    break;
-                };
-                // The confirmation task finished on its own; drop its handle.
-                pending_shorts.remove(&pending_reference);
-                click_detector.confirm_single();
-                match event {
-                    ClickEvent::ShortPress => {
+                    let Some(event) = definition.control_event(code, pressed) else {
                         log.debug(
                             Subsystem::Device,
-                            format!("{pending_reference} single press detected"),
+                            format!("no control uses raw code {code}; skipping"),
                         );
-                        run_bound_action(
+                        continue;
+                    };
+
+                    match event {
+                        ControlEvent::Button { number } => {
+                            if number > definition.key_count {
+                                log.debug(
+                                    Subsystem::Device,
+                                    format!("button {number} is out of range (device has {} buttons); skipping", definition.key_count),
+                                );
+                                continue;
+                            }
+                            let reference = Reference::button(device_number, number);
+                            run_pressable_edge(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &reference,
+                                pressed,
+                                &mut down_controls,
+                                &mut click_detector,
+                                &click_tx,
+                                &mut pending_shorts,
+                                &defaults,
+                                &mut timer_handle,
+                                &timer_tx,
+                                &variables,
+                            )
+                            .await;
+                        }
+                        ControlEvent::EncoderPress { number } => {
+                            if number > definition.encoder_count {
+                                log.debug(
+                                    Subsystem::Device,
+                                    format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
+                                );
+                                continue;
+                            }
+                            let reference = Reference::encoder(device_number, number);
+                            run_pressable_edge(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &reference,
+                                pressed,
+                                &mut down_controls,
+                                &mut click_detector,
+                                &click_tx,
+                                &mut pending_shorts,
+                                &defaults,
+                                &mut timer_handle,
+                                &timer_tx,
+                                &variables,
+                            )
+                            .await;
+                        }
+                        ControlEvent::EncoderTurn { number, direction } => {
+                            if number > definition.encoder_count {
+                                log.debug(
+                                    Subsystem::Device,
+                                    format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
+                                );
+                                continue;
+                            }
+                            let event = match direction {
+                                TwistDirection::Clockwise => "turn_cw",
+                                TwistDirection::CounterClockwise => "turn_ccw",
+                            };
+                            run_bound_action(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &Reference::encoder(device_number, number),
+                                event,
+                                &mut timer_handle,
+                                &timer_tx,
+                                &variables,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                action = timer_rx.recv() => {
+                    let Some(actions) = action else {
+                        break SessionEnd::Quit;
+                    };
+                    log.debug(
+                        Subsystem::Actions,
+                        format!("timer for scene \"{current_scene}\" -> {actions:?}"),
+                    );
+                    let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+                    run_actions(
+                        log,
+                        &mut runner,
+                        &mut current_scene,
+                        &mut previous_scene,
+                        &scenes,
+                        &actions,
+                        &mut timer_handle,
+                        &timer_tx,
+                        &variables,
+                    )
+                    .await;
+                }
+                click = click_rx.recv() => {
+                    let Some((pending_reference, event)) = click else {
+                        break SessionEnd::Quit;
+                    };
+                    // The confirmation task finished on its own; drop its handle.
+                    pending_shorts.remove(&pending_reference);
+                    click_detector.confirm_single();
+                    match event {
+                        ClickEvent::ShortPress => {
+                            log.debug(
+                                Subsystem::Device,
+                                format!("{pending_reference} single press detected"),
+                            );
+                            run_bound_action(
+                                log,
+                                &mut runner,
+                                &mut current_scene,
+                                &mut previous_scene,
+                                &scenes,
+                                &pending_reference,
+                                "short_press",
+                                &mut timer_handle,
+                                &timer_tx,
+                                &variables,
+                            )
+                            .await;
+                        }
+                    }
+                }
+                event = exec_rx.recv() => {
+                    let Some(event) = event else {
+                        break SessionEnd::Quit;
+                    };
+                    match event {
+                        actions::ExecEvent::Assignment(completed) => {
+                            apply_completed_assignment(completed, &variables, &mut runner, log).await;
+                        }
+                        event => runner.handle_exec_event(event).await,
+                    }
+                }
+                key = refresh_rx.recv() => {
+                    let Some(key) = key else {
+                        break SessionEnd::Quit;
+                    };
+                    log.debug(
+                        Subsystem::Scene,
+                        format!("refresh tick for button {key}"),
+                    );
+                    if let Err(error) = runner.refresh_button(key).await {
+                        warn_unless_disconnected(
                             log,
-                            &mut runner,
-                            &mut current_scene,
-                            &mut previous_scene,
-                            &scenes,
-                            &pending_reference,
-                            "short_press",
-                            &mut timer_handle,
-                            &timer_tx,
-                            &variables,
-                        )
-                        .await;
+                            &runner,
+                            format!("failed to refresh button {key}: {error}"),
+                        );
                     }
                 }
-            }
-            event = exec_rx.recv() => {
-                let Some(event) = event else {
-                    break;
-                };
-                match event {
-                    actions::ExecEvent::Assignment(completed) => {
-                        apply_completed_assignment(completed, &variables, &mut runner, log).await;
-                    }
-                    event => runner.handle_exec_event(event).await,
+                _ = tokio::signal::ctrl_c() => {
+                    // Ctrl-C (SIGINT) normally kills the process instantly; route it
+                    // through the same break so the cleanup + shutdown below run.
+                    break SessionEnd::Quit;
+                }
+                _ = device.disconnected() => {
+                    // A draw/flush noticed the device is gone before the reader did.
+                    break SessionEnd::Disconnected("device stopped responding".to_string());
                 }
             }
-            key = refresh_rx.recv() => {
-                let Some(key) = key else {
-                    break;
-                };
-                log.debug(
-                    Subsystem::Scene,
-                    format!("refresh tick for button {key}"),
-                );
-                if let Err(error) = runner.refresh_button(key).await {
-                    log.warn(format!("failed to refresh button {key}: {error}"));
+        };
+        // The reader holds the connection's input handle open; it must go before any
+        // reconnect can open the device again.
+        drop(reader);
+        match end {
+            SessionEnd::Quit => break 'connection,
+            SessionEnd::Disconnected(reason) => {
+                // A control held down when the device vanished never reports its release,
+                // and pending short-press confirmations belong to the lost connection.
+                down_controls.clear();
+                for (_, pending) in pending_shorts.drain() {
+                    pending.alive.store(false, Ordering::SeqCst);
+                    pending.handle.abort();
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                // Ctrl-C (SIGINT) normally kills the process instantly; route it
-                // through the same break so the cleanup + shutdown below run.
-                break;
+                click_detector = ClickDetector::new(&defaults);
+                match await_reconnect(
+                    device_number,
+                    &definition,
+                    &device_info,
+                    protocol_version,
+                    &device,
+                    &mut runner,
+                    &variables,
+                    log,
+                    &reason,
+                    reconnect_policy,
+                )
+                .await
+                {
+                    Reconnect::Reconnected => continue 'connection,
+                    // Ctrl-C while waiting: nothing left to restore on a missing device.
+                    Reconnect::Cancelled => return Ok(()),
+                    // Only this device's task ends; the others keep running, and the
+                    // program's exit status reports the failure once they are done.
+                    Reconnect::GaveUp => return Err(MirajazzError::DeviceNotFoundError),
+                }
             }
         }
     }
 
-    drop(reader);
-
     // Restore the buttons this program touched: clear the image on every button whose
-    // image the session changed, then flush. Buttons never changed are left alone.
-    if let Err(error) = runner.clear_changed_button_images().await {
-        log.warn(format!("failed to restore changed buttons: {error}"));
+    // image the session changed, then flush. Buttons never changed are left alone - and
+    // a device that is already gone has nothing left to restore.
+    if device.is_connected() {
+        if let Err(error) = runner.clear_changed_button_images().await {
+            warn_unless_disconnected(
+                log,
+                &runner,
+                format!("failed to restore changed buttons: {error}"),
+            );
+        }
     }
 
-    device.shutdown().await?;
+    match device.current() {
+        Some(connection) => {
+            if let Err(error) = connection.shutdown().await {
+                log.warn(format!(
+                    "device #{device_number}: failed to shut down: {error}"
+                ));
+            }
+        }
+        None => log.debug(
+            Subsystem::Device,
+            format!("device #{device_number}: already gone at shutdown"),
+        ),
+    }
     Ok(())
+}
+
+/// Warns about a failed device write, unless the device is known to be gone, in which
+/// case the failure is expected (every write fails until it reconnects and is fully
+/// repainted) and only shows up as a `device` debug line.
+fn warn_unless_disconnected<D: ButtonDevice>(
+    log: Log,
+    runner: &actions::SceneRunner<'_, D>,
+    message: String,
+) {
+    if runner.is_connected() {
+        log.warn(message);
+    } else {
+        log.debug(
+            Subsystem::Device,
+            format!("{message} (device disconnected)"),
+        );
+    }
+}
+
+/// How one connection's input loop in [`run_device`] ended.
+enum SessionEnd {
+    /// Stop the program: Ctrl-C, or one of the event channels closed.
+    Quit,
+    /// The device went away; carries how that was noticed, for the warning.
+    Disconnected(String),
+}
+
+/// Result of waiting for a lost device in [`await_reconnect`].
+#[derive(Debug, PartialEq)]
+enum Reconnect {
+    /// A new connection is attached and the screen was repainted.
+    Reconnected,
+    /// Ctrl-C arrived while waiting; the program should end.
+    Cancelled,
+    /// The allowed attempts ran out; this device is no longer driven.
+    GaveUp,
+}
+
+/// Connects to `device_info` with the key/encoder counts from `definition` and
+/// initializes it the way every session starts: both keypress/encoder states reported,
+/// the given brightnesses applied, and every button image cleared.
+async fn connect_device(
+    device_info: &HidDeviceInfo,
+    definition: &Mapping,
+    protocol_version: usize,
+    button_brightness: u8,
+    encoder_brightness: u8,
+) -> Result<Device, MirajazzError> {
+    let device = Device::connect(
+        device_info,
+        protocol_version,
+        definition.key_count as usize,
+        definition.encoder_count as usize,
+    )
+    .await?;
+    let device = device.with_supports_both_keypress_states(true);
+    let device = device.with_supports_both_encoder_states(true);
+    device.set_brightness(button_brightness).await?;
+    // Not verified to have any visible effect: see `Defaults::encoder_brightness`'s
+    // doc comment for why (no unit with functioning encoder LEDs was available to
+    // confirm this against). Sent unconditionally anyway, same as `set_brightness`
+    // above, since it costs nothing when the device has no encoders or LEDs.
+    device.set_led_brightness(encoder_brightness).await?;
+    device.clear_all_button_images().await?;
+    Ok(device)
+}
+
+/// The current runtime brightness defaults (`$defaults.button_brightness`/
+/// `$defaults.encoder_brightness`, possibly changed since startup), clamped to the
+/// device's 0-100 range, so a reconnect restores what the user last set.
+fn current_brightness(variables: &std::sync::Mutex<Variables>) -> (u8, u8) {
+    let state = variables.lock().expect("variables mutex poisoned");
+    let clamp = |value: i32| value.clamp(0, 100) as u8;
+    (
+        clamp(state.button_brightness()),
+        clamp(state.encoder_brightness()),
+    )
+}
+
+/// Handles a lost device: detaches the old connection, warns once (always shown),
+/// then tries to rediscover and reopen the device matching `definition` right away and
+/// every `policy.interval` after that, until it opens, Ctrl-C arrives, or
+/// `policy.max_attempts` (when nonzero) attempts have failed - in which case an
+/// always-shown error says so and the caller stops driving this device.
+///
+/// On success the fresh connection gets the *current* brightness defaults, is swapped
+/// in under `runner`, the whole pre-disconnect screen is repainted with
+/// [`actions::SceneRunner::redraw_all`], and an always-shown "reconnected" line is
+/// printed. Scene, timer and variable state is untouched throughout, so input simply
+/// carries on where it left off.
+#[allow(clippy::too_many_arguments)]
+async fn await_reconnect(
+    device_number: u8,
+    definition: &Mapping,
+    original_info: &HidDeviceInfo,
+    protocol_version: usize,
+    device: &SwappableDevice<Device>,
+    runner: &mut actions::SceneRunner<'_, SwappableDevice<Device>>,
+    variables: &std::sync::Mutex<Variables>,
+    log: Log,
+    reason: &str,
+    policy: reconnect::ReconnectPolicy,
+) -> Reconnect {
+    device.mark_disconnected();
+    log.warn(reconnect::disconnected_message(device_number, reason));
+    let attempt = |number: u64| async move {
+        let of = if policy.max_attempts == 0 {
+            format!("attempt {number}")
+        } else {
+            format!("attempt {number}/{}", policy.max_attempts)
+        };
+        let devices = match list_devices(&hardware::QUERIES).await {
+            Ok(devices) => devices,
+            Err(error) => {
+                log.debug(
+                    Subsystem::Device,
+                    format!("device #{device_number}: discovery failed ({of}): {error}"),
+                );
+                return None;
+            }
+        };
+        let info = devices.into_iter().find(|dev| {
+            actions::discovered_device_matches(
+                definition,
+                &dev.serial_number,
+                dev.vendor_id,
+                dev.product_id,
+            )
+        });
+        let Some(info) = info else {
+            log.debug(
+                Subsystem::Device,
+                format!("device #{device_number}: not back yet ({of})"),
+            );
+            return None;
+        };
+        let (button_brightness, encoder_brightness) = current_brightness(variables);
+        match connect_device(
+            &info,
+            definition,
+            protocol_version,
+            button_brightness,
+            encoder_brightness,
+        )
+        .await
+        {
+            Ok(connection) => Some((connection, info)),
+            Err(error) => {
+                // Typically the device is enumerated but not ready to open yet.
+                log.debug(
+                    Subsystem::Device,
+                    format!("device #{device_number}: reconnect {of} failed: {error}"),
+                );
+                None
+            }
+        }
+    };
+    let (connection, info) =
+        match reconnect::wait_until(policy, attempt, tokio::signal::ctrl_c()).await {
+            reconnect::WaitOutcome::Found(found) => found,
+            reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
+            reconnect::WaitOutcome::GaveUp => {
+                log.error(reconnect::gave_up_message(
+                    device_number,
+                    policy.max_attempts,
+                ));
+                return Reconnect::GaveUp;
+            }
+        };
+    let name = if info.name.is_empty() {
+        original_info.name.clone()
+    } else {
+        info.name.clone()
+    };
+    let serial = connection.serial_number().clone();
+    device.replace(connection);
+    log.info(reconnect::reconnected_message(
+        device_number,
+        &name,
+        &serial,
+    ));
+    if let Err(error) = runner.redraw_all().await {
+        log.warn(format!(
+            "device #{device_number}: failed to repaint after reconnect: {error}"
+        ));
+    }
+    Reconnect::Reconnected
 }
 
 /// A delayed short-press confirmation for one pressable control (a button or a
@@ -791,9 +1098,11 @@ async fn run_action<D: actions::ButtonDevice>(
                 format!("stay on scene \"{current_scene}\" (re-applies it)"),
             );
             if let Err(error) = runner.enter_scene(&*current_scene, scenes).await {
-                log.warn(format!(
-                    "failed to refresh scene \"{current_scene}\": {error}"
-                ));
+                warn_unless_disconnected(
+                    log,
+                    runner,
+                    format!("failed to refresh scene \"{current_scene}\": {error}"),
+                );
             }
             rearm_scene_timer(
                 &*current_scene,
@@ -836,7 +1145,11 @@ async fn run_action<D: actions::ButtonDevice>(
             *previous_scene = Some(current_scene.clone());
             *current_scene = scene.clone();
             if let Err(error) = runner.enter_scene(&scene, scenes).await {
-                log.warn(format!("failed to enter scene \"{scene}\": {error}"));
+                warn_unless_disconnected(
+                    log,
+                    runner,
+                    format!("failed to enter scene \"{scene}\": {error}"),
+                );
             }
             rearm_scene_timer(
                 &*current_scene,
@@ -892,7 +1205,11 @@ async fn run_action<D: actions::ButtonDevice>(
                             _ => unreachable!("brightness effect on a colour parameter"),
                         };
                         if let Err(error) = result {
-                            log.warn(format!("failed to set {}: {error}", param.path()));
+                            warn_unless_disconnected(
+                                log,
+                                runner,
+                                format!("failed to set {}: {error}", param.path()),
+                            );
                         }
                     }
                     actions::DefaultEffect::Color(param, colour) => {
@@ -991,7 +1308,11 @@ async fn apply_completed_assignment<D: actions::ButtonDevice>(
                     _ => unreachable!("brightness effect on a colour parameter"),
                 };
                 if let Err(error) = result {
-                    log.warn(format!("failed to set {}: {error}", param.path()));
+                    warn_unless_disconnected(
+                        log,
+                        runner,
+                        format!("failed to set {}: {error}", param.path()),
+                    );
                 }
             }
             actions::DefaultEffect::Color(param, colour) => {
@@ -2760,5 +3081,25 @@ mod tests {
             state.timer_handle.is_none(),
             "an undefined scene has no timer to arm"
         );
+    }
+
+    /// A reconnect re-applies the brightness the user last set at runtime (not the
+    /// config's startup value), clamped to the device's 0-100 range.
+    #[test]
+    fn current_brightness_follows_runtime_changes_and_clamps() {
+        let variables = test_variables();
+        let defaults = Defaults::default();
+        assert_eq!(
+            super::current_brightness(&variables),
+            (defaults.button_brightness, defaults.encoder_brightness)
+        );
+        {
+            let mut state = variables.lock().unwrap();
+            state.set_button_brightness(35);
+            state.set_encoder_brightness(250);
+        }
+        assert_eq!(super::current_brightness(&variables), (35, 100));
+        variables.lock().unwrap().set_button_brightness(-4);
+        assert_eq!(super::current_brightness(&variables).0, 0);
     }
 }

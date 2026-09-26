@@ -5,6 +5,80 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.12.0 — Survive sleep, unplug and USB resets
+
+### User-facing changes
+- dak no longer dies when the computer goes to sleep or the keypad is
+  unplugged or reset. It prints `device #N disconnected (...); waiting for it
+  to come back`, looks for the same device again, and once it is back prints
+  `device #N reconnected (...)`, reapplies the current brightness and repaints
+  exactly what the buttons showed before: current scene, buttons inherited
+  from earlier scenes, variables, refreshing buttons and `*_exec` programs.
+  A key held down during the disconnect counts as released. Ctrl-C still
+  exits while waiting.
+- New settings `device_reconnect_interval` (seconds between attempts,
+  default 15, minimum 1; first attempt is immediate) and
+  `device_reconnect_max_attempts` (default 0 = unlimited), in `defaults` or
+  per device. When the attempts run out, dak reports
+  `device #N did not come back after M attempts; giving up on it` and stops
+  driving that device; once no device is left it exits non-zero. Both are
+  readable (not writable) as `$defaults.*`.
+- While a device is away, the errors from failed draws are no longer printed
+  (only with `-d device`).
+- One device failing no longer stops the other configured devices.
+- FreeBSD: reconnect may be flaky and needs more troubleshooting (see the
+  README); it has only been tested in a VM with USB passthrough.
+
+### Details
+- Cause of the crash: the input loop `break`s on any read error, the
+  cleanup then wrote to the gone device, `device.shutdown().await?` failed
+  and `main` returned the first device task's error, ending the process.
+- New `src/reconnect.rs`: `SwappableDevice<D>` implements `ButtonDevice`
+  over an `RwLock<Option<Arc<D>>>` plus a `watch` connection flag. Calls
+  fail fast with `SwapError::Disconnected` while no connection is attached;
+  a call failing with a disconnect error detaches the connection itself
+  (only if it is still the current one, via `Arc::ptr_eq`) and wakes
+  `disconnected()` waiters, so a write can notice a loss before the reader.
+  `is_disconnect_error` recognizes async-hid `Disconnected`/`NotConnected`,
+  OS errors ENODEV/ENXIO/EIO and timeouts, including the FreeBSD backend's
+  `nix` errno values matched by name. `ReconnectPolicy::resolve` combines
+  per-device and `defaults` settings; `wait_until` polls with a 1-based
+  attempt number, is cancellable, and returns `Found`/`Cancelled`/`GaveUp`.
+- `ButtonDevice` gained a default `is_connected()`; `SceneRunner` routes
+  device-write failures through `device_error`, which demotes them to a
+  `device` debug line while disconnected. New `SceneRunner::redraw_all`
+  re-resolves and re-applies every button in `active_setup`, leaving
+  still-running `*_exec` tasks alone and restarting finished ones with a new
+  generation; `ExecTracker::is_running` added.
+- `main.rs`: connection setup moved into `connect_device`; `run_device`
+  wraps the connection in `SwappableDevice` and runs a `'connection` loop
+  whose input loop ends in `SessionEnd::Quit` or `Disconnected`. On
+  disconnect the reader is dropped, press-tracking state is reset and
+  `await_reconnect` rediscovers via `list_devices` +
+  `discovered_device_matches`, reconnects with the current runtime
+  brightness (`current_brightness`), swaps the connection in and calls
+  `redraw_all`. Cleanup/shutdown are skipped when the device is gone.
+  `main` now waits for all device tasks and returns the first error last.
+- Config: `DEFAULTS_KEYS` gains both keys, `Defaults` gains
+  `device_reconnect_interval`/`device_reconnect_max_attempts`, `Mapping`
+  gains optional overrides (`skip_serializing_if`, never written by
+  `--map`); `check_reconnect_value` validates both places, removing device
+  keys before serde so errors are reported once. Both are read-only
+  `$defaults` targets.
+- Tests: unit tests for `SwappableDevice`, error classification, policy
+  resolution, `wait_until` (retry, cancel, give-up, last-attempt success),
+  messages and `current_brightness`; scene-runner tests for `redraw_all`
+  (inherited buttons, exec restart/leave-alone, swapped connection);
+  validation tests for the new keys; `--map` output unchanged.
+- Verified on FreeBSD 15.1 in a VM against a real AKP03E: `usbconfig`
+  power off/on and reset, `devctl detach` and hypervisor unplug/replug all
+  detected with one warning, reader thread exits cleanly, 0% CPU while
+  waiting, Ctrl-C while waiting exits promptly. One hypervisor replug left
+  the keypad un-enumerable by the kernel (`USB_ERR_TIMEOUT`); recorded in
+  `NOTES.md` section 7. `TODO.md` item 9 extended with SIGHUP device rescan
+  and clean SIGTERM shutdown.
+- Version bumped to `0.12.0`.
+
 ## v0.11.1 — No more false "program not found" warnings for programs in PATH
 
 ### User-facing changes

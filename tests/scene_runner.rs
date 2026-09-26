@@ -2428,3 +2428,166 @@ async fn text_value_renders_and_refreshes_from_variables() {
         "the refresh should have re-resolved the value text"
     );
 }
+
+// -- redraw after reconnect --
+
+/// Builds a runner over `device` with fresh exec/refresh channels, returning the exec
+/// receiver so tests can observe restarted `*_exec` programs.
+fn redraw_runner<D: ButtonDevice>(
+    device: &D,
+) -> (SceneRunner<'_, D>, tokio::sync::mpsc::Receiver<ExecEvent>) {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(8);
+    let runner = SceneRunner::new(
+        1,
+        device,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+    (runner, rx)
+}
+
+/// `redraw_all` repaints every button with an active operation - including one set by
+/// an earlier scene and merely inherited by the current one - and flushes exactly once,
+/// without touching buttons that never had content.
+#[tokio::test]
+async fn redraw_all_repaints_every_active_button_including_inherited_ones() {
+    let mock = MockButtonDevice::default();
+    let image_path = write_temp_image();
+    let (mut runner, _exec_rx) = redraw_runner(&mock);
+    let scenes = json!({
+        "A": { "setup": {
+            "1b01": { "type": "image", "params": image_path.to_str().unwrap() },
+            "1b02": { "type": "text_value", "params": "hi" }
+        }},
+        "B": { "setup": {
+            "1b04": { "type": "clear" }
+        }}
+    });
+    runner.enter_scene("A", &scenes).await.unwrap();
+    runner.enter_scene("B", &scenes).await.unwrap();
+    mock.calls.lock().unwrap().clear();
+
+    runner.redraw_all().await.unwrap();
+
+    let calls = mock.calls();
+    assert_eq!(
+        mock.kinds(&calls),
+        ["SetImage", "SetImage", "ClearImage", "Flush"]
+    );
+    assert_eq!(mock.keys(&calls), [0, 1, 3]);
+    let _ = std::fs::remove_file(&image_path);
+}
+
+/// `redraw_all` with nothing ever drawn only flushes.
+#[tokio::test]
+async fn redraw_all_without_content_only_flushes() {
+    let mock = MockButtonDevice::default();
+    let (mut runner, _exec_rx) = redraw_runner(&mock);
+    runner.redraw_all().await.unwrap();
+    assert_eq!(mock.kinds(&mock.calls()), ["Flush"]);
+}
+
+/// A finished `text_exec` is run again by `redraw_all` (its earlier output never
+/// reached the LCD of the new connection), and the old run's result becomes stale.
+#[tokio::test]
+async fn redraw_all_restarts_finished_exec_programs() {
+    let mock = MockButtonDevice::default();
+    let (mut runner, mut exec_rx) = redraw_runner(&mock);
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "echo first" } }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), exec_rx.recv())
+        .await
+        .expect("first run should report")
+        .unwrap();
+    let ExecEvent::Output {
+        generation: old, ..
+    } = first
+    else {
+        panic!("unexpected event {first:?}");
+    };
+    // Let the task finish so it counts as "not running".
+    while runner.tracker.is_running(2) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    runner.redraw_all().await.unwrap();
+
+    assert!(
+        !runner.tracker.is_current(2, old),
+        "old result must be stale"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(5), exec_rx.recv())
+        .await
+        .expect("redraw should restart the program")
+        .unwrap();
+    let ExecEvent::Output {
+        key, generation, ..
+    } = second
+    else {
+        panic!("unexpected event {second:?}");
+    };
+    assert_eq!(key, 2);
+    assert!(runner.tracker.is_current(2, generation));
+}
+
+/// A `text_exec` still running at redraw time is left alone: not killed, no red
+/// "Error" drawn, and its pending result stays current.
+#[tokio::test]
+async fn redraw_all_leaves_running_exec_programs_alone() {
+    let mock = MockButtonDevice::default();
+    let (mut runner, _exec_rx) = redraw_runner(&mock);
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "text_exec", "params": "sleep 10" } }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert!(runner.tracker.is_running(2));
+    mock.calls.lock().unwrap().clear();
+
+    runner.redraw_all().await.unwrap();
+
+    assert!(
+        runner.tracker.is_running(2),
+        "running program must not be killed"
+    );
+    assert_eq!(mock.kinds(&mock.calls()), ["Flush"]);
+}
+
+/// The runner keeps working across a disconnect through a `SwappableDevice`: while
+/// disconnected, scene application fails fast without reaching any device, and after a
+/// new connection is swapped in `redraw_all` repaints the pre-disconnect screen on it.
+#[tokio::test]
+async fn runner_redraws_on_a_swapped_in_connection() {
+    use dak::reconnect::SwappableDevice;
+    /// No error of the mock is a disconnect.
+    fn never(_: &std::convert::Infallible) -> bool {
+        false
+    }
+    let image_path = write_temp_image();
+    let device = SwappableDevice::new(MockButtonDevice::default(), never);
+    let (mut runner, _exec_rx) = redraw_runner(&device);
+    let scenes = scenes_with_buttons(
+        json!({ "1b03": { "type": "image", "params": image_path.to_str().unwrap() } }),
+    );
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    assert!(runner.is_connected());
+    device.mark_disconnected();
+    assert!(!device.is_connected());
+    assert!(!runner.is_connected());
+    let error = runner.redraw_all().await.unwrap_err();
+    assert_eq!(error.to_string(), "device disconnected");
+
+    device.replace(MockButtonDevice::default());
+    runner.redraw_all().await.unwrap();
+    let fresh = device.current().unwrap();
+    let calls = fresh.calls();
+    assert_eq!(fresh.kinds(&calls), ["SetImage", "Flush"]);
+    assert_eq!(fresh.keys(&calls), [2]);
+    let _ = std::fs::remove_file(&image_path);
+}

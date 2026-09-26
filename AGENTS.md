@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.11.1 (declared as `0.11.1` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.12.0 (declared as `0.12.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -52,6 +52,16 @@ under other platforms.
   (`VariableStore`/`Variables`) shared by every device
 - `src/baseplane.rs` — device addressing: the `Reference`/`Kind` model (device N,
   button B, encoder E) that scene configs and control references use
+- `src/reconnect.rs` — surviving the keypad disappearing (host suspend, unplug,
+  USB reset): `SwappableDevice`, the `ButtonDevice` handle the scene runner draws
+  through, whose connection `run_device` swaps for a fresh one once the device is
+  rediscovered; `is_disconnect_error` (ENODEV/ENXIO/EIO and async-hid's own
+  disconnect variants, plus timeouts); `ReconnectPolicy`, resolved per device from
+  `device_reconnect_interval`/`device_reconnect_max_attempts` (device definition
+  first, then `defaults`, then 15 s/unlimited); `wait_until`, the rediscovery poll
+  that Ctrl-C cancels and that gives up after the attempt limit; and the
+  always-shown connect/disconnect/give-up messages. FreeBSD reconnect is known to
+  be flaky under VM USB passthrough - see `NOTES.md` section 7
 - `src/press.rs` — complex press-event detection: turns a button's raw
   press/release timeline into `short_press`/`long_press`/`double_click` events
 - `src/color.rs` — button colours: parsing the `background`/`text_color` config
@@ -107,6 +117,10 @@ under other platforms.
 Work in progress. Current known issues:
 
 - `main.rs` config errors are printed, but the program still exits with `MirajazzError::BadData` regardless of the specific failure
+- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop) is
+  only unit-tested through its pieces (`SwappableDevice`, `wait_until`,
+  `SceneRunner::redraw_all`, `current_brightness`); the end-to-end
+  disconnect/rediscover/repaint sequence needs real hardware being unplugged
 - `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's
   interactive I/O still have no test coverage (both need a physical device *and*
   driving actual button presses/encoder turns/typed answers, which
