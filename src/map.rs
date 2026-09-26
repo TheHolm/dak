@@ -83,6 +83,16 @@ pub struct Mapping {
     /// version turns out to work better for your specific unit.
     #[serde(default)]
     pub protocol_version: Option<usize>,
+    /// Per-device override of `defaults.device_reconnect_interval` (seconds between
+    /// reconnect attempts after this device disappears); `None` uses the default.
+    /// Validated by the config loader, never written by `--map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_reconnect_interval: Option<u64>,
+    /// Per-device override of `defaults.device_reconnect_max_attempts` (0 = retry
+    /// forever); `None` uses the default. Validated by the config loader, never
+    /// written by `--map`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_reconnect_max_attempts: Option<u64>,
     /// Raw codes per physical button, in the order the user pressed them.
     pub buttons: Vec<ButtonMapping>,
     /// Raw twist codes per encoder, in the order the user turned them.
@@ -462,6 +472,8 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         encoder_count,
         screens,
         protocol_version: Some(protocol_version),
+        device_reconnect_interval: None,
+        device_reconnect_max_attempts: None,
         buttons,
         encoders,
     };
@@ -1047,6 +1059,8 @@ mod tests {
             encoder_count: 3,
             screens: 6,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![
                 ButtonMapping {
                     number: 1,
@@ -1085,6 +1099,8 @@ mod tests {
             encoder_count: 0,
             screens: 1,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![ButtonMapping {
                 number: 3,
                 press: 0x60,
@@ -1113,6 +1129,8 @@ mod tests {
             encoder_count: 1,
             screens: 1,
             protocol_version: Some(2),
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![
                 ButtonMapping {
                     number: 1,
@@ -1186,6 +1204,8 @@ mod tests {
             encoder_count: 0,
             screens: 0,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![],
             encoders: vec![],
         };
@@ -1290,6 +1310,17 @@ mod tests {
         assert!(!is_no(""));
     }
 
+    /// `--map` output never carries the per-device reconnect overrides: neither the
+    /// printed JSON nor the serde form, when they are unset.
+    #[test]
+    fn map_output_has_no_reconnect_settings() {
+        let mapping = sample_mapping();
+        assert!(!mapping_json(&mapping).contains("device_reconnect"));
+        let value = serde_json::to_value(&mapping).unwrap();
+        assert!(value.get("device_reconnect_interval").is_none());
+        assert!(value.get("device_reconnect_max_attempts").is_none());
+    }
+
     /// The mapping serializes to the documented JSON shape.
     #[test]
     fn mapping_serializes_as_expected_json() {
@@ -1301,6 +1332,8 @@ mod tests {
             encoder_count: 3,
             screens: 6,
             protocol_version: Some(2),
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![
                 super::ButtonMapping {
                     number: 1,
@@ -1474,6 +1507,8 @@ mod tests {
             encoder_count: 1,
             screens: 6,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![
                 ButtonMapping {
                     number: 1,

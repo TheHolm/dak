@@ -1,5 +1,5 @@
 .\" Man page for the dak configuration file. See man(7) and groff_man(7).
-.TH DAK-CONFIG 5 "2026-09-20" "dak 0.11.1" "File Formats"
+.TH DAK-CONFIG 5 "2026-09-20" "dak 0.12.0" "File Formats"
 .SH NAME
 dak\-config \- configuration file format for
 .BR dak (1)
@@ -69,7 +69,9 @@ optional and falls back to its built\-in value.
   "button_brightness": 50,
   "encoder_brightness": 50,
   "background": "#000000",
-  "text_color": "#ffffff"
+  "text_color": "#ffffff",
+  "device_reconnect_interval": 15,
+  "device_reconnect_max_attempts": 0
 }
 .RE
 .fi
@@ -124,6 +126,26 @@ A colour (default
 that button text is drawn in. See
 .B COLOURS
 below.
+.TP
+.B device_reconnect_interval
+Whole seconds, at least
+.B 1
+(default
+.BR 15 ),
+between attempts to get a device back after it disappeared; the first attempt
+is made right away. See
+.B DEVICES
+below.
+.TP
+.B device_reconnect_max_attempts
+How many reconnect attempts to make before giving up on a device (default
+.BR 0 ,
+meaning unlimited).
+.PP
+Both reconnect keys may also appear in a single device definition, where they
+override the
+.B defaults
+value for that device only.
 .SH COLOURS
 A colour value is either a
 .B #RRGGBB
@@ -248,6 +270,8 @@ parameter
 .BR encoder_brightness ,
 .BR short_press_duration ,
 .BR double_click_gap ,
+.BR device_reconnect_interval ,
+.BR device_reconnect_max_attempts ,
 .B background ,
 .BR text_color ;
 the last two are colours, the rest int), reflecting any runtime changes. A
@@ -304,7 +328,7 @@ and the colour keys
 .B background
 and
 .BR text_color .
-The read\-only timing parameters cannot be assigned.
+The read\-only timing and reconnect parameters cannot be assigned.
 .TP
 .B <op>
 .B :=
@@ -700,6 +724,11 @@ value recognized from the device id. Omit it or set it to JSON
 .B null
 to use the default.
 .TP
+.BR device_reconnect_interval ", " device_reconnect_max_attempts
+Optional. Override the
+.B defaults
+values of the same name for this device.
+.TP
 .B buttons
 One entry per button, mapping its
 .B number
@@ -727,6 +756,31 @@ every matched device is connected and driven with the shared scenes. A device
 defined in config but not found is reported with a warning, and a discovered
 device with no definition is ignored with a warning. When no configured
 device is found, the program exits with an error.
+.PP
+A device that disappears while dak runs (host suspend, unplugging, a USB bus
+reset) does not stop the program. dak warns
+\(lqdevice #\fIN\fR disconnected ...; waiting for it to come back\(rq,
+and looks for the same device, matched as at startup: right away, then every
+.B device_reconnect_interval
+seconds, for up to
+.B device_reconnect_max_attempts
+attempts (0 means forever). When they run out it reports
+\(lqdevice #\fIN\fR did not come back after \fIM\fR attempts; giving up on it\(rq
+and stops driving that device; the others keep running, and once none is left
+dak exits with a non\-zero status. When the device is back dak prints
+\(lqdevice #\fIN\fR reconnected ...\(rq. It then reapplies the current brightness and repaints what
+the buttons showed before: the current scene, buttons inherited from earlier
+scenes and all variables are kept, refreshing buttons resume, and
+.B text_exec
+and
+.B image_exec
+programs run again. A key held at the moment of the disconnect counts as
+released. Ctrl-C still exits while waiting. Only a failure of a device's
+first connection at startup is fatal, and only for that device.
+.PP
+On FreeBSD reconnecting may be flaky and needs more troubleshooting: after an
+unplug through VM USB passthrough the keypad was once not re\-enumerated by
+the kernel, and dak kept waiting for it.
 .SH EXAMPLE
 .nf
 .RS 4

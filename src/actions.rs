@@ -61,7 +61,52 @@ pub const DEFAULTS_KEYS: &[&str] = &[
     "encoder_brightness",
     "background",
     "text_color",
+    "device_reconnect_interval",
+    "device_reconnect_max_attempts",
 ];
+
+/// The reconnect keys a device definition may carry to override the `defaults` values
+/// of the same name for that device only.
+pub const DEVICE_RECONNECT_KEYS: &[&str] =
+    &["device_reconnect_interval", "device_reconnect_max_attempts"];
+
+/// Checks one reconnect setting (`key` is `device_reconnect_interval` or
+/// `device_reconnect_max_attempts`), shared by `defaults` and device definitions;
+/// `path` names it in errors. The interval is whole seconds, at least 1; the attempt
+/// limit is a whole number, 0 meaning unlimited.
+fn check_reconnect_value(
+    key: &str,
+    path: &str,
+    value: &Value,
+    errors: &mut Vec<String>,
+) -> Option<u64> {
+    let minimum = if key == "device_reconnect_interval" {
+        1
+    } else {
+        0
+    };
+    let what = if minimum == 1 {
+        "a whole number of seconds, at least 1"
+    } else {
+        "a whole number of attempts, 0 or more (0 = unlimited)"
+    };
+    match value.as_u64() {
+        Some(number) if number >= minimum => Some(number),
+        Some(number) => {
+            errors.push(format!("{path} must be {what}, got {number}"));
+            None
+        }
+        None => {
+            let shown = if value.is_number() {
+                value.to_string()
+            } else {
+                value_type(value).to_string()
+            };
+            errors.push(format!("{path} must be {what}, got {shown}"));
+            None
+        }
+    }
+}
 
 /// The scene `setup` operation types (the allowed `"type"` values). Setup validation
 /// rejects any kind not listed here before dispatching, keeping this list, the `match`
@@ -424,6 +469,18 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
                     Err(error) => errors.push(format!("defaults.{key}: {error}")),
                 }
             }
+            "device_reconnect_interval" | "device_reconnect_max_attempts" => {
+                let Some(number) =
+                    check_reconnect_value(key, &format!("defaults.{key}"), value, errors)
+                else {
+                    continue;
+                };
+                if key == "device_reconnect_interval" {
+                    result.device_reconnect_interval = Duration::from_secs(number);
+                } else {
+                    result.device_reconnect_max_attempts = number;
+                }
+            }
             _ => unreachable!("unknown keys are rejected above"),
         }
     }
@@ -506,8 +563,23 @@ fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapp
             ));
             continue;
         };
-        match serde_json::from_value::<Mapping>(value.clone()) {
-            Ok(mapping) => {
+        // The reconnect overrides are validated here, with the same messages as their
+        // `defaults` counterparts, and taken out before serde sees the definition so a
+        // bad value is reported once rather than twice.
+        let mut value = value.clone();
+        let mut overrides: [Option<u64>; 2] = [None, None];
+        if let Some(object) = value.as_object_mut() {
+            for (slot, key) in DEVICE_RECONNECT_KEYS.iter().enumerate() {
+                if let Some(raw) = object.remove(*key) {
+                    let path = format!("devices.\"{id}\".{key}");
+                    overrides[slot] = check_reconnect_value(key, &path, &raw, errors);
+                }
+            }
+        }
+        match serde_json::from_value::<Mapping>(value) {
+            Ok(mut mapping) => {
+                mapping.device_reconnect_interval = overrides[0];
+                mapping.device_reconnect_max_attempts = overrides[1];
                 by_id.insert(number, mapping);
             }
             Err(error) => errors.push(format!(
@@ -1934,6 +2006,14 @@ pub trait ButtonDevice: Send + Sync {
 
     /// Sets the device's encoder LED-ring brightness (0-100 percent).
     async fn set_led_brightness(&self, percent: u8) -> Result<(), Self::Error>;
+
+    /// Whether the device is currently believed to be attached. A handle that can lose
+    /// its device (see [`crate::reconnect::SwappableDevice`]) reports `false` once it
+    /// has, so write failures while the keypad is away are logged quietly instead of
+    /// as errors; a plain connection always reports `true`.
+    fn is_connected(&self) -> bool {
+        true
+    }
 }
 
 impl ButtonDevice for Device {
@@ -2072,6 +2152,12 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     /// Same next-draw-only effect as [`SceneRunner::set_background`].
     pub fn set_text_color(&mut self, text_color: Color) {
         self.text_color = text_color;
+    }
+
+    /// Whether the device this runner draws on is currently attached (see
+    /// [`ButtonDevice::is_connected`]).
+    pub fn is_connected(&self) -> bool {
+        self.device.is_connected()
     }
 
     /// Attaches the shared variable/default state, so `setup` params are resolved (and,
@@ -2347,7 +2433,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                             .set_button_image(key.saturating_sub(1), self.image_format, image)
                             .await
                         {
-                            self.log.error(format!(
+                            self.device_error(format!(
                                 "button {key}: failed to draw image from \"{path}\": {error}"
                             ));
                         } else {
@@ -2405,7 +2491,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                                     )
                                     .await
                                 {
-                                    self.log.error(format!(
+                                    self.device_error(format!(
                                         "button {key}: failed to draw text from \"{path}\": {error}"
                                     ));
                                 } else {
@@ -2465,8 +2551,9 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                             .set_button_image(key.saturating_sub(1), self.image_format, image)
                             .await
                         {
-                            self.log
-                                .error(format!("button {key}: failed to draw value text: {error}"));
+                            self.device_error(format!(
+                                "button {key}: failed to draw value text: {error}"
+                            ));
                         } else {
                             self.log.debug(
                                 Subsystem::Device,
@@ -2511,8 +2598,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             SceneOp::Clear { reference: _ } => {
                 self.log.debug(Subsystem::Scene, format!("clear key {key}"));
                 if let Err(error) = self.device.clear_button_image(key.saturating_sub(1)).await {
-                    self.log
-                        .error(format!("button {key}: failed to clear: {error}"));
+                    self.device_error(format!("button {key}: failed to clear: {error}"));
                 } else {
                     self.log
                         .debug(Subsystem::Device, format!("clear image on button {key}"));
@@ -2615,7 +2701,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                                 self.log
                                     .error(format!("button {key}: non-UTF-8 output: {error}"));
                                 if let Err(error) = self.draw_error_label(key).await {
-                                    self.log.error(format!(
+                                    self.device_error(format!(
                                         "button {key}: failed to draw error label: {error}"
                                     ));
                                 }
@@ -2644,7 +2730,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                                 "button {key}: output is not a valid image: {error}"
                             ));
                             if let Err(error) = self.draw_error_label(key).await {
-                                self.log.error(format!(
+                                self.device_error(format!(
                                     "button {key}: failed to draw error label: {error}"
                                 ));
                             }
@@ -2657,8 +2743,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     .set_button_image(key.saturating_sub(1), self.image_format, image)
                     .await
                 {
-                    self.log
-                        .error(format!("button {key}: failed to draw output: {error}"));
+                    self.device_error(format!("button {key}: failed to draw output: {error}"));
                     return;
                 }
                 self.log.debug(
@@ -2666,8 +2751,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     format!("set image on button {key} from exec output"),
                 );
                 if let Err(error) = self.device.flush().await {
-                    self.log
-                        .error(format!("button {key}: failed to flush output: {error}"));
+                    self.device_error(format!("button {key}: failed to flush output: {error}"));
                 }
             }
             ExecEvent::Error {
@@ -2680,8 +2764,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 }
                 self.log.error(format!("button {key}: {error}"));
                 if let Err(error) = self.draw_error_label(key).await {
-                    self.log
-                        .error(format!("button {key}: failed to draw error label: {error}"));
+                    self.device_error(format!("button {key}: failed to draw error label: {error}"));
                 }
             }
             ExecEvent::Assignment(_) => {
@@ -2709,8 +2792,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             "button {key}: killed running program because its content changed"
         ));
         if let Err(error) = self.draw_error_label(key).await {
-            self.log
-                .error(format!("button {key}: failed to draw error label: {error}"));
+            self.device_error(format!("button {key}: failed to draw error label: {error}"));
         }
     }
 
@@ -2740,9 +2822,79 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
     async fn fail_button(&mut self, key: u8, message: String) {
         self.log.error(message);
         if let Err(error) = self.draw_error_label(key).await {
-            self.log
-                .error(format!("button {key}: failed to draw error label: {error}"));
+            self.device_error(format!("button {key}: failed to draw error label: {error}"));
         }
+    }
+
+    /// Reports a failed write to the device: as an error while the device is attached,
+    /// but only as a `device` debug line once it is known to be gone (host asleep,
+    /// unplugged), where every draw is expected to fail until it reconnects and a full
+    /// redraw ([`SceneRunner::redraw_all`]) repaints everything anyway.
+    fn device_error(&self, message: String) {
+        if self.device.is_connected() {
+            self.log.error(message);
+        } else {
+            self.log.debug(
+                Subsystem::Device,
+                format!("{message} (device disconnected)"),
+            );
+        }
+    }
+
+    /// Repaints every button from the operation currently active on it, e.g. after the
+    /// device reconnected with blank LCDs.
+    ///
+    /// This restores exactly what was on screen - including buttons whose content was
+    /// inherited from earlier scenes, since `active_setup` tracks each button's latest
+    /// explicit entry regardless of which scene set it - rather than re-entering the
+    /// current scene. Each button goes through the same path as a refresh tick: params
+    /// are re-resolved against the current variables, `refresh_seconds` ticks are
+    /// re-armed and `*_exec` programs restart (with a new generation, so results of runs
+    /// started before the disconnect are discarded). One flush at the end.
+    pub async fn redraw_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut keys: Vec<u8> = self.active_setup.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            let operation = match self.refresh_sources.get(&key).cloned() {
+                Some(raw) => match self.resolve_op(&raw) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        self.log
+                            .warn(format!("button {key}: cannot redraw: {error}"));
+                        continue;
+                    }
+                },
+                None => match self.active_setup.get(&key).cloned() {
+                    Some(operation) => operation,
+                    None => continue,
+                },
+            };
+            let is_exec = matches!(
+                operation,
+                SceneOp::TextExec { .. } | SceneOp::ImageExec { .. }
+            );
+            if is_exec && self.tracker.is_running(key) {
+                // Still running from before the disconnect: its result is current and
+                // will draw on the new connection, so leave it alone rather than kill it
+                // (which would also paint a red "Error").
+                self.log.debug(
+                    Subsystem::Device,
+                    format!("button {key}: program still running; its output will redraw it"),
+                );
+                continue;
+            }
+            // A finished task is only dereferenced here, silently: its result (if not
+            // handled yet) belongs to a draw that never reached the LCD, so it is made
+            // stale and the program runs again below.
+            self.tracker.cancel(key);
+            self.log.debug(
+                Subsystem::Device,
+                format!("redraw button {key} after reconnect"),
+            );
+            self.apply_one_operation(&operation).await;
+        }
+        self.device.flush().await?;
+        Ok(())
     }
 }
 
@@ -2825,6 +2977,13 @@ impl ExecTracker {
     pub fn cancel(&mut self, key: u8) -> Option<PendingExec> {
         self.bump(key);
         self.pending.remove(&key)
+    }
+
+    /// Whether `key` has an `exec` task whose program is still running.
+    pub fn is_running(&self, key: u8) -> bool {
+        self.pending
+            .get(&key)
+            .is_some_and(|pending| !pending.handle.is_finished())
     }
 
     /// Whether an event tagged `generation` is still valid for `key`.
@@ -3213,8 +3372,8 @@ enum TargetClass {
 /// `devices.*`/`scenes.*` (and the whole `version`/`scenes`/`devices`/`defaults` keys)
 /// are read-only wholesale rather than field-by-field, since their shapes are
 /// config-author-chosen. `defaults.*` has an exact, fixed field list: the two brightness
-/// keys and the two colour keys are writable, the two timing keys are read-only, and
-/// anything else under `defaults` does not exist. Everything else is a variable reference
+/// keys and the two colour keys are writable, the two timing keys and the two reconnect
+/// keys are read-only, and anything else under `defaults` does not exist. Everything else is a variable reference
 /// (`$name` or `$var.name`), declared or not.
 fn classify_target(path: &str, variables: &Variables) -> TargetClass {
     match path {
@@ -3222,9 +3381,10 @@ fn classify_target(path: &str, variables: &Variables) -> TargetClass {
         "defaults.encoder_brightness" => TargetClass::Default(SettableDefault::EncoderBrightness),
         "defaults.background" => TargetClass::Default(SettableDefault::Background),
         "defaults.text_color" => TargetClass::Default(SettableDefault::TextColor),
-        "defaults.short_press_duration" | "defaults.double_click_gap" => {
-            TargetClass::ReadOnly(path.to_string())
-        }
+        "defaults.short_press_duration"
+        | "defaults.double_click_gap"
+        | "defaults.device_reconnect_interval"
+        | "defaults.device_reconnect_max_attempts" => TargetClass::ReadOnly(path.to_string()),
         "version" | "scenes" | "devices" | "defaults" => TargetClass::ReadOnly(path.to_string()),
         _ if path.starts_with("devices.") || path.starts_with("scenes.") => {
             TargetClass::ReadOnly(path.to_string())
@@ -4317,6 +4477,8 @@ mod tests {
             encoder_count: 3,
             screens: 6,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![],
             encoders: vec![],
         };
@@ -4352,6 +4514,8 @@ mod tests {
             encoder_count: 3,
             screens: 6,
             protocol_version: None,
+            device_reconnect_interval: None,
+            device_reconnect_max_attempts: None,
             buttons: vec![],
             encoders: vec![],
         };

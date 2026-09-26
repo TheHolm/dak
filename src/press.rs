@@ -43,6 +43,12 @@ pub struct Defaults {
     pub background: Color,
     /// Colour button text is drawn in. Mutable at runtime via `$defaults.text_color`.
     pub text_color: Color,
+    /// Time between attempts to reconnect a device that disappeared (host suspend,
+    /// unplug); at least one second. A device definition can override it.
+    pub device_reconnect_interval: Duration,
+    /// How many reconnect attempts are made before giving up on a device; 0 means
+    /// unlimited. A device definition can override it.
+    pub device_reconnect_max_attempts: u64,
 }
 
 impl Default for Defaults {
@@ -54,6 +60,8 @@ impl Default for Defaults {
             encoder_brightness: 50,
             background: Color::rgb(0x00, 0x00, 0x00),
             text_color: Color::rgb(0xff, 0xff, 0xff),
+            device_reconnect_interval: Duration::from_secs(15),
+            device_reconnect_max_attempts: 0,
         }
     }
 }

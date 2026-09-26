@@ -674,6 +674,14 @@ impl Variables {
                 "encoder_brightness" => Ok(self.encoder_brightness.to_string()),
                 "short_press_duration" => Ok(self.short_press_duration_ms.to_string()),
                 "double_click_gap" => Ok(self.double_click_gap_ms.to_string()),
+                "device_reconnect_interval" => Ok(self
+                    .defaults
+                    .device_reconnect_interval
+                    .as_secs()
+                    .to_string()),
+                "device_reconnect_max_attempts" => {
+                    Ok(self.defaults.device_reconnect_max_attempts.to_string())
+                }
                 "background" => Ok(self.background.text().to_string()),
                 "text_color" => Ok(self.text_color.text().to_string()),
                 _ => Err(format!("undefined variable \"{reference}\"")),
@@ -689,7 +697,9 @@ impl Variables {
                 "button_brightness"
                 | "encoder_brightness"
                 | "short_press_duration"
-                | "double_click_gap" => Some(VarType::Int),
+                | "double_click_gap"
+                | "device_reconnect_interval"
+                | "device_reconnect_max_attempts" => Some(VarType::Int),
                 "background" | "text_color" => Some(VarType::Str),
                 _ => None,
             },

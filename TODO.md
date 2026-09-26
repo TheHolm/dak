@@ -78,7 +78,12 @@
    and log the errors). `SIGUSR1`/`SIGUSR2` mapping to a named action overlaps with
    the existing scene/timer machinery and may be the simpler half to land first.
    Design-heavy and it interacts with the input/timer loop, so it needs care around
-   reload races.
+   reload races. A `SIGHUP` reload should also restart the device scan, picking up
+   keypads plugged in (or newly defined) since startup, and drop definitions that were
+   removed. Separately, `SIGTERM` (`systemctl stop`, `service dak stop`, `kill`)
+   should shut down cleanly like Ctrl-C - clear the changed buttons, close the device -
+   instead of killing the process on the spot and leaving the last images on the
+   keypad; so should `SIGHUP` until reload exists.
 10. D-Bus integration to watch and/or submit events (probably not). Would expose
     button/encoder events on the session bus and/or let `dak` react to other
     applications' signals (e.g. show now-playing). Adds a dependency (`zbus`/`dbus`),

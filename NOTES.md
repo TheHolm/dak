@@ -35,6 +35,7 @@ FreeBSD/cross-compiling) and states its own environment inline.
 4. [`dak`'s actual runtime dependencies on FreeBSD](#4-daks-actual-runtime-dependencies-on-freebsd)
 5. [CI TODO / open questions](#5-ci-todo--open-questions)
 6. [Animated button images: real-hardware findings](#6-animated-button-images-real-hardware-findings)
+7. [Device disconnect/reconnect on FreeBSD](#7-device-disconnectreconnect-on-freebsd)
 
 ---
 
@@ -722,3 +723,65 @@ endpoint's total bytes/URB count:
 ```sh
 awk '$3=="C" && $4 ~ /^Io:2:003/ {sum+=$6; n++} END {print n, sum}' capture.txt
 ```
+
+---
+
+## 7. Device disconnect/reconnect on FreeBSD
+
+Findings from testing v0.12.0's reconnect support (`src/reconnect.rs`,
+`run_device`'s `'connection` loop) on a FreeBSD 15.1-RELEASE VM with the
+keypad (AKP03E rev. 2) passed through from a Linux KVM host. Not yet tried on
+bare metal; **treat FreeBSD reconnect as flaky** until it has been.
+
+### Setup inside the guest
+
+- `hw.usb.usbhid.enable=1` was already on in the template; `hidraw` needed
+  `kldload hidraw` (plus `hidraw_load="YES"` in `/boot/loader.conf`).
+- devfs rule as in `INSTALL.md` (`hidraw*` mode 0660 group operator) plus the
+  user in `operator`. The keypad appears as three `hidraw` nodes (two for its
+  own two `usbhid` interfaces, one for the QEMU tablet); dak uses `hidraw0`.
+- `usbconfig power_off`/`power_on`/`reset` need root even with those devfs
+  rules (the `ugen`/`usb` nodes are not covered by them).
+- A native `cargo build --release` (`pkg install rust`) takes ~6 min on 2
+  vCPUs - fine for a test VM, no need for the cross toolchain from section 1.
+
+### What each kind of disconnect looks like to dak
+
+| Trigger (in guest) | First error dak sees | Recovery |
+|---|---|---|
+| `usbconfig -d ugenX.Y power_off` | reader: `HidError(Disconnected)` (read gets `EIO`) | `power_on` -> re-enumerated, reconnect + repaint |
+| `devctl detach usbhid0` with a refreshing button | write: `HidError(Other(ENXIO))` (flush) | see below |
+| `devctl detach usbhid0` on a static screen | reader: `HidError(Disconnected)` | see below |
+| unplug via the hypervisor (remove passthrough device) | write: `HidError(Other(ETIMEDOUT))`, then reader `Disconnected` | re-add -> reconnect + repaint |
+
+- The errno values arrive as `nix` errors (`ENXIO`, `ETIMEDOUT` in the
+  `Display` text), not `std::io::Error`, which is why
+  `is_disconnect_error` matches them by name. `ETIMEDOUT` was missed at first
+  and produced a spurious `error: button N: failed to flush output` before the
+  reader noticed - hence timeouts now count as disconnects.
+- After a disconnect the vendored `hidraw_bsd` background reader thread exits
+  cleanly (thread count drops by one, no `hidraw` fd left open, 0% CPU while
+  waiting): a read on a detached `hidraw` node returns an error, not a 0-byte
+  EOF, so no busy loop. Ctrl-C while waiting exits in well under a second.
+- `devctl attach usbhid0` after a `devctl detach` fails with "No such file or
+  directory"; `usbconfig -d ugenX.Y reset` re-attaches it instead.
+
+### Open problem: device not re-enumerated after a hypervisor unplug
+
+After one remove/re-add of the passthrough device dak reconnected and
+repainted fine, but a later scene switch timed out mid-write and the keypad
+then vanished from the guest for good:
+
+```
+usbd_setup_device_desc: getting device descriptor at addr 1 failed, USB_ERR_TIMEOUT
+usbd_req_re_enumerate: addr=1, set address failed! (USB_ERR_IOERROR, ignored)
+ugen1.2: <Unknown > at usbus1 (disconnected)
+uhub_reattach_port: could not allocate new device
+```
+
+dak behaved correctly (kept waiting, idle), but nothing in software brought
+the keypad back. Unresolved whether this is the keypad's firmware, QEMU's
+USB passthrough, or FreeBSD's xhci. One suspect: the device was passed through
+on a USB3 port (`usb3=1`) although it is a USB 2.0 high-speed device; retry
+with USB3 off, and on bare metal, before blaming dak.
+

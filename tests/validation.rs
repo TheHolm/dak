@@ -274,10 +274,128 @@ fn rejects_unknown_defaults_key() {
     let errors = error_texts(config.unwrap_err());
     assert!(
         errors.contains(
-            "defaults: unknown key \"long_press_duration\", expected one of \"short_press_duration\", \"double_click_gap\", \"button_brightness\", \"encoder_brightness\", \"background\", \"text_color\""
+            "defaults: unknown key \"long_press_duration\", expected one of \"short_press_duration\", \"double_click_gap\", \"button_brightness\", \"encoder_brightness\", \"background\", \"text_color\", \"device_reconnect_interval\", \"device_reconnect_max_attempts\""
         ),
         "{errors}"
     );
+}
+
+// -- reconnect settings --
+
+/// Loads a config with `defaults_json` as `defaults` and one device definition carrying
+/// `device_extra` (extra JSON members, e.g. `"device_reconnect_interval": 3,`), returning
+/// the load result.
+fn load_with_reconnect(
+    defaults_json: &str,
+    device_extra: &str,
+) -> Result<dak::actions::LoadedConfig, Vec<String>> {
+    let path = write_temp_config(&format!(
+        r#"{{
+  "scenes": {{ "on_start": {{ "actions": {{}} }} }},
+  "defaults": {defaults_json},
+  "devices": {{
+    "1": {{
+      {device_extra}
+      "device_id": "0300:3002", "device_name": "keypad", "serial": "unknown",
+      "key_count": 9, "encoder_count": 3, "screens": 6,
+      "buttons": [], "encoders": []
+    }}
+  }}
+}}"#
+    ));
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    config
+}
+
+/// Without any reconnect settings: 15 s between attempts, unlimited attempts, and the
+/// device definition carries no overrides.
+#[test]
+fn reconnect_settings_default_to_15s_unlimited() {
+    let config = load_with_reconnect("{}", "").unwrap();
+    assert_eq!(
+        config.defaults.device_reconnect_interval,
+        std::time::Duration::from_secs(15)
+    );
+    assert_eq!(config.defaults.device_reconnect_max_attempts, 0);
+    let device = &config.devices.by_id[&1];
+    assert_eq!(device.device_reconnect_interval, None);
+    assert_eq!(device.device_reconnect_max_attempts, None);
+}
+
+/// `defaults` values and per-device overrides both load; the minimum interval (1 s)
+/// is accepted.
+#[test]
+fn reconnect_settings_load_from_defaults_and_device() {
+    let config = load_with_reconnect(
+        r#"{"device_reconnect_interval": 30, "device_reconnect_max_attempts": 5}"#,
+        r#""device_reconnect_interval": 1, "device_reconnect_max_attempts": 0,"#,
+    )
+    .unwrap();
+    assert_eq!(
+        config.defaults.device_reconnect_interval,
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(config.defaults.device_reconnect_max_attempts, 5);
+    let device = &config.devices.by_id[&1];
+    assert_eq!(device.device_reconnect_interval, Some(1));
+    assert_eq!(device.device_reconnect_max_attempts, Some(0));
+}
+
+/// Invalid reconnect values are rejected, in `defaults` and on a device alike, with a
+/// message naming where the value is. An interval of 0 is below the 1 s minimum.
+#[test]
+fn reconnect_settings_reject_invalid_values() {
+    let cases = [
+        (
+            r#"{"device_reconnect_interval": 0}"#,
+            "",
+            "defaults.device_reconnect_interval must be a whole number of seconds, at least 1, got 0",
+        ),
+        (
+            r#"{"device_reconnect_interval": 2.5}"#,
+            "",
+            "defaults.device_reconnect_interval must be a whole number of seconds, at least 1, got 2.5",
+        ),
+        (
+            r#"{"device_reconnect_max_attempts": -1}"#,
+            "",
+            "defaults.device_reconnect_max_attempts must be a whole number of attempts, 0 or more (0 = unlimited), got -1",
+        ),
+        (
+            "{}",
+            r#""device_reconnect_interval": "soon","#,
+            "devices.\"1\".device_reconnect_interval must be a whole number of seconds, at least 1, got a string",
+        ),
+        (
+            "{}",
+            r#""device_reconnect_max_attempts": -3,"#,
+            "devices.\"1\".device_reconnect_max_attempts must be a whole number of attempts",
+        ),
+    ];
+    for (defaults, device, expected) in cases {
+        let errors = error_texts(load_with_reconnect(defaults, device).unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "expected {expected:?}, got: {errors}"
+        );
+        // Reported once, not a second time by the device-mapping parser.
+        assert!(!errors.contains("not a valid device mapping"), "{errors}");
+    }
+}
+
+/// The reconnect settings can be read as `$defaults.*` values but not assigned.
+#[test]
+fn reconnect_defaults_are_readable_but_read_only() {
+    let path = write_config_with_defaults(
+        r#"{"device_reconnect_interval": 20}"#,
+        r#"{"on_start": {"setup": {"1b01": {"type": "text_value", "params": "$defaults.device_reconnect_interval"}}, "actions": {"1b02": {"pressed": "$defaults.device_reconnect_max_attempts := 3"}}}}"#,
+    );
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(errors.contains("device_reconnect_max_attempts"), "{errors}");
+    assert!(!errors.contains("device_reconnect_interval"), "{errors}");
 }
 
 /// Zero and non-numeric durations in `defaults` are rejected.
