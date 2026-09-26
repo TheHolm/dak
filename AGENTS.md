@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.12.0 (declared as `0.12.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.13.0 (declared as `0.13.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -25,6 +25,8 @@ DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Aja
 - `async-hid` — underlying HID transport (pulled in via `mirajazz`)
 - `image` — image loading/JPEG encoding for button screens
 - `ab_glyph` — font rendering for button text labels
+- `unicode-segmentation` / `unicode-width` — grapheme clusters and display widths for
+  cutting button text to 6 columns (emoji count as 2)
 - `clap` — command-line argument parsing
 - `serde` / `serde_json` — config file parsing
 - `chrono` — date/time (for timers)
@@ -45,8 +47,10 @@ under other platforms.
   `clap_mangen` dev-dependency renders it; see `man/` below)
 - `src/actions.rs` — config loading and scene/action handling; also the public
   vocabulary constants (`TOP_LEVEL_KEYS`, `DEFAULTS_KEYS`, `SETUP_KINDS`,
-  `CONTROL_EVENTS`, `ENCODER_EVENTS`) that both validation and
-  `tests/man_pages.rs` use
+  `SETUP_ENTRY_FIELDS`, `CONTROL_EVENTS`, `ENCODER_EVENTS`) that both validation and
+  `tests/man_pages.rs` use. Config loading also loads `defaults.fonts` into
+  `LoadedConfig::fonts`, which `main.rs` hands every `SceneRunner` via
+  `set_text_settings` together with `defaults.markup`
 - `src/variables.rs` — declared variables and their validation, `$` reference
   expansion/substitution, and the runtime variable/default state
   (`VariableStore`/`Variables`) shared by every device
@@ -67,7 +71,19 @@ under other platforms.
 - `src/color.rs` — button colours: parsing the `background`/`text_color` config
   values (hex or CSS colour names) and alpha-compositing transparent images onto
   an opaque background
-- `src/text.rs` — text rendering for button LCDs using a font embedded in the binary
+- `src/markup.rs` — button text markup: parses a `text`/`text_value`/`text_exec`
+  entry's text into lines of styled spans (`Line`/`Span`/`Style`/`Align`) per its
+  `markup` (`none`, or the default `tmux`: `#[bold,fg=red,align=left]` tags, `##`
+  escape, and the non-tmux `#[u=1F600]` / `#[u=1F44D,1F3FD]` code-point extension);
+  malformed tags stay literal and come back as warnings. `MARKUP_VALUES` is a
+  vocabulary constant `tests/man_pages.rs` checks
+- `src/text.rs` — text rendering for button LCDs. `FontSet` holds a lookup chain per
+  style (configured `defaults.fonts` file first, then the embedded DejaVu Sans Mono
+  regular/bold/oblique/bold-oblique) plus the emoji chain (configured, then embedded
+  monochrome Noto Emoji); `FontSet::embedded()` is parsed once and shared,
+  `FontSet::load(&FontPaths)` reads configured files (`path#N` = `.ttc` face, 32 MiB
+  cap). `render_lines` draws `markup::Line`s; `render_text`/`render_text_colored`/
+  `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
   (`device`/`scene`/`action`) by `-d`/`--debug`
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
@@ -78,6 +94,13 @@ under other platforms.
   constants for their own connection setup rather than depending on this module
 - `src/lib.rs` — library crate exposing config loading/validation and the scene
   runner so both the binary and the integration tests can drive it
+- `fonts/` — the fonts embedded with `include_bytes!` (all unmodified upstream files:
+  DejaVu Sans Mono 2.37 in four styles, Noto Emoji 3.000 monochrome variable font)
+  and their licences (`LICENSE.txt` = DejaVu's, `OFL.txt` = Noto Emoji's)
+- `debian/copyright` — DEP-5 licence file with the full AGPL, Bitstream Vera, Arev
+  and OFL-1.1 texts; the only licence file installed by both the `.deb`s (as a
+  cargo-deb asset) and the FreeBSD `.pkg`. `tests/packaging.rs` keeps it in step with
+  `LICENSE`/`fonts/*`. See `NOTES.md` section 8 for why (Debian/Ubuntu policy)
 - `config.json` — the user's own runtime config (gitignored, not checked in):
   scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `config.json.example` — checked-in template new users copy to `config.json`
@@ -92,7 +115,7 @@ under other platforms.
   `tests/man_pages.rs` guards filenames/section/version, compares the committed
   `dak.1` to a fresh render semantically (normalized tokens, so `clap_mangen`
   needs no pinning), and checks `dak-config.5` documents every vocabulary
-  constant from `src/actions.rs`/`src/variables.rs`. Both pages' `.TH` version
+  constant from `src/actions.rs`/`src/variables.rs`/`src/markup.rs`/`src/text.rs`. Both pages' `.TH` version
   fields must match `Cargo.toml`'s `version`.
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
@@ -110,6 +133,8 @@ under other platforms.
 
 - `QUERY` in `main.rs` (vendor 0x0300, product 0x3002) filters the device list
 - Images are 60x60 JPEG; the `image` crate computes them on the fly
+- Button text: at most 3 lines x 6 display columns, scaled to fit; embedding the fonts
+  grew the release binary by about 3 MB (5.6 MB to 8.7 MB)
 - The device supports distinct press/release key and encoder states
 
 ## Status / known gaps

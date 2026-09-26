@@ -77,8 +77,10 @@ def build_manifest(args: argparse.Namespace, files: dict) -> dict:
         "arch": f"freebsd:{args.freebsd_major}:{args.arch_alias}",
         "prefix": "/usr/local",
         "flatsize": flatsize,
-        "licenselogic": "single",
-        "licenses": [args.license],
+        # "multi" is FreeBSD's LICENSE_COMB=multi: every listed licence applies at
+        # once (the AGPL program plus the embedded fonts' own licences).
+        "licenselogic": "multi" if len(args.license) > 1 else "single",
+        "licenses": args.license,
         "desc": args.desc,
         "categories": [args.category],
         "files": files,
@@ -146,7 +148,12 @@ def parse_args(argv: list) -> argparse.Namespace:
     )
     parser.add_argument("--maintainer", default="theholm@github.com")
     parser.add_argument("--www", default="https://github.com/theholm/dak")
-    parser.add_argument("--license", default="AGPL3")
+    # Repeatable. The defaults are dak's own AGPL plus the licences of the fonts
+    # embedded in the binary: DejaVu Sans Mono (the Arev and Bitstream Vera terms,
+    # named as the x11-fonts/dejavu port names them) and Noto Emoji (OFL 1.1, as
+    # x11-fonts/noto-emoji names it). The full texts ship in the package's
+    # share/doc/dak/copyright (debian/copyright).
+    parser.add_argument("--license", action="append", default=None)
     parser.add_argument("--category", default="sysutils")
     parser.add_argument(
         "--desc",
@@ -158,7 +165,10 @@ def parse_args(argv: list) -> argparse.Namespace:
     parser.add_argument("--freebsd-major", default="15")
     parser.add_argument("--arch", default="amd64")
     parser.add_argument("--arch-alias", default="x86:64")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.license is None:
+        args.license = ["AGPL3", "AREV", "BITSTREAM", "OFL11"]
+    return args
 
 
 def main(argv: list) -> int:

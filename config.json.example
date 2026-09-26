@@ -11,7 +11,11 @@
     "button_brightness": 50,
     "encoder_brightness": 50,
     "background": "#000000",
-    "text_color": "#ffffff"
+    "text_color": "#ffffff",
+    // Button text understands tmux-style tags like "#[bold,fg=red]"; "none" turns
+    // that off. Add "fonts": { "regular": "/path/to/font.ttf", ... } to use your own
+    // fonts - see the README's "Text markup" and "Fonts" sections.
+    "markup": "tmux"
   },
   "scenes": {
     "on_start": {
@@ -19,7 +23,8 @@
         "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
         "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
         "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-        "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
+        "1b04": { "type": "text", "params": "/tmp/aaa.txt" },
+        "1b05": { "type": "text_value", "params": "#[bold]Hi#[nobold,fg=yellow,u=1F600]\n#[align=left,italics]dak" }
       },
       "actions": {
         "1b01": { "short_press": "@", "long_press": "", "double_click": "", "pressed": "", "released": "" },

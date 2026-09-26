@@ -14,8 +14,12 @@
 //! A real content change - a renamed flag, reworded help, edited appendix - still fails.
 
 use clap::CommandFactory;
-use dak::actions::{CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_KINDS, TOP_LEVEL_KEYS};
+use dak::actions::{
+    CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
+};
 use dak::cli::Cli;
+use dak::markup::MARKUP_VALUES;
+use dak::text::FONT_KEYS;
 use dak::variables::{RESERVED_NAMES, VARIABLE_KEYS};
 
 /// `man/dak.1`: the file that must exist, the name/section its `.TH` header declares,
@@ -380,10 +384,13 @@ fn dak_config_5_documents_the_config_vocabulary() {
     let text = canonical_text(
         &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
     );
-    let groups: [(&str, &[&str]); 7] = [
+    let groups: [(&str, &[&str]); 10] = [
         ("top-level key", TOP_LEVEL_KEYS),
         ("defaults key", DEFAULTS_KEYS),
         ("setup type", SETUP_KINDS),
+        ("setup entry field", SETUP_ENTRY_FIELDS),
+        ("markup value", MARKUP_VALUES),
+        ("defaults.fonts key", FONT_KEYS),
         ("button event", CONTROL_EVENTS),
         ("encoder event", ENCODER_EVENTS),
         ("variable key", VARIABLE_KEYS),

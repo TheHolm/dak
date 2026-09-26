@@ -1,14 +1,37 @@
-//! Text rendering for button LCDs using a font embedded into the binary.
+//! Text rendering for button LCDs, using fonts embedded into the binary plus any the
+//! config names in `defaults.fonts`.
+//!
+//! Text arrives as [`Line`]s of styled spans (see [`crate::markup`]). Each line is cut to
+//! [`MAX_LINE_CHARS`] display columns, counted over grapheme clusters so a character is
+//! never split and a wide character (an emoji, a CJK ideograph) takes two columns. Only
+//! the first [`MAX_LINES`] lines are kept. The text is then scaled as large as fits the
+//! button, and every line placed by its alignment.
+//!
+//! Glyphs are looked up per character, in this order: the configured font for the span's
+//! style (regular, bold, italic or bold italic), the embedded DejaVu Sans Mono face of
+//! that style, the configured emoji font, the embedded monochrome Noto Emoji, and finally
+//! the style font's "missing glyph" box. Glyphs a font only has as colour bitmaps/layers
+//! (colour emoji fonts) cannot be drawn by `ab_glyph` and are skipped the same way as
+//! missing ones. There is no text shaping: variation selectors and zero-width joiners are
+//! dropped, and an emoji made of several code points (skin tone, ZWJ sequence, flag)
+//! shows only its first one - a monochrome font has no skin tones to show anyway.
 
 use std::error::Error;
+use std::fmt;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
-use ab_glyph::{point, Font, FontRef, ScaleFont};
+use ab_glyph::{point, Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont};
 use image::{Rgb, RgbImage};
 use mirajazz::types::ImageFormat;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::color::Color;
+use crate::markup::{plain_lines, Align, Line, Style};
 
-/// Maximum number of characters shown per line on a button.
+/// Maximum number of display columns shown per line on a button: six ordinary
+/// characters, or three wide ones such as emoji.
 ///
 /// Matches the config documentation for the `text` and `text_exec` commands.
 pub const MAX_LINE_CHARS: usize = 6;
@@ -18,9 +41,33 @@ pub const MAX_LINE_CHARS: usize = 6;
 /// Matches the config documentation for the `text` and `text_exec` commands.
 pub const MAX_LINES: usize = 3;
 
-/// DejaVu Sans Mono embedded into the binary, so text rendering works without
-/// any font files installed on the host. Free to redistribute, see `fonts/LICENSE.txt`.
+/// The keys `defaults.fonts` may contain, in documentation order: the four text styles
+/// and the emoji fallback. Also the vocabulary `tests/man_pages.rs` requires
+/// `dak-config.5` to document.
+pub const FONT_KEYS: &[&str] = &["regular", "bold", "italic", "bold_italic", "emoji"];
+
+/// Largest font file `defaults.fonts` may name; bigger files are refused rather than
+/// read into memory whole.
+pub const MAX_FONT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// DejaVu Sans Mono (regular, bold, oblique, bold oblique) embedded into the binary, so
+/// text rendering works without any font files installed on the host. All four faces
+/// share one character width, so mixed styles stay on a monospace grid. Free to
+/// redistribute, see `fonts/LICENSE.txt`.
 static FONT_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono.ttf");
+/// See [`FONT_BYTES`].
+static FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono-Bold.ttf");
+/// See [`FONT_BYTES`].
+static FONT_ITALIC_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono-Oblique.ttf");
+/// See [`FONT_BYTES`].
+static FONT_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono-BoldOblique.ttf");
+/// Monochrome Noto Emoji (unmodified), the embedded fallback for characters the text
+/// fonts lack. SIL Open Font License 1.1, see `fonts/OFL.txt`.
+static EMOJI_BYTES: &[u8] = include_bytes!("../fonts/NotoEmoji-VariableFont_wght.ttf");
+
+/// Characters dropped before drawing because, without text shaping, they have nothing
+/// to show: text/emoji variation selectors and the zero-width joiner.
+const IGNORED_CHARS: &[char] = &['\u{FE0E}', '\u{FE0F}', '\u{200D}'];
 
 /// The default text colour (white), used by [`render_text`].
 fn default_text_color() -> Color {
@@ -32,15 +79,235 @@ fn default_background() -> Color {
     Color::rgb(0x00, 0x00, 0x00)
 }
 
-/// Extracts up to three lines of up to six characters from `text`, as shown on a button.
+/// The font files named by `defaults.fonts`, already `~`/`$`-expanded. `None` keeps the
+/// embedded font for that slot. A path may end in `#N` to pick face `N` (0-based) of a
+/// `.ttc`/`.otc` collection.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FontPaths {
+    /// Font for text that is neither bold nor italic.
+    pub regular: Option<String>,
+    /// Font for bold text.
+    pub bold: Option<String>,
+    /// Font for italic text.
+    pub italic: Option<String>,
+    /// Font for bold italic text.
+    pub bold_italic: Option<String>,
+    /// Fallback font for characters none of the text fonts have (typically emoji).
+    pub emoji: Option<String>,
+}
+
+impl FontPaths {
+    /// The path configured under `key` (one of [`FONT_KEYS`]), for generic handling.
+    pub fn slot_mut(&mut self, key: &str) -> Option<&mut Option<String>> {
+        match key {
+            "regular" => Some(&mut self.regular),
+            "bold" => Some(&mut self.bold),
+            "italic" => Some(&mut self.italic),
+            "bold_italic" => Some(&mut self.bold_italic),
+            "emoji" => Some(&mut self.emoji),
+            _ => None,
+        }
+    }
+}
+
+/// The fonts text is drawn with: a lookup chain per style plus the emoji fallback chain.
+/// Parsed once (at startup for configured fonts) and shared behind an [`Arc`].
+#[derive(Clone)]
+pub struct FontSet {
+    /// Lookup chain per style, indexed by [`style_index`]: the configured font (if any)
+    /// first, then the embedded face.
+    faces: [Vec<FontArc>; 4],
+    /// Fallback chain for characters no face of the style has: the configured emoji
+    /// font (if any), then the embedded Noto Emoji.
+    emoji: Vec<FontArc>,
+}
+
+impl fmt::Debug for FontSet {
+    /// Fonts have no useful textual form; show only how many fonts each chain holds.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FontSet")
+            .field(
+                "faces",
+                &self.faces.iter().map(Vec::len).collect::<Vec<_>>(),
+            )
+            .field("emoji", &self.emoji.len())
+            .finish()
+    }
+}
+
+/// The index of `style`'s face in [`FontSet::faces`]: regular, bold, italic, bold italic.
+fn style_index(style: &Style) -> usize {
+    usize::from(style.bold) + 2 * usize::from(style.italic)
+}
+
+/// Parses one of the embedded fonts; they are known-good, so failure is a build bug.
+fn embedded_font(bytes: &'static [u8]) -> FontArc {
+    FontArc::try_from_slice(bytes).expect("embedded font is valid")
+}
+
+impl FontSet {
+    /// The embedded fonts only, parsed on first use and shared afterwards.
+    pub fn embedded() -> Arc<FontSet> {
+        static EMBEDDED: OnceLock<Arc<FontSet>> = OnceLock::new();
+        EMBEDDED
+            .get_or_init(|| {
+                Arc::new(FontSet {
+                    faces: [
+                        vec![embedded_font(FONT_BYTES)],
+                        vec![embedded_font(FONT_BOLD_BYTES)],
+                        vec![embedded_font(FONT_ITALIC_BYTES)],
+                        vec![embedded_font(FONT_BOLD_ITALIC_BYTES)],
+                    ],
+                    emoji: vec![embedded_font(EMOJI_BYTES)],
+                })
+            })
+            .clone()
+    }
+
+    /// Builds the font set for `paths`: each configured file is read and parsed now and
+    /// put in front of the embedded font of its slot. Every problem (missing file, file
+    /// too large, not a font, collection index out of range) is reported, prefixed with
+    /// `defaults.fonts.<slot>`.
+    pub fn load(paths: &FontPaths) -> Result<FontSet, Vec<String>> {
+        let embedded = FontSet::embedded();
+        let mut set = (*embedded).clone();
+        let mut errors = Vec::new();
+        let slots = [
+            ("regular", &paths.regular),
+            ("bold", &paths.bold),
+            ("italic", &paths.italic),
+            ("bold_italic", &paths.bold_italic),
+        ];
+        for (index, (key, path)) in slots.into_iter().enumerate() {
+            if let Some(path) = path {
+                match load_font_file(path) {
+                    Ok(font) => set.faces[index].insert(0, font),
+                    Err(error) => errors.push(format!("defaults.fonts.{key}: {error}")),
+                }
+            }
+        }
+        if let Some(path) = &paths.emoji {
+            match load_font_file(path) {
+                Ok(font) => set.emoji.insert(0, font),
+                Err(error) => errors.push(format!("defaults.fonts.emoji: {error}")),
+            }
+        }
+        if errors.is_empty() {
+            Ok(set)
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// The font whose metrics lay out every line: the first regular face.
+    fn primary(&self) -> &FontArc {
+        &self.faces[0][0]
+    }
+
+    /// Finds the font and glyph to draw `ch` in `style` with, following the lookup
+    /// order in the module documentation. The flag is true when the glyph came from the
+    /// emoji chain (and so is fitted into its cells rather than drawn at its advance).
+    fn resolve(&self, ch: char, style: &Style) -> (&FontArc, GlyphId, bool) {
+        let chain = &self.faces[style_index(style)];
+        for font in chain {
+            if let Some(id) = drawable_glyph(font, ch) {
+                return (font, id, false);
+            }
+        }
+        for font in &self.emoji {
+            if let Some(id) = drawable_glyph(font, ch) {
+                return (font, id, true);
+            }
+        }
+        let font = &chain[0];
+        (font, font.glyph_id(ch), false)
+    }
+}
+
+/// `font`'s glyph for `ch` when it has a usable one: present in the character map and,
+/// unless `ch` is whitespace (which legitimately has no outline), an outline - which a
+/// colour-only emoji glyph lacks, so such fonts fall through to the next one.
+fn drawable_glyph(font: &FontArc, ch: char) -> Option<GlyphId> {
+    let id = font.glyph_id(ch);
+    if id.0 == 0 {
+        return None;
+    }
+    (ch.is_whitespace() || font.outline(id).is_some()).then_some(id)
+}
+
+/// Reads and parses one configured font file. A trailing `#N` on `spec` selects face
+/// `N` of a font collection; files over [`MAX_FONT_FILE_BYTES`] are refused.
+pub fn load_font_file(spec: &str) -> Result<FontArc, String> {
+    let (path, index) = split_face_index(spec);
+    let metadata = std::fs::metadata(path).map_err(|error| format!("\"{path}\": {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("\"{path}\" is not a regular file"));
+    }
+    if metadata.len() > MAX_FONT_FILE_BYTES {
+        return Err(format!(
+            "\"{path}\" is larger than {} MiB",
+            MAX_FONT_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(path).map_err(|error| format!("\"{path}\": {error}"))?;
+    let font = FontVec::try_from_vec_and_index(bytes, index).map_err(|_| {
+        if index == 0 {
+            format!("\"{path}\" is not a TrueType/OpenType font")
+        } else {
+            format!("\"{path}\" is not a font collection with a face #{index}")
+        }
+    })?;
+    Ok(FontArc::new(font))
+}
+
+/// Splits a font spec into its path and collection face index: `"a.ttc#2"` is face 2 of
+/// `a.ttc`, anything without a `#<digits>` suffix is face 0 of the whole path. A file
+/// that really exists under the full spec wins, so a name ending in `#1` still works.
+fn split_face_index(spec: &str) -> (&str, u32) {
+    if let Some((path, index)) = spec.rsplit_once('#') {
+        if let Ok(index) = index.parse::<u32>() {
+            if !Path::new(spec).exists() {
+                return (path, index);
+            }
+        }
+    }
+    (spec, 0)
+}
+
+/// Extracts up to three lines of up to six display columns from `text`, as shown on a
+/// button, without any markup.
 ///
-/// Lines are split on newline characters and each line is truncated to
-/// [`MAX_LINE_CHARS`] characters; only the first [`MAX_LINES`] lines are kept.
+/// Lines are split on newline characters and each is cut after the last whole grapheme
+/// cluster fitting [`MAX_LINE_CHARS`] columns; only the first [`MAX_LINES`] lines are kept.
 pub fn button_text(text: &str) -> Vec<String> {
     text.lines()
         .take(MAX_LINES)
-        .map(|line| line.chars().take(MAX_LINE_CHARS).collect())
+        .map(|line| {
+            let mut used = 0;
+            let mut out = String::new();
+            for grapheme in line.graphemes(true) {
+                let Some(cells) = grapheme_cells(grapheme) else {
+                    out.push_str(grapheme);
+                    continue;
+                };
+                if used + cells > MAX_LINE_CHARS {
+                    break;
+                }
+                used += cells;
+                out.push_str(grapheme);
+            }
+            out
+        })
         .collect()
+}
+
+/// The number of display columns `grapheme` takes, at least one, or `None` when it
+/// consists only of [`IGNORED_CHARS`] and draws nothing.
+fn grapheme_cells(grapheme: &str) -> Option<usize> {
+    if grapheme.chars().all(|ch| IGNORED_CHARS.contains(&ch)) {
+        return None;
+    }
+    Some(grapheme.width().max(1))
 }
 
 /// Renders `lines` into an image of `image_format.size` using the embedded font.
@@ -53,10 +320,10 @@ pub fn render_text(
     lines: &[String],
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
-    render_image(
+    render_text_colored(
         lines,
-        &default_text_color(),
         &default_background(),
+        &default_text_color(),
         image_format,
     )
 }
@@ -72,30 +339,159 @@ pub fn render_text_colored(
     text_color: &Color,
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
-    render_image(lines, text_color, background, image_format)
-}
-
-/// Renders the label "Error" in red, centered, used when an async command fails,
-/// times out or is interrupted. Deliberately unaffected by the configured colours.
-pub fn render_error_image(
-    image_format: ImageFormat,
-) -> Result<image::DynamicImage, Box<dyn Error>> {
-    render_image(
-        &["Error".to_string()],
-        &Color::rgb(0xff, 0x00, 0x00),
-        &default_background(),
+    render_lines(
+        &plain_lines(lines),
+        background,
+        text_color,
+        &FontSet::embedded(),
         image_format,
     )
 }
 
-/// Renders the text of `lines` in `color` onto a `background`-filled button-sized image.
+/// Renders the label "Error" in red, centered, used when an async command fails,
+/// times out or is interrupted. Deliberately unaffected by the configured colours and
+/// fonts.
+pub fn render_error_image(
+    image_format: ImageFormat,
+) -> Result<image::DynamicImage, Box<dyn Error>> {
+    render_text_colored(
+        &["Error".to_string()],
+        &default_background(),
+        &Color::rgb(0xff, 0x00, 0x00),
+        image_format,
+    )
+}
+
+/// One glyph to draw, positioned in units of a 1 px font scale relative to its line.
+struct PlacedGlyph {
+    /// The font the glyph comes from.
+    font: FontArc,
+    /// The glyph within `font`.
+    id: GlyphId,
+    /// Left edge of the glyph's origin from the line start, at scale 1.
+    x: f32,
+    /// Multiplier on the line's font scale (below 1 for emoji shrunk into their cells).
+    scale: f32,
+    /// Whether the glyph is vertically centred on the line (emoji) instead of sitting
+    /// on the shared baseline.
+    centred: bool,
+    /// The glyph's colour; `None` for the button's text colour.
+    fg: Option<Color>,
+}
+
+/// A highlight rectangle behind one grapheme cluster, at scale 1 relative to its line.
+struct Highlight {
+    /// Left edge from the line start.
+    x: f32,
+    /// Width.
+    width: f32,
+    /// Fill colour.
+    colour: Color,
+}
+
+/// A line cut to fit and broken into positioned glyphs, all at scale 1.
+struct LaidOutLine {
+    /// Glyphs to draw.
+    glyphs: Vec<PlacedGlyph>,
+    /// Highlights to paint before the glyphs.
+    highlights: Vec<Highlight>,
+    /// Total advance of the line.
+    width: f32,
+    /// Horizontal placement.
+    align: Align,
+}
+
+/// Cuts `line` to [`MAX_LINE_CHARS`] columns and positions its glyphs at scale 1.
 ///
-/// Shared by [`render_text_colored`] and [`render_error_image`]; see [`render_text`] for
-/// an explanation of the geometry.
-fn render_image(
-    lines: &[String],
-    color: &Color,
+/// Characters from a text face advance by their own width (so a proportional configured
+/// font keeps its spacing); a character from the emoji chain is fitted into its cells'
+/// width (one cell being the primary font's `M` advance) and centred there.
+fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
+    let primary = fonts.primary().as_scaled(1.0);
+    let cell = primary.h_advance(primary.glyph_id('M'));
+    let mut laid = LaidOutLine {
+        glyphs: Vec::new(),
+        highlights: Vec::new(),
+        width: 0.0,
+        align: line.align,
+    };
+    let mut used = 0;
+    'spans: for span in &line.spans {
+        for grapheme in span.text.graphemes(true) {
+            let Some(cells) = grapheme_cells(grapheme) else {
+                continue;
+            };
+            if used + cells > MAX_LINE_CHARS {
+                break 'spans;
+            }
+            used += cells;
+            let start = laid.width;
+            let mut chars = grapheme.chars().filter(|ch| !IGNORED_CHARS.contains(ch));
+            let first = chars.next().expect("grapheme has a drawable character");
+            let (font, id, is_emoji) = fonts.resolve(first, &span.style);
+            if is_emoji {
+                // Fit the emoji into its cells, never larger than its natural size so it
+                // cannot outgrow the line height; the rest of the cluster (skin tone,
+                // joined emoji) cannot be combined without shaping and is dropped.
+                let target = cells as f32 * cell;
+                let natural = font.as_scaled(1.0).h_advance(id).max(f32::EPSILON);
+                let scale = (target / natural).min(1.0);
+                laid.glyphs.push(PlacedGlyph {
+                    font: font.clone(),
+                    id,
+                    x: start + (target - natural * scale) / 2.0,
+                    scale,
+                    centred: true,
+                    fg: span.style.fg.clone(),
+                });
+                laid.width += target;
+            } else {
+                for (index, ch) in std::iter::once(first).chain(chars).enumerate() {
+                    let (font, id) = if index == 0 {
+                        (font, id)
+                    } else {
+                        let (font, id, _) = fonts.resolve(ch, &span.style);
+                        (font, id)
+                    };
+                    laid.glyphs.push(PlacedGlyph {
+                        font: font.clone(),
+                        id,
+                        x: laid.width,
+                        scale: 1.0,
+                        centred: false,
+                        fg: span.style.fg.clone(),
+                    });
+                    // Combining marks sit on the preceding base character.
+                    if ch.width() != Some(0) {
+                        laid.width += font.as_scaled(1.0).h_advance(id);
+                    }
+                }
+            }
+            if let Some(colour) = &span.style.bg {
+                laid.highlights.push(Highlight {
+                    x: start,
+                    width: laid.width - start,
+                    colour: colour.clone(),
+                });
+            }
+        }
+    }
+    laid
+}
+
+/// Renders styled `lines` onto a `background`-filled button-sized image with `fonts`.
+///
+/// Lines beyond [`MAX_LINES`] and columns beyond [`MAX_LINE_CHARS`] are dropped. The
+/// font is scaled as large as keeps the widest line and all lines inside the button, the
+/// block is centred vertically and each line placed by its alignment. Spans without an
+/// `fg` are drawn in `text_color`; a span's `bg` highlights the cells behind it. Glyph
+/// coverage is blended over whatever is already under it, so anti-aliased edges stay
+/// correct on highlights too.
+pub fn render_lines(
+    lines: &[Line],
     background: &Color,
+    text_color: &Color,
+    fonts: &FontSet,
     image_format: ImageFormat,
 ) -> Result<image::DynamicImage, Box<dyn Error>> {
     let (width, height) = (image_format.size.0 as u32, image_format.size.1 as u32);
@@ -103,32 +499,30 @@ fn render_image(
         return Err("render_text: image format size must be non-zero".into());
     }
 
-    let font: FontRef = FontRef::try_from_slice(FONT_BYTES)?;
     let mut image = RgbImage::from_pixel(width, height, background.to_rgb());
-    let foreground = color.channels();
-    let backdrop = background.channels();
+    let laid: Vec<LaidOutLine> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| lay_out(line, fonts))
+        .collect();
 
     // Reference metrics from a 1px scale; every metric scales linearly, so the font
     // size can be solved from the width and height budgets below.
-    let reference = font.as_scaled(1.0);
-    let advance = reference.h_advance(reference.glyph_id('M'));
+    let primary = fonts.primary();
+    let reference = primary.as_scaled(1.0);
+    let cell = reference.h_advance(reference.glyph_id('M'));
     let line_height = reference.ascent() - reference.descent();
     let line_gap = reference.line_gap();
 
-    let line_count = lines.len().max(1) as f32;
-    let char_count = lines
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(1)
-        .max(1) as f32;
+    let line_count = laid.len().max(1) as f32;
+    let widest = laid.iter().map(|line| line.width).fold(cell, f32::max);
 
     // Largest uniform scale that keeps every column and all lines inside the button.
-    let scale_x = width as f32 / (char_count * advance);
+    let scale_x = width as f32 / widest;
     let scale_y = height as f32 / (line_count * line_height + (line_count - 1.0) * line_gap);
     let scale = scale_x.min(scale_y);
 
-    let scaled = font.as_scaled(scale);
+    let scaled = primary.as_scaled(scale);
     let ascent = scaled.ascent();
     let descent = scaled.descent();
     let line_height = ascent - descent;
@@ -136,19 +530,46 @@ fn render_image(
     let total_height = line_count * line_height + (line_count - 1.0) * gap;
     let top = (height as f32 - total_height) / 2.0;
 
-    for (index, line) in lines.iter().enumerate() {
+    for (index, line) in laid.iter().enumerate() {
         // Baseline of each line: `index` full lines above it.
         let baseline = top + ascent + index as f32 * (line_height + gap);
-        let line_width: f32 = line
-            .chars()
-            .map(|ch| scaled.h_advance(scaled.glyph_id(ch)))
-            .sum();
-        let mut x = (width as f32 - line_width) / 2.0;
+        let left = match line.align {
+            Align::Left => 0.0,
+            Align::Center => (width as f32 - line.width * scale) / 2.0,
+            Align::Right => width as f32 - line.width * scale,
+        };
 
-        for ch in line.chars() {
-            let mut glyph = scaled.scaled_glyph(ch);
-            glyph.position = point(x, baseline);
-            if let Some(outline) = scaled.outline_glyph(glyph) {
+        for highlight in &line.highlights {
+            let x0 = (left + highlight.x * scale).round().max(0.0) as u32;
+            let x1 = ((left + (highlight.x + highlight.width) * scale)
+                .round()
+                .max(0.0) as u32)
+                .min(width);
+            let y0 = (baseline - ascent).round().max(0.0) as u32;
+            let y1 = ((baseline - descent).round().max(0.0) as u32).min(height);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    image.put_pixel(x, y, highlight.colour.to_rgb());
+                }
+            }
+        }
+
+        for glyph in &line.glyphs {
+            let glyph_scale = scale * glyph.scale;
+            let glyph_baseline = if glyph.centred {
+                // Put the glyph's line box centre on the primary font's line centre.
+                let own = glyph.font.as_scaled(glyph_scale);
+                let centre = baseline - (ascent + descent) / 2.0;
+                centre + (own.ascent() + own.descent()) / 2.0
+            } else {
+                baseline
+            };
+            let positioned = glyph.id.with_scale_and_position(
+                PxScale::from(glyph_scale),
+                point(left + glyph.x * scale, glyph_baseline),
+            );
+            let foreground = glyph.fg.as_ref().unwrap_or(text_color).channels();
+            if let Some(outline) = glyph.font.outline_glyph(positioned) {
                 // draw() reports glyph-local pixel coordinates, so translate them by
                 // the glyph's pixel bounds origin to reach image coordinates.
                 let (offset_x, offset_y) = (
@@ -158,9 +579,11 @@ fn render_image(
                 outline.draw(|px, py, coverage| {
                     let (px, py) = (px as i32 + offset_x, py as i32 + offset_y);
                     if px >= 0 && py >= 0 && (px as u32) < width && (py as u32) < height {
-                        // Blend the glyph's colour over the background by its coverage,
-                        // so partially covered edge pixels mix rather than replace.
+                        // Blend the glyph's colour over what is already there by its
+                        // coverage, so partially covered edge pixels mix rather than
+                        // replace (the background, a highlight, or a neighbour's edge).
                         let alpha = coverage.clamp(0.0, 1.0);
+                        let backdrop = image.get_pixel(px as u32, py as u32).0;
                         let channel = |index: usize| {
                             (foreground[index] as f32 * alpha
                                 + backdrop[index] as f32 * (1.0 - alpha))
@@ -175,7 +598,6 @@ fn render_image(
                     }
                 });
             }
-            x += scaled.h_advance(scaled.glyph_id(ch));
         }
     }
 
@@ -185,6 +607,47 @@ fn render_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markup::{parse, Markup};
+
+    /// The button-sized (60x60) image format every rendering test uses.
+    fn format() -> ImageFormat {
+        ImageFormat {
+            mode: mirajazz::types::ImageMode::None,
+            size: (60, 60),
+            rotation: mirajazz::types::ImageRotation::Rot0,
+            mirror: mirajazz::types::ImageMirroring::None,
+        }
+    }
+
+    /// Renders tmux-markup `text` white on black with the embedded fonts.
+    fn render_markup(text: &str) -> RgbImage {
+        let parsed = parse(text, Markup::Tmux);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        render_lines(
+            &parsed.lines,
+            &default_background(),
+            &default_text_color(),
+            &FontSet::embedded(),
+            format(),
+        )
+        .expect("render")
+        .to_rgb8()
+    }
+
+    /// Sum of the red channel over the whole image, a proxy for how much "ink" it holds.
+    fn ink(image: &RgbImage) -> u64 {
+        image.pixels().map(|p| p.0[0] as u64).sum()
+    }
+
+    /// Mean x of the lit pixels (red above 100), weighting each pixel equally.
+    fn ink_centre_x(image: &RgbImage) -> f32 {
+        let lit: Vec<u32> = image
+            .enumerate_pixels()
+            .filter(|(_, _, p)| p.0[0] > 100)
+            .map(|(x, _, _)| x)
+            .collect();
+        lit.iter().sum::<u32>() as f32 / lit.len().max(1) as f32
+    }
 
     /// The button text extraction keeps only the first three lines and the first six
     /// characters of each.
@@ -208,20 +671,27 @@ mod tests {
         assert!(button_text("").is_empty());
     }
 
+    /// Wide characters count as two columns and grapheme clusters are never split.
+    #[test]
+    fn button_text_counts_display_columns() {
+        assert_eq!(
+            button_text("\u{1F600}\u{1F600}\u{1F600}\u{1F600}"),
+            vec!["\u{1F600}\u{1F600}\u{1F600}"]
+        );
+        assert_eq!(button_text("ab\u{1F600}cdef"), vec!["ab\u{1F600}cd"]);
+        // "e" + combining acute is one cluster of one column.
+        assert_eq!(
+            button_text("e\u{301}bcdefg"),
+            vec!["e\u{301}bcdef".to_string()]
+        );
+    }
+
     /// Rendering writes the text into a button-sized image with visible, grayscale pixels.
     #[test]
     fn render_text_draws_glyphs() {
-        let image = render_text(
-            &["Hi".to_string()],
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (60, 60),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
-        )
-        .expect("render")
-        .to_rgb8();
+        let image = render_text(&["Hi".to_string()], format())
+            .expect("render")
+            .to_rgb8();
         assert_eq!(image.dimensions(), (60, 60));
         let has_pixels = image.pixels().any(|p| p.0 != [0, 0, 0]);
         assert!(has_pixels, "expected some non-black pixels");
@@ -230,34 +700,20 @@ mod tests {
     /// Rendering scales the text so two full-width lines still fit vertically.
     #[test]
     fn render_text_fits_two_lines() {
-        let image = render_text(
-            &["abcdef".to_string(), "ghijkl".to_string()],
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (60, 60),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
-        )
-        .expect("render")
-        .to_rgb8();
+        let image = render_text(&["abcdef".to_string(), "ghijkl".to_string()], format())
+            .expect("render")
+            .to_rgb8();
         assert_eq!(image.dimensions(), (60, 60));
     }
 
     /// A zero-sized image format is rejected because no glyphs can be rendered.
     #[test]
     fn render_image_rejects_zero_size() {
-        let error = render_text(
-            &["x".to_string()],
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (0, 0),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
-        )
-        .unwrap_err()
-        .to_string();
+        let mut format = format();
+        format.size = (0, 0);
+        let error = render_text(&["x".to_string()], format)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("non-zero"), "unexpected error: {error}");
     }
 
@@ -277,17 +733,9 @@ mod tests {
     /// straddles the middle of the image) instead of being squashed into the top-left.
     #[test]
     fn render_text_centers_two_lines() {
-        let image = render_text(
-            &["line1".to_string(), "line2 ".to_string()],
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (60, 60),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
-        )
-        .expect("render")
-        .to_rgb8();
+        let image = render_text(&["line1".to_string(), "line2 ".to_string()], format())
+            .expect("render")
+            .to_rgb8();
 
         let (min_row, max_row) = lit_row_range(&image, 40);
         let (min_row, max_row) = (
@@ -311,12 +759,7 @@ mod tests {
     fn render_text_centers_three_lines() {
         let image = render_text(
             &["one".to_string(), "two".to_string(), "3".to_string()],
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (60, 60),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
+            format(),
         )
         .expect("render")
         .to_rgb8();
@@ -342,12 +785,7 @@ mod tests {
             &["M".to_string()],
             &Color::parse("#0000ff").unwrap(),
             &Color::parse("#00ff00").unwrap(),
-            ImageFormat {
-                mode: mirajazz::types::ImageMode::None,
-                size: (60, 60),
-                rotation: mirajazz::types::ImageRotation::Rot0,
-                mirror: mirajazz::types::ImageMirroring::None,
-            },
+            format(),
         )
         .expect("render")
         .to_rgb8();
@@ -366,14 +804,7 @@ mod tests {
     /// The error renderer produces a red-on-black label in the requested size.
     #[test]
     fn render_error_image_is_red() {
-        let image = render_error_image(ImageFormat {
-            mode: mirajazz::types::ImageMode::None,
-            size: (60, 60),
-            rotation: mirajazz::types::ImageRotation::Rot0,
-            mirror: mirajazz::types::ImageMirroring::None,
-        })
-        .expect("render")
-        .to_rgb8();
+        let image = render_error_image(format()).expect("render").to_rgb8();
         assert_eq!(image.dimensions(), (60, 60));
         assert!(
             image
@@ -381,5 +812,133 @@ mod tests {
                 .any(|p| p.0[0] > 100 && p.0[1] == 0 && p.0[2] == 0),
             "expected red pixels"
         );
+    }
+
+    /// All four embedded DejaVu faces share one advance, so mixing styles keeps the
+    /// monospace grid.
+    #[test]
+    fn embedded_faces_share_one_advance() {
+        let fonts = FontSet::embedded();
+        let advances: Vec<f32> = fonts
+            .faces
+            .iter()
+            .map(|chain| {
+                let font = chain[0].as_scaled(1.0);
+                font.h_advance(font.glyph_id('M'))
+            })
+            .collect();
+        assert!(
+            advances.windows(2).all(|pair| pair[0] == pair[1]),
+            "{advances:?}"
+        );
+    }
+
+    /// Bold text carries noticeably more ink than regular text.
+    #[test]
+    fn bold_is_heavier() {
+        let regular = ink(&render_markup("MMM"));
+        let bold = ink(&render_markup("#[bold]MMM"));
+        assert!(bold > regular * 11 / 10, "bold {bold} vs regular {regular}");
+    }
+
+    /// Italic text leans right: its top rows sit further right than its bottom rows,
+    /// unlike upright text.
+    #[test]
+    fn italic_is_slanted() {
+        /// Mean lit x of rows `rows` of `image`.
+        fn mean_x(image: &RgbImage, rows: std::ops::Range<u32>) -> f32 {
+            let xs: Vec<u32> = image
+                .enumerate_pixels()
+                .filter(|(_, y, p)| rows.contains(y) && p.0[0] > 100)
+                .map(|(x, _, _)| x)
+                .collect();
+            xs.iter().sum::<u32>() as f32 / xs.len().max(1) as f32
+        }
+        let slant = |image: &RgbImage| {
+            let (top, bottom) = lit_row_range(image, 100);
+            let (top, bottom) = (top.unwrap(), bottom.unwrap());
+            let third = (bottom - top) / 3;
+            mean_x(image, top..top + third) - mean_x(image, bottom - third..bottom + 1)
+        };
+        let upright = slant(&render_markup("l"));
+        let italic = slant(&render_markup("#[italics]l"));
+        assert!(
+            italic > upright + 2.0,
+            "italic {italic} vs upright {upright}"
+        );
+    }
+
+    /// `fg` colours only its span and `bg` paints a highlight behind its cells.
+    #[test]
+    fn fg_and_bg_colour_spans() {
+        let image = render_markup("#[fg=red]A#[fg=default,bg=blue]B");
+        assert!(image
+            .pixels()
+            .any(|p| p.0[0] > 200 && p.0[1] < 40 && p.0[2] < 40));
+        assert!(image.pixels().any(|p| p.0 == [0, 0, 255]));
+        assert!(image.pixels().any(|p| p.0 == [255, 255, 255]));
+        // The highlight only covers the right half (the "B" cell).
+        assert!(image
+            .enumerate_pixels()
+            .all(|(x, _, p)| x >= 28 || p.0[2] < 100));
+    }
+
+    /// Left and right alignment move the ink toward that edge.
+    #[test]
+    fn alignment_moves_ink() {
+        let text = "#[align=left]abcdef\n#[align=left]i";
+        let left = ink_centre_x(&render_markup(text));
+        let right = ink_centre_x(&render_markup(&text.replace("left", "right")));
+        let centre = ink_centre_x(&render_markup(&text.replace("left", "centre")));
+        assert!(left < centre && centre < right, "{left} {centre} {right}");
+    }
+
+    /// An emoji is drawn from the embedded Noto Emoji rather than as DejaVu's
+    /// missing-glyph box, and in the span's colour.
+    #[test]
+    fn emoji_is_drawn_from_noto() {
+        let fonts = FontSet::embedded();
+        let (_, id, is_emoji) = fonts.resolve('\u{1F600}', &Style::default());
+        assert!(is_emoji);
+        assert_ne!(id.0, 0);
+        let (_, _, is_emoji) = fonts.resolve('A', &Style::default());
+        assert!(!is_emoji);
+        let image = render_markup("#[fg=yellow,u=1F600]");
+        let lit = image
+            .pixels()
+            .filter(|p| p.0[0] > 200 && p.0[1] > 200 && p.0[2] < 40)
+            .count();
+        assert!(lit > 300, "only {lit} yellow pixels");
+    }
+
+    /// Variation selectors and joiners draw nothing, and a lone one yields an empty line.
+    #[test]
+    fn ignored_characters_draw_nothing() {
+        let fonts = FontSet::embedded();
+        let lines = parse("\u{FE0F}\u{200D}", Markup::None).lines;
+        let laid = lay_out(&lines[0], &fonts);
+        assert!(laid.glyphs.is_empty());
+        let lines = parse("\u{2764}\u{FE0F}", Markup::None).lines;
+        assert_eq!(lay_out(&lines[0], &fonts).glyphs.len(), 1);
+    }
+
+    /// Lines are cut to six columns across span boundaries, and to three lines.
+    #[test]
+    fn layout_cuts_lines_and_columns() {
+        let fonts = FontSet::embedded();
+        let lines = parse("abc#[bold]defgh", Markup::Tmux).lines;
+        assert_eq!(lay_out(&lines[0], &fonts).glyphs.len(), 6);
+        let lines = parse("a\u{1F600}\u{1F600}\u{1F600}", Markup::Tmux).lines;
+        assert_eq!(lay_out(&lines[0], &fonts).glyphs.len(), 3);
+        // Four lines render without error, only three are drawn.
+        render_markup("a\nb\nc\nd");
+    }
+
+    /// `split_face_index` separates a `#N` collection index, but leaves other `#`s alone.
+    #[test]
+    fn split_face_index_parses_suffix() {
+        assert_eq!(split_face_index("/x/a.ttc#2"), ("/x/a.ttc", 2));
+        assert_eq!(split_face_index("/x/a.ttf"), ("/x/a.ttf", 0));
+        assert_eq!(split_face_index("/x/a#b.ttf"), ("/x/a#b.ttf", 0));
     }
 }

@@ -145,6 +145,7 @@ async fn main() -> Result<(), MirajazzError> {
             log,
             config.defaults.clone(),
             variables.clone(),
+            config.fonts.clone(),
         )));
     }
     // Wait for every device task, so one device failing (e.g. its first connection
@@ -179,7 +180,9 @@ async fn main() -> Result<(), MirajazzError> {
 /// `device_number` is the id the definition is keyed under in the config; the runner
 /// drives references naming this number and skips references to other devices with a
 /// warning, so the same scenes address every device by its own number. `defaults`
-/// carries the press-detection timing knobs from the config `defaults` section.
+/// carries the press-detection timing knobs from the config `defaults` section, and
+/// `fonts` the fonts loaded from it that button text is drawn with.
+#[allow(clippy::too_many_arguments)]
 async fn run_device(
     device_number: u8,
     definition: Mapping,
@@ -188,6 +191,7 @@ async fn run_device(
     log: Log,
     defaults: Defaults,
     variables: Arc<std::sync::Mutex<Variables>>,
+    fonts: Arc<dak::text::FontSet>,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -320,6 +324,7 @@ async fn run_device(
     // Setup params are expanded against the shared variable state, re-resolved on every
     // refresh tick (see `SceneRunner::set_variables`).
     runner.set_variables(variables.clone());
+    runner.set_text_settings(defaults.markup, fonts);
 
     // Complex press events (short/long press, double click): the detector decides
     // which event each press or release produces. Widgets are addressed by their

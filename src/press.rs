@@ -11,6 +11,8 @@
 use std::time::{Duration, Instant};
 
 use crate::color::Color;
+use crate::markup::Markup;
+use crate::text::FontPaths;
 
 /// Default settings read from the config `defaults` section: the timing knobs for
 /// complex press events, the brightness levels applied to a device at connect, and the
@@ -49,6 +51,12 @@ pub struct Defaults {
     /// How many reconnect attempts are made before giving up on a device; 0 means
     /// unlimited. A device definition can override it.
     pub device_reconnect_max_attempts: u64,
+    /// Markup syntax button text is parsed with when its setup entry has no `markup`
+    /// field of its own.
+    pub markup: Markup,
+    /// The `defaults.fonts` file paths as written in the config (not yet `~`/`$`
+    /// expanded); loaded once at startup into a [`crate::text::FontSet`].
+    pub fonts: FontPaths,
 }
 
 impl Default for Defaults {
@@ -62,6 +70,8 @@ impl Default for Defaults {
             text_color: Color::rgb(0xff, 0xff, 0xff),
             device_reconnect_interval: Duration::from_secs(15),
             device_reconnect_max_attempts: 0,
+            markup: Markup::Tmux,
+            fonts: FontPaths::default(),
         }
     }
 }

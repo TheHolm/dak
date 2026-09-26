@@ -73,6 +73,7 @@ file and exits. Run `dak --help` for the exact, generated usage text.
 All runtime behavior is driven by `config.json`:
 
 - **Scenes** — buttons can display images, static text files, or the output of async commands (`image_exec` / `text_exec` with a 5-second timeout); scenes switch on key/encoder input, from the scene timer, or on demand.
+- **Styled text** — button text understands tmux-style `#[bold,fg=red,align=left]` markup, including emoji (`#[u=1F600]`), and can be drawn in your own fonts (see [Text markup](#text-markup) and [Fonts](#fonts)).
 - **Per-key actions** — `short_press`, `long_press`, `double_click`, `pressed` and `released` bindings, with actions inherited from the previously active scene.
 - **Encoders** — each encoder binds `turn_cw` / `turn_ccw` per rotation notch, and the knob itself is pressable like a button: pushing it fires the same `pressed` / `released` / `short_press` / `long_press` / `double_click` events.
 - **Timers** — each scene can run a `timer` action after a number of seconds; button presses and scene switches re-arm it only when appropriate.
@@ -95,7 +96,7 @@ config is a dictionary with up to five keys:
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
 - `"variables"` — optional declared variables that actions read and assign (see [Variables](#variables))
-- `"defaults"` — optional press-detection timing knobs and connect-time brightness levels (see [Defaults](#defaults))
+- `"defaults"` — optional press-detection timing knobs, connect-time brightness levels, colours, text markup and fonts (see [Defaults](#defaults))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
@@ -124,7 +125,7 @@ JSON itself has no comment syntax, so `dak` strips comments before parsing: both
 
 ### Defaults
 
-The optional top-level `defaults` section tunes how the complex button presses are detected, the brightness levels applied when a device connects, and the colours button images and text are drawn with. All keys are optional and fall back to their built-in values when missing:
+The optional top-level `defaults` section tunes how the complex button presses are detected, the brightness levels applied when a device connects, the colours button images and text are drawn with, how button text is marked up, and which fonts draw it. All keys are optional and fall back to their built-in values when missing:
 
 ```json
 "defaults": {
@@ -135,7 +136,9 @@ The optional top-level `defaults` section tunes how the complex button presses a
   "background": "#000000",
   "text_color": "#ffffff",
   "device_reconnect_interval": 15,
-  "device_reconnect_max_attempts": 0
+  "device_reconnect_max_attempts": 0,
+  "markup": "tmux",
+  "fonts": {}
 }
 ```
 
@@ -147,6 +150,8 @@ The optional top-level `defaults` section tunes how the complex button presses a
 - `text_color` (default `#ffffff`) — the colour button text is drawn in.
 - `device_reconnect_interval` (default `15`, whole seconds, at least `1`) — how long to wait between attempts to get a device back after it disappeared (see [Devices](#devices)). The first attempt is made right away.
 - `device_reconnect_max_attempts` (default `0` = unlimited) — how many reconnect attempts to make before giving up on a device.
+- `markup` (default `tmux`) — how button text is parsed: `tmux` understands the `#[...]` tags described in [Text markup](#text-markup), `none` shows text exactly as written. A `setup` entry's own `markup` key overrides it.
+- `fonts` (default: the embedded fonts) — font files to draw button text with; see [Fonts](#fonts).
 
 Both reconnect keys can also be set inside a single device's definition, overriding the `defaults` value for that device only.
 
@@ -161,6 +166,58 @@ like an extra button:
 - a press held past `short_press_duration` fires `long_press` on its release;
 - a second press landing inside `double_click_gap` of the previous release is a `double_click` firing on that second release, no matter how long the second press is held, and its first click never fires `short_press`;
 - anything else is a `short_press`, which only fires once `double_click_gap` has passed without a second press — so the first click of a double click is never reported as a short press too.
+
+### Text markup
+
+With `markup` set to `tmux` (the default), the text of a `text`, `text_value` or `text_exec` button may contain [tmux](https://man.openbsd.org/tmux#STYLES)-style tags. `#[attr,attr ...]` changes how the text after it is drawn; attributes are separated by commas and/or spaces:
+
+| Attribute | Effect |
+|---|---|
+| `bold` / `nobold` | bold on / off |
+| `italics` (or `italic`) / `noitalics` (or `noitalic`) | italic on / off |
+| `none` | bold and italic off |
+| `default` | everything back to the defaults: plain, the button's colours, centred |
+| `fg=<colour>` | text colour (see the colour list above); `fg=default` is the button's `text_color` |
+| `bg=<colour>` | highlight behind the characters; `bg=default` for none. The button's own background is still `background` |
+| `align=left` / `centre` / `center` / `right` | placement of the line |
+| `u=<hex>` | **dak extension, not tmux:** insert the Unicode character with that code point (1-6 hex digits). Bare hex tokens right after it insert more, so `#[u=1F44D,1F3FD]` = `#[u=1F44D,u=1F3FD]` |
+
+`##` is a literal `#`, and any other `#` that does not start a tag is shown as-is. Styles carry over to the following lines until changed; alignment applies to a whole line (the last `align` in effect at the end of the line wins) and carries over too. A tag that does not parse — an unknown attribute, a bad colour or code point, no closing `]` on the same line — is shown literally and logged as a warning, and for a literal `text_value` it is already reported when the config loads.
+
+```json
+"1b01": { "type": "text_value", "params": "#[align=left,bold]CPU\n#[fg=red]$cpu%" },
+"1b02": { "type": "text_value", "params": "#[fg=yellow,u=1F600]" },
+"1b03": { "type": "text_exec",  "params": "~/bin/status.sh", "markup": "none" }
+```
+
+Markup is interpreted after `$` references are expanded, so `#[fg=$alert_colour]` works. A script only has to print the tags, e.g. `printf '#[fg=green]OK\n#[u=2714]'`. One trap: in a `text_exec` command that runs through `sh -c` (one containing `|`, `;`, `>` and the like — see [Commands and the shell](#commands-and-the-shell)), an unquoted `#` starts a shell comment, so write `echo '#[bold]hi' | cat`, not `echo #[bold]hi | cat`.
+
+A line shows at most 6 *columns*: ordinary characters take one, wide characters such as emoji and CJK ideographs take two, and a character is never split in half. There is no text shaping: variation selectors and zero-width joiners are dropped, and an emoji made of several code points (a skin tone, a joined family, a flag) shows only its first one.
+
+Existing configs: with `tmux` now the default, text that happens to contain `#[` or `##` renders differently than before 0.13.0. Set `"markup": "none"` (per entry or in `defaults`) to keep the old behaviour.
+
+### Fonts
+
+Button text is drawn with fonts embedded in the binary: DejaVu Sans Mono in regular, bold, oblique and bold oblique — all four share one character width, so mixed styles stay on a monospace grid — plus the monochrome [Noto Emoji](https://fonts.google.com/noto/specimen/Noto+Emoji) for emoji and other symbols DejaVu lacks. `defaults.fonts` may replace any of them with a TrueType/OpenType file of your own; every key is optional:
+
+```json
+"defaults": {
+  "fonts": {
+    "regular":     "~/.local/share/fonts/Iosevka-Regular.ttf",
+    "bold":        "~/.local/share/fonts/Iosevka-Bold.ttf",
+    "italic":      "~/.local/share/fonts/Iosevka-Italic.ttf",
+    "bold_italic": "~/.local/share/fonts/Iosevka-BoldItalic.ttf",
+    "emoji":       "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"
+  }
+}
+```
+
+- `regular`, `bold`, `italic`, `bold_italic` — the font for text in that style.
+- `emoji` — the fallback for characters none of the text fonts have.
+
+Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 32 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
+
+Each character is looked up in the configured font of its style, then the embedded font of that style, then the configured `emoji` font, then the embedded Noto Emoji; if none has it, a box is drawn. So a Latin-only font still shows Cyrillic and emoji from the embedded fonts. The embedded fonts have no CJK ideographs: to show those, point `emoji` (or `regular`) at a CJK font such as Noto Sans CJK. Colour emoji fonts (Noto Color Emoji and the like) store pictures rather than outlines, which `dak` cannot draw: their glyphs are skipped and the next font is tried. A proportional font works too, but since lines are limited by character count, a line of wide letters is then drawn smaller than one of narrow letters.
 
 ### Variables
 
@@ -198,7 +255,7 @@ thing written with its explicit scope (the `var` scope is the default, so both w
 `$defaults.<name>` reads a `defaults` parameter: `button_brightness`,
 `encoder_brightness`, `short_press_duration` (milliseconds), `double_click_gap`
 (milliseconds), `device_reconnect_interval` (seconds), `device_reconnect_max_attempts`,
-and the colours `background`/`text_color` - the values
+the colours `background`/`text_color` and `markup` - the values
 [Defaults](#defaults) describes, reflecting any runtime changes. A colour reads back
 exactly as it was set, so a name stays a name.
 
@@ -299,16 +356,17 @@ Rules for the program:
 
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
-- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background` and `text_color`:
+- `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background`, `text_color` and `markup`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
-  - `{"type":"text","params":"path"}` — display the first 6 characters of the first 3 lines of the file `path`
+  - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied
   - `{"type":"text_value","params":"text"}` — display `text` directly (after `$` references are expanded), without reading a file or running a program. This is the simplest way to show a variable's value, e.g. `{"type":"text_value","params":"$defaults.button_brightness%"}`
-  - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 characters of its first 3 lines); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
+  - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 columns of its first 3 lines, with markup); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
   - `{"type":"clear"}` — clear the button image
   - `background` (optional, colour, default: `defaults.background`) — override the background for this button. Allowed on `image`, `image_exec`, `text`, `text_value` and `text_exec`: for an image it is composited under transparent pixels, for text it is the canvas the glyphs are drawn on. The value may contain `$` references; a reference that resolves to something that is not a colour falls back to the default with a warning rather than failing the scene.
   - `text_color` (optional, colour, default: `defaults.text_color`) — override the glyph colour for this button. Allowed on `text`, `text_value` and `text_exec` only.
+  - `markup` (optional, `tmux` or `none`, default: `defaults.markup`) — how this button's text is parsed (see [Text markup](#text-markup)). Allowed on `text`, `text_value` and `text_exec` only; written literally, not `$`-expanded.
   - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `text_value`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
 - `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
 
@@ -562,3 +620,5 @@ See [TODO.md](TODO.md).
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](LICENSE) for the full license text. This program is free software: you can redistribute it and/or modify it under the terms of the AGPL as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+The fonts embedded in the binary keep their own licences: DejaVu Sans Mono (Bitstream Vera licence, see [fonts/LICENSE.txt](fonts/LICENSE.txt)) and Noto Emoji (SIL Open Font License 1.1, see [fonts/OFL.txt](fonts/OFL.txt)). The packages carry all three licence texts in a single `copyright` file (see [debian/copyright](debian/copyright)).

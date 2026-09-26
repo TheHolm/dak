@@ -36,6 +36,7 @@ FreeBSD/cross-compiling) and states its own environment inline.
 5. [CI TODO / open questions](#5-ci-todo--open-questions)
 6. [Animated button images: real-hardware findings](#6-animated-button-images-real-hardware-findings)
 7. [Device disconnect/reconnect on FreeBSD](#7-device-disconnectreconnect-on-freebsd)
+8. [Package licence files (`debian/copyright`)](#8-package-licence-files-debiancopyright)
 
 ---
 
@@ -784,4 +785,46 @@ the keypad back. Unresolved whether this is the keypad's firmware, QEMU's
 USB passthrough, or FreeBSD's xhci. One suspect: the device was passed through
 on a USB3 port (`usb3=1`) although it is a USB 2.0 high-speed device; retry
 with USB3 off, and on bare metal, before blaming dak.
+
+---
+
+## 8. Package licence files (`debian/copyright`)
+
+Since v0.13.0 the binary embeds fonts with their own licences (DejaVu Sans
+Mono: Bitstream Vera + Arev terms; monochrome Noto Emoji: OFL-1.1), so every
+package must carry more than the AGPL. Findings and decisions:
+
+- **Debian Policy 12.5** (Ubuntu adopts Debian Policy wholesale, no
+  Ubuntu-specific rule for this): exactly one uncompressed, non-symlink
+  `/usr/share/doc/<pkg>/copyright` with the full text of every licence,
+  except those in `/usr/share/common-licenses`, which are referenced instead.
+  No separate `LICENSE`/`OFL.txt` files in the package - that is the
+  "20 copies of the same licence" complaint on debian-devel.
+- **common-licenses** is identical on trixie (base-files 13.8) and Ubuntu
+  24.04/26.04: Apache-2.0, Artistic, BSD, CC0-1.0, GFDL*, GPL*, LGPL*,
+  MPL-1.1/2.0. AGPL, OFL-1.1 and Bitstream Vera are **not** there (OFL was
+  requested in Debian bug #884228, 2017, never added), so all are quoted in
+  full.
+- **cargo-deb (3.8)**: without an asset at `usr/share/doc/<pkg>/copyright`
+  it generates one from Cargo.toml metadata. With only `license = "..."` set
+  that file just *names* the licence (a 200-byte file, no text) - the state
+  of every .deb up to v0.12.0. `license-file` would copy a file, but an
+  explicit asset is simpler: when one targets that path cargo-deb logs "Not
+  generating a default copyright" and ships ours verbatim.
+- **`debian/copyright`** (DEP-5) is the single source for both the .debs
+  and the FreeBSD .pkg (`/usr/local/share/doc/dak/copyright`).
+  `tests/packaging.rs` checks it quotes `LICENSE`, `fonts/OFL.txt` and the
+  Bitstream/Arev sections of `fonts/LICENSE.txt` verbatim and lists every
+  `fonts/*.ttf`; if a licence file changes, regenerate the matching
+  paragraph (each body line indented one space, blank lines as ` .`).
+- **FreeBSD manifest** licence names follow the ports tree:
+  `x11-fonts/dejavu` uses `AREV BITSTREAM` (plus `AMS` for the math font we
+  do not embed), `x11-fonts/noto-emoji` uses `OFL11`; with several licences
+  `licenselogic` is `multi` (= all apply, ports' `LICENSE_COMB=multi`).
+  `pkg` treats these as free-form strings; not yet verified with
+  `pkg info -l`/`pkg install` on a real FreeBSD host.
+- **lintian** on the built .deb (run report-only in CI): the only remaining
+  finding is `E: no-changelog usr/share/doc/dak/changelog.Debian.gz` -
+  we ship no Debian changelog. Setting `section = "utils"` in
+  `[package.metadata.deb]` fixed the `recommended-field Section` warning.
 
