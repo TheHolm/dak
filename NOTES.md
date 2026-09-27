@@ -880,6 +880,13 @@ Gotchas found on the way:
   emoji (U+1F170.., U+1F201..); the emoji fonts have no CJK text. Hence the
   lookup puts `extra` after the emoji fonts. Loading Noto Color Emoji +
   Noto Sans CJK `#0` (read + scan + parse) takes ~100 ms on the dev host.
+- CJK sizing: Noto Sans CJK's em is only 0.69 of its line box (DejaVu 0.86,
+  Noto Emoji 0.85), so fitting by line box left ideographs at 67% of their
+  two columns. Fitted glyphs are now sized by em box to 93% of the line
+  height (`FITTED_EM_FILL`); 100% left 1 px between stacked lines on the
+  60x60 LCD and looked cramped. Noto Emoji's OS/2 typo metrics copy its line
+  box, not its em, so they are only trusted when they span exactly one em -
+  otherwise a lone emoji moved 4 px down.
 - Supporting COLR/SVG later: estimated ~1.3-1.8k lines hand-written (COLRv1
   painter on tiny-skia + resvg for SVG) or ~300 via usvg's own text rendering
   (which would also bring shaping: ZWJ sequences, flags, Arabic); +2-4 MB.

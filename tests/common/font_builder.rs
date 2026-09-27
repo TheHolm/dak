@@ -14,6 +14,9 @@
 pub enum Glyph {
     /// A filled square outline (100..900 x 0..800 font units).
     Square,
+    /// A filled square spanning the whole em box vertically, like a CJK ideograph
+    /// (50..950 x -110..870 font units, inside Noto Sans CJK's 880/-120 em box).
+    FullSquare,
     /// No outline and no bitmap.
     Empty,
     /// No outline; a CBDT colour bitmap holding these PNG bytes, declared `size` px square.
@@ -54,28 +57,67 @@ pub fn solid_png(size: u32, rgba: [u8; 4]) -> Vec<u8> {
     bytes.into_inner()
 }
 
-/// The `glyf` data of the square outline glyph.
-fn square_glyph() -> Vec<u8> {
+/// The `glyf` data of a filled rectangle from (`x0`, `y0`) to (`x1`, `y1`).
+fn rectangle_glyph(x0: i16, y0: i16, x1: i16, y1: i16) -> Vec<u8> {
     let mut g = Vec::new();
     i16be(&mut g, 1); // numberOfContours
-    for value in [100, 0, 900, 800] {
+    for value in [x0, y0, x1, y1] {
         i16be(&mut g, value); // xMin, yMin, xMax, yMax
     }
     u16be(&mut g, 3); // endPtsOfContours[0]
     u16be(&mut g, 0); // instructionLength
     g.extend_from_slice(&[1, 1, 1, 1]); // flags: on-curve, 16-bit deltas
-    for dx in [100, 0, 800, 0] {
+    for dx in [x0, 0, x1 - x0, 0] {
         i16be(&mut g, dx);
     }
-    for dy in [0, 800, 0, -800] {
+    for dy in [y0, y1 - y0, 0, y0 - y1] {
         i16be(&mut g, dy);
     }
     g
 }
 
+/// Vertical metrics of a built font, in its 1000 units per em.
+#[derive(Clone, Copy)]
+pub struct VerticalMetrics {
+    /// `hhea` ascender (top of the line box).
+    pub ascender: i16,
+    /// `hhea` descender (bottom of the line box, negative).
+    pub descender: i16,
+    /// OS/2 typographic ascender/descender; `None` builds no OS/2 table.
+    pub typo: Option<(i16, i16)>,
+}
+
+impl Default for VerticalMetrics {
+    /// A line box of exactly one em (800 above, 200 below the baseline), no OS/2 table.
+    fn default() -> Self {
+        Self {
+            ascender: 800,
+            descender: -200,
+            typo: None,
+        }
+    }
+}
+
+/// The vertical metrics of Noto Sans CJK: a line box much taller than the em
+/// (1160/-288) and typographic metrics spanning exactly one em (880/-120).
+pub const CJK_METRICS: VerticalMetrics = VerticalMetrics {
+    ascender: 1160,
+    descender: -288,
+    typo: Some((880, -120)),
+};
+
 /// Builds a font mapping each `(char, Glyph)` (glyph ids 1.. in order; 0 is an empty
 /// `.notdef`), plus the requested colour tables. Returns the font file bytes.
 pub fn build_font(glyphs: &[(char, Glyph)], colour: ColourTables) -> Vec<u8> {
+    build_font_with_metrics(glyphs, colour, VerticalMetrics::default())
+}
+
+/// [`build_font`] with the given vertical metrics.
+pub fn build_font_with_metrics(
+    glyphs: &[(char, Glyph)],
+    colour: ColourTables,
+    metrics: VerticalMetrics,
+) -> Vec<u8> {
     let num_glyphs = glyphs.len() as u16 + 1;
     let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::new();
 
@@ -101,8 +143,8 @@ pub fn build_font(glyphs: &[(char, Glyph)], colour: ColourTables) -> Vec<u8> {
     // hhea
     let mut hhea = Vec::new();
     u32be(&mut hhea, 0x0001_0000);
-    i16be(&mut hhea, 800); // ascender
-    i16be(&mut hhea, -200); // descender
+    i16be(&mut hhea, metrics.ascender);
+    i16be(&mut hhea, metrics.descender);
     i16be(&mut hhea, 0); // lineGap
     u16be(&mut hhea, 1000); // advanceWidthMax
     for value in [0, 0, 1000, 1, 0, 0, 0, 0, 0, 0, 0] {
@@ -110,6 +152,14 @@ pub fn build_font(glyphs: &[(char, Glyph)], colour: ColourTables) -> Vec<u8> {
     }
     u16be(&mut hhea, num_glyphs); // numberOfHMetrics
     tables.push((*b"hhea", hhea));
+
+    // OS/2 version 0 (78 bytes): only the typographic ascender/descender matter here.
+    if let Some((typo_ascender, typo_descender)) = metrics.typo {
+        let mut os2 = vec![0u8; 78];
+        os2[68..70].copy_from_slice(&typo_ascender.to_be_bytes());
+        os2[70..72].copy_from_slice(&typo_descender.to_be_bytes());
+        tables.push((*b"OS/2", os2));
+    }
 
     // maxp (version 1.0; limits left at zero)
     let mut maxp = Vec::new();
@@ -158,8 +208,10 @@ pub fn build_font(glyphs: &[(char, Glyph)], colour: ColourTables) -> Vec<u8> {
     u32be(&mut loca, 0); // start of .notdef
     u32be(&mut loca, 0); // end of .notdef (empty)
     for (_, glyph) in glyphs {
-        if matches!(glyph, Glyph::Square) {
-            glyf.extend(square_glyph());
+        match glyph {
+            Glyph::Square => glyf.extend(rectangle_glyph(100, 0, 900, 800)),
+            Glyph::FullSquare => glyf.extend(rectangle_glyph(50, -110, 950, 870)),
+            _ => {}
         }
         u32be(&mut loca, glyf.len() as u32);
     }

@@ -74,6 +74,11 @@ static FONT_BOLD_ITALIC_BYTES: &[u8] = include_bytes!("../fonts/DejaVuSansMono-B
 /// fonts lack. SIL Open Font License 1.1, see `fonts/OFL.txt`.
 static EMOJI_BYTES: &[u8] = include_bytes!("../fonts/NotoEmoji-VariableFont_wght.ttf");
 
+/// How tall a fitted glyph's em box (emoji, CJK from `extra`) may be, as a share of the
+/// text line height. Below 1 so stacked lines of CJK keep a visible gap: at 1.0 three
+/// lines of Noto Sans CJK nearly touched on the keypad.
+const FITTED_EM_FILL: f32 = 0.93;
+
 /// Characters dropped before drawing because, without text shaping, they have nothing
 /// to show: text/emoji variation selectors and the zero-width joiner.
 const IGNORED_CHARS: &[char] = &['\u{FE0E}', '\u{FE0F}', '\u{200D}'];
@@ -140,6 +145,41 @@ fn fallback_description(key: &str) -> &'static str {
 /// records a bitmap that failed to decode, so it is not retried on every draw.
 type BitmapCache = HashMap<(usize, u16), Option<Arc<RgbaImage>>>;
 
+/// A font's em box (the square its characters are designed in) in units of its own line
+/// box at scale 1 (`ab_glyph`'s `as_scaled(1.0)`, where ascent - descent = 1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EmBox {
+    /// Height of the em (units per em) relative to the line box: 0.86 for DejaVu Sans
+    /// Mono, 0.69 for Noto Sans CJK, whose line box is unusually tall.
+    size: f32,
+    /// Distance of the em box's vertical centre above the baseline.
+    centre: f32,
+}
+
+/// Em boxes of the fonts in use, keyed by the font's data address.
+type EmBoxCache = HashMap<usize, EmBox>;
+
+/// Computes `font`'s [`EmBox`]: the em is placed by the OS/2 typographic ascender and
+/// descender when they span exactly one em, as CJK fonts' do (Noto Sans CJK: 880 above
+/// and 120 below the baseline, of 1000); otherwise it is centred in the line box - many
+/// fonts (Noto Emoji among them) copy their line box into those fields instead.
+fn em_box(font: &FontArc) -> EmBox {
+    let line = (font.ascent_unscaled() - font.descent_unscaled()).max(f32::EPSILON);
+    let upem = font.units_per_em().unwrap_or(line).max(f32::EPSILON);
+    let typo_top = ttf_parser::Face::parse(font.font_data(), 0)
+        .ok()
+        .and_then(|face| Some((face.typographic_ascender()?, face.typographic_descender()?)))
+        .filter(|(top, bottom)| {
+            *top > 0 && (f32::from(*top) - f32::from(*bottom) - upem).abs() < 1.0
+        })
+        .map(|(top, _)| f32::from(top));
+    let top = typo_top.unwrap_or(font.ascent_unscaled() - (line - upem) / 2.0);
+    EmBox {
+        size: upem / line,
+        centre: (top - upem / 2.0) / line,
+    }
+}
+
 /// The fonts text is drawn with: a lookup chain per style plus the emoji fallback chain.
 /// Parsed once (at startup for configured fonts) and shared behind an [`Arc`].
 #[derive(Clone)]
@@ -157,6 +197,8 @@ pub struct FontSet {
     extra: Option<FontArc>,
     /// Colour bitmaps decoded so far, shared by every clone of the set.
     bitmaps: Arc<Mutex<BitmapCache>>,
+    /// Em boxes computed so far, shared by every clone of the set.
+    em_boxes: Arc<Mutex<EmBoxCache>>,
 }
 
 /// What loading `defaults.fonts` had to say beyond errors: one-line warnings (always
@@ -223,6 +265,7 @@ impl FontSet {
                     regular: None,
                     extra: None,
                     bitmaps: Arc::default(),
+                    em_boxes: Arc::default(),
                 })
             })
             .clone()
@@ -237,6 +280,7 @@ impl FontSet {
         let embedded = FontSet::embedded();
         let mut set = (*embedded).clone();
         set.bitmaps = Arc::default();
+        set.em_boxes = Arc::default();
         let mut errors = Vec::new();
         let mut report = FontReport::default();
         let slots = [
@@ -322,6 +366,16 @@ impl FontSet {
             fitted: false,
             bitmap: None,
         }
+    }
+
+    /// `font`'s em box, from the cache or computed now.
+    fn em_box(&self, font: &FontArc) -> EmBox {
+        let key = font.font_data().as_ptr() as usize;
+        let mut cache = self
+            .em_boxes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *cache.entry(key).or_insert_with(|| em_box(font))
     }
 
     /// The decoded colour bitmap of glyph `id` in `font` (its largest strike), from the
@@ -694,9 +748,10 @@ struct PlacedGlyph {
     x: f32,
     /// Multiplier on the line's font scale (below 1 for emoji shrunk into their cells).
     scale: f32,
-    /// Whether the glyph is vertically centred on the line (emoji) instead of sitting
-    /// on the shared baseline.
-    centred: bool,
+    /// For a glyph vertically centred on the line (emoji, CJK) instead of sitting on
+    /// the shared baseline: its em box centre above its baseline, at scale 1 of its own
+    /// font (see [`EmBox::centre`]).
+    centred: Option<f32>,
     /// The glyph's colour; `None` for the button's text colour. Unused for bitmaps,
     /// which carry their own colours.
     fg: Option<Color>,
@@ -764,24 +819,29 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                     id,
                     x: start,
                     scale: 1.0,
-                    centred: true,
+                    centred: Some(0.0),
                     fg: None,
                     bitmap: Some((bitmap, target)),
                 });
                 laid.width += target;
             } else if resolved.fitted {
-                // Fit the emoji into its cells, never larger than its natural size so it
-                // cannot outgrow the line height; the rest of the cluster (skin tone,
-                // joined emoji) cannot be combined without shaping and is dropped.
+                // Fit the glyph (emoji, CJK) into its cells: as large as makes its em box
+                // [`FITTED_EM_FILL`] of the text line's height, but never wider than its
+                // cells. So a font
+                // with a tall line box relative to its em (Noto Sans CJK) is enlarged to
+                // fill its cells instead of leaving gaps beside each character. The rest
+                // of the cluster (skin tone, joined emoji) cannot be combined without
+                // shaping and is dropped.
                 let target = cells as f32 * cell;
                 let natural = font.as_scaled(1.0).h_advance(id).max(f32::EPSILON);
-                let scale = (target / natural).min(1.0);
+                let em = fonts.em_box(font);
+                let scale = (FITTED_EM_FILL / em.size.max(f32::EPSILON)).min(target / natural);
                 laid.glyphs.push(PlacedGlyph {
                     font: font.clone(),
                     id,
                     x: start + (target - natural * scale) / 2.0,
                     scale,
-                    centred: true,
+                    centred: Some(em.centre),
                     fg: span.style.fg.clone(),
                     bitmap: None,
                 });
@@ -803,7 +863,7 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                         id,
                         x: laid.width,
                         scale: 1.0,
-                        centred: false,
+                        centred: None,
                         fg: span.style.fg.clone(),
                         bitmap: None,
                     });
@@ -931,13 +991,13 @@ pub fn render_lines(
                 continue;
             }
             let glyph_scale = scale * glyph.scale;
-            let glyph_baseline = if glyph.centred {
-                // Put the glyph's line box centre on the primary font's line centre.
-                let own = glyph.font.as_scaled(glyph_scale);
-                let centre = baseline - (ascent + descent) / 2.0;
-                centre + (own.ascent() + own.descent()) / 2.0
-            } else {
-                baseline
+            let glyph_baseline = match glyph.centred {
+                // Put the glyph's em box centre on the primary font's line centre.
+                Some(em_centre) => {
+                    let centre = baseline - (ascent + descent) / 2.0;
+                    centre + em_centre * glyph_scale
+                }
+                None => baseline,
             };
             let positioned = glyph.id.with_scale_and_position(
                 PxScale::from(glyph_scale),

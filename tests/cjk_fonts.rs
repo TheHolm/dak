@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::font_builder::{build_font, solid_png, write_font, ColourTables, Glyph};
+use common::font_builder::{
+    build_font, build_font_with_metrics, solid_png, write_font, ColourTables, Glyph, CJK_METRICS,
+};
 use dak::actions::load_config_from_path;
 use dak::color::Color;
 use dak::markup::{parse, Markup};
@@ -171,4 +173,75 @@ fn extra_in_config() {
         errors.contains("defaults.fonts.extra: \"/nonexistent/cjk.ttc\""),
         "{errors}"
     );
+}
+
+/// A stand-in for Noto Sans CJK's proportions: ideographs filling the em box in a font
+/// whose line box is much taller than its em (1160/-288 of 1000 units).
+fn tall_cjk_font() -> Vec<u8> {
+    build_font_with_metrics(
+        &[
+            ('\u{65E5}', Glyph::FullSquare),
+            ('\u{672C}', Glyph::FullSquare),
+        ],
+        ColourTables::default(),
+        CJK_METRICS,
+    )
+}
+
+/// Columns of `image` holding any lit pixel.
+fn lit_columns(image: &image::RgbImage) -> usize {
+    (0..image.width())
+        .filter(|x| (0..image.height()).any(|y| image.get_pixel(*x, y).0[0] > 200))
+        .count()
+}
+
+/// Ideographs from a font with a tall line box are enlarged until their em box is 93%
+/// of the line height, so they mostly fill their two columns: three light 44-50 of the
+/// 60 pixel columns, where fitting by the line box alone left ~33 and the full line
+/// height ~53.
+#[test]
+fn tall_line_box_cjk_fills_its_columns() {
+    let fonts = fonts_with(&[("extra", &tall_cjk_font())]);
+    let covered = lit_columns(&render("\u{65E5}\u{672C}\u{65E5}", &fonts));
+    assert!((44..=50).contains(&covered), "{covered} of 60 columns lit");
+}
+
+/// The enlarged ideograph is centred on the line by its em box, not by the tall line
+/// box (which would put it low): alone on the button its ink is vertically centred.
+#[test]
+fn tall_line_box_cjk_is_vertically_centred() {
+    let fonts = fonts_with(&[("extra", &tall_cjk_font())]);
+    let image = render("\u{65E5}", &fonts);
+    let rows: Vec<u32> = (0..image.height())
+        .filter(|y| (0..image.width()).any(|x| image.get_pixel(x, *y).0[0] > 200))
+        .collect();
+    let (top, bottom) = (rows[0], *rows.last().unwrap());
+    let centre = (top + bottom) as f32 / 2.0;
+    assert!((centre - 29.5).abs() <= 2.5, "ink rows {top}..{bottom}");
+}
+
+/// Rows of `image` holding any lit pixel.
+fn lit_rows(image: &image::RgbImage) -> Vec<u32> {
+    (0..image.height())
+        .filter(|y| (0..image.width()).any(|x| image.get_pixel(x, *y).0[0] > 200))
+        .collect()
+}
+
+/// Three lines of enlarged ideographs keep a gap of at least 2 blank pixel rows between
+/// them (3 with the real Noto Sans CJK): fitted glyphs fill only 93% of the line height,
+/// where the full line height left 1 row and looked cramped on the keypad.
+#[test]
+fn stacked_cjk_lines_keep_a_gap() {
+    let fonts = fonts_with(&[("extra", &tall_cjk_font())]);
+    let rows = lit_rows(&render(
+        "\u{65E5}\u{672C}\u{65E5}\n\u{672C}\u{65E5}\u{672C}\n\u{65E5}\u{672C}\u{65E5}",
+        &fonts,
+    ));
+    let gaps: Vec<u32> = rows
+        .windows(2)
+        .filter(|pair| pair[1] > pair[0] + 1)
+        .map(|pair| pair[1] - pair[0] - 1)
+        .collect();
+    assert_eq!(gaps.len(), 2, "lit rows {rows:?}");
+    assert!(gaps.iter().all(|gap| *gap >= 2), "gaps {gaps:?}");
 }

@@ -40,7 +40,8 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   back to (`-d scene` lists them).
 - Chinese/Japanese/Korean work through a new `defaults.fonts.extra` font
   (e.g. Noto Sans CJK), tried after the emoji fonts; Latin stays in DejaVu
-  and CJK characters take two of the six columns. Bold/italic text now falls
+  and CJK characters take two of the six columns, sized to fill them (Noto
+  Sans CJK's tall line box would otherwise leave wide gaps beside each one). Bold/italic text now falls
   back to your configured `regular` font before giving up, so a CJK
   `regular` font no longer shows boxes in bold. Right-to-left scripts (Hebrew, Arabic) are not
   supported yet; formatting tags past the visible 6x3 area still apply.
@@ -88,7 +89,13 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   `FONT_KEYS`/`FontPaths` gain `extra`; `FontSet` gains `regular` (tried for
   bold/italic after the style chain) and `extra` (after the emoji chain,
   fitted into cells like emoji); the extra slot's gap warning says the
-  characters are shown as a missing-glyph box;
+  characters are shown as a missing-glyph box; fitted glyphs are sized by
+  the font's em box (OS/2 typographic metrics when they span exactly one em,
+  as CJK fonts' do, else centred in the line box) to `FITTED_EM_FILL` = 93%
+  of the line height, capped by their cells' width, and centred on the line
+  by that em box - measured with Noto Sans CJK: 日本語 lights 44-48 of 60
+  pixel columns (31-36 before), with 3 blank rows between three stacked
+  lines (1 at 100%, which looked cramped on the keypad);
   `FontSet::load` returns `(FontSet, FontReport { warnings, details })`;
   `LoadedConfig::font_details` carries the code-point lists, printed by
   `main.rs` as `scene` debug output. `MAX_FONT_FILE_BYTES` is 256 MiB (was
