@@ -17,7 +17,7 @@ dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It 
 Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory
 .TP
 \fB\-d\fR, \fB\-\-debug\fR \fI<DEBUG>...\fR
-Debug subsystems to enable: device, scene, action. The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
+Debug subsystems to enable: device, scene, action, fonts (the fonts in use and the characters configured fonts cannot draw; silent without defaults.fonts). The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
 .TP
 \fB\-\-map\fR
 Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits

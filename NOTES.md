@@ -873,6 +873,12 @@ Gotchas found on the way:
   head/hhea/maxp/hmtx/cmap(format 12)/glyf/loca, optional CBDT+CBLC (index
   format 1, image format 17), empty COLR+CPAL / SVG. `loca` needs numGlyphs+1
   entries - one short and ttf-parser silently finds no outlines at all.
+- `-d fonts` classifies undrawable glyphs with ttf-parser: `is_color_glyph`
+  (COLR base record), `glyph_svg_image` (SVG document), a raster image in a
+  format we do not decode (mono/grey), an `sbix` table without a readable
+  image (ttf-parser returns `None` for JPEG/TIFF/PDF - so only "probably"),
+  else empty. Counts in the listing differ slightly from the scan-bench
+  numbers above because `is_blank_by_design` skips a few more characters.
 - CJK coverage (checked against the real fonts): DejaVu Sans Mono has **no**
   CJK ideographs, kana, Hangul syllables (0/11172), half-width katakana,
   full-width ASCII or CJK punctuation - Noto Sans CJK has all. Noto Sans CJK

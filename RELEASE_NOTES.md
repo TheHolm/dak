@@ -37,7 +37,13 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   starting, one that also has outlines is drawn in monochrome with a warning.
 - Configured fonts are checked at startup; if some characters cannot be
   drawn you get one warning with the count and the embedded font they fall
-  back to (`-d scene` lists them).
+  back to.
+- New debug mode `-d fonts` (only active when `defaults.fonts` names a
+  font): lists every font in lookup order, embedded ones included, with
+  each configured font's character counts and its undrawable characters as
+  ranges (`U+1F1E6-1F1FF,1F3FB`) grouped by reason - COLR layers, SVG
+  picture, unsupported bitmap, probably unsupported sbix image, empty glyph
+  - at most 20 lines per font.
 - Chinese/Japanese/Korean work through a new `defaults.fonts.extra` font
   (e.g. Noto Sans CJK), tried after the emoji fonts; Latin stays in DejaVu
   and CJK characters take two of the six columns, sized to fill them (Noto
@@ -98,7 +104,14 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   lines (1 at 100%, which looked cramped on the keypad);
   `FontSet::load` returns `(FontSet, FontReport { warnings, details })`;
   `LoadedConfig::font_details` carries the code-point lists, printed by
-  `main.rs` as `scene` debug output. `MAX_FONT_FILE_BYTES` is 256 MiB (was
+  `main.rs` as `fonts` debug output (new `Subsystem::Fonts`, `-d fonts`/
+  `font`). `FontScan` records outlines and, per undrawable character, an
+  `Undrawable` reason (`classify_undrawable`: COLR via `is_color_glyph`, SVG
+  via `glyph_svg_image`, other raster formats, an `sbix` table without a
+  readable image, else empty); `format_ranges` merges code points into
+  Cisco-VLAN-style ranges, wraps at 100 columns with labelled `(cont.)`
+  lines and caps them at `FONT_DEBUG_MAX_LINES` = 20 per font plus one
+  "… N more ranges (M characters) not shown" line. `MAX_FONT_FILE_BYTES` is 256 MiB (was
   32). Scan timings on real fonts are in `NOTES.md` section 9.
 - Fonts added under `fonts/` unmodified: `DejaVuSansMono-{Bold,Oblique,
   BoldOblique}.ttf` (2.37, same release as the existing regular face) and

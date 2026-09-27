@@ -29,7 +29,7 @@ Options:
   -c, --config <CONFIG>   Path to the config file; when omitted, `config.json` is
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
-  -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action
+  -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action, fonts
       --map               Run the interactive device-mapping wizard instead of
                           normal operation (see Devices below) and exit
   -h, --help              Print usage help and exit
@@ -54,6 +54,7 @@ controlled with `-d` / `--debug` (repeatable, or comma-separated values added up
 | `device`  | the device used, its capabilities (key/encoder counts, supported states), every key press/release event, and every event that sets or clears a button image |
 | `scene`   | entering and leaving scenes, armed scene timers, and every setup operation applied to a button |
 | `action`  | every action that runs and what triggered it (key press or scene timer), including launched commands and their completion |
+| `fonts`   | only when `defaults.fonts` names a font: every font in lookup order (embedded ones marked as built in), each configured font's character counts, and the characters it cannot draw with the reason — listed as ranges like `U+1F1E6-1F1FF,1F3FB`, at most 20 lines per font |
 
 `-d` values are additive, e.g. `-d device -d scene` or `-d device,scene`.
 
@@ -241,7 +242,19 @@ So a Latin-only font still shows Cyrillic and emoji from the embedded fonts, and
 
 - a font none of whose characters can be drawn — typically a COLR- or SVG-only colour emoji font — is a config error;
 - a COLR/SVG font that also has plain outlines (e.g. Twitter Color Emoji SVGinOT) is accepted with a warning that its colour is ignored, and drawn in monochrome;
-- if only some characters cannot be drawn, you get one warning such as `defaults.fonts.emoji: 214 of 3731 characters cannot be drawn; they fall back to the embedded Noto Emoji` (run with `-d scene` to see which code points).
+- if only some characters cannot be drawn, you get one warning such as `defaults.fonts.emoji: 214 of 3731 characters cannot be drawn; they fall back to the embedded Noto Emoji` (run with `-d fonts` to see which characters, and why).
+
+With `-d fonts` the startup output looks like this:
+
+```
+debug[fonts]: 5 emoji       "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+debug[fonts]:     1460 characters: 0 outline, 1460 colour bitmap, 0 undrawable
+debug[fonts]: 6 emoji       embedded Noto Emoji (built in, not scanned)
+debug[fonts]: 7 extra       "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0"
+debug[fonts]:     44800 characters: 44800 outline, 0 colour bitmap, 0 undrawable
+```
+
+A font with gaps adds lines such as `undrawable, COLR colour layers: U+1F1E6-1F1FF,1F3FB-1F3FF`, one list per reason: `COLR colour layers`, `SVG colour picture`, `unsupported bitmap (mono/grey)`, `probably unsupported sbix image (JPEG/TIFF/PDF)` or `empty glyph`.
 
 ### Variables
 

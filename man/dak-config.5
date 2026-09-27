@@ -414,8 +414,12 @@ configured font is scanned at startup: a font with no drawable character (a
 COLR\- or SVG\-only colour font) is a config error; a COLR/SVG font that also
 has outlines is used in monochrome with a warning; and characters a font
 cannot draw are counted in one warning and fall back to the slot's embedded
-font (the code points are listed with
-.BR "\-d scene" ).
+font. With
+.B "\-d fonts"
+every font is listed in lookup order, and each configured font's undrawable
+characters are shown as code point ranges grouped by reason (COLR colour
+layers, SVG colour picture, unsupported bitmap, probably unsupported sbix
+image, empty glyph), at most 20 lines per font.
 
 .SH VARIABLES
 The optional

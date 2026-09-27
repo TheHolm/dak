@@ -201,14 +201,50 @@ pub struct FontSet {
     em_boxes: Arc<Mutex<EmBoxCache>>,
 }
 
+/// Most range lines `-d fonts` prints per configured font; the rest are summarised in
+/// one "… N more ranges" line so a font with thousands of gaps cannot flood the output.
+pub const FONT_DEBUG_MAX_LINES: usize = 20;
+
+/// Width (in characters) at which `-d fonts` range lists wrap.
+const FONT_DEBUG_LINE_WIDTH: usize = 100;
+
 /// What loading `defaults.fonts` had to say beyond errors: one-line warnings (always
-/// shown) and details such as the full list of undrawable code points (debug output).
+/// shown) and the `-d fonts` listing of the lookup order and undrawable characters.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FontReport {
     /// Warnings shown at startup, prefixed with `defaults.fonts.<slot>`.
     pub warnings: Vec<String>,
-    /// Extra detail for `-d scene`, prefixed the same way.
+    /// Lines for `-d fonts`, see [`FontSet::load`].
     pub details: Vec<String>,
+}
+
+/// Why a mapped character cannot be drawn, as found by [`scan_font`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Undrawable {
+    /// The glyph is COLR colour layers without an outline of its own.
+    Colr,
+    /// The glyph is an SVG colour picture without an outline.
+    Svg,
+    /// The glyph has only a monochrome or greyscale bitmap, which dak does not decode.
+    UnsupportedBitmap,
+    /// The font has an `sbix` table but no readable image for the glyph - most likely
+    /// JPEG, TIFF or PDF, which the font parser skips.
+    ProbablySbix,
+    /// The glyph is empty: no outline and no picture of any kind.
+    Empty,
+}
+
+impl Undrawable {
+    /// The label used in `-d fonts` output.
+    pub fn label(self) -> &'static str {
+        match self {
+            Undrawable::Colr => "COLR colour layers",
+            Undrawable::Svg => "SVG colour picture",
+            Undrawable::UnsupportedBitmap => "unsupported bitmap (mono/grey)",
+            Undrawable::ProbablySbix => "probably unsupported sbix image (JPEG/TIFF/PDF)",
+            Undrawable::Empty => "empty glyph",
+        }
+    }
 }
 
 /// The result of scanning a font's character map with [`scan_font`].
@@ -216,13 +252,117 @@ pub struct FontReport {
 pub struct FontScan {
     /// Characters the font maps (not counting those in [`is_blank_by_design`]).
     pub total: usize,
-    /// Of those, the code points with neither an outline nor a colour bitmap dak can
-    /// decode (COLR/SVG-only colour glyphs, JPEG/TIFF sbix images, empty glyphs).
-    pub undrawable: Vec<u32>,
+    /// Characters drawn from outlines.
+    pub outlines: usize,
     /// Characters drawn from colour bitmaps (CBDT/sbix) rather than outlines.
     pub bitmaps: usize,
+    /// The code points with neither an outline nor a colour bitmap dak can decode, in
+    /// ascending order, each with the reason.
+    pub undrawable: Vec<(u32, Undrawable)>,
     /// Whether the font has COLR or SVG colour tables, whose colour dak ignores.
     pub vector_colour: bool,
+}
+
+/// Classifies why a glyph with no outline and no decodable colour bitmap cannot be drawn:
+/// `colr`/`svg` tell whether the font has a COLR/SVG entry for it, `raster` whether it has
+/// some other (monochrome/greyscale) bitmap, `sbix` whether the font has an `sbix` table.
+/// Checked in that order, as the first matches the glyph's actual content best.
+pub fn classify_undrawable(colr: bool, svg: bool, raster: bool, sbix: bool) -> Undrawable {
+    if colr {
+        Undrawable::Colr
+    } else if svg {
+        Undrawable::Svg
+    } else if raster {
+        Undrawable::UnsupportedBitmap
+    } else if sbix {
+        Undrawable::ProbablySbix
+    } else {
+        Undrawable::Empty
+    }
+}
+
+/// Merges sorted `codes` into inclusive ranges and writes them Cisco-VLAN style: `115F`,
+/// `115F-1160`, comma separated, at least four hex digits each.
+fn range_tokens(codes: &[u32]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut iter = codes.iter().copied().peekable();
+    while let Some(start) = iter.next() {
+        let mut end = start;
+        while iter.peek() == Some(&(end + 1)) {
+            end = iter.next().expect("peeked");
+        }
+        tokens.push(if start == end {
+            format!("{start:04X}")
+        } else {
+            format!("{start:04X}-{end:04X}")
+        });
+    }
+    tokens
+}
+
+/// Formats groups of undrawable code points (each `(label, sorted codes)`) as labelled,
+/// wrapped range lists: `undrawable, <label>: U+115F-1160,3164`, continuing on
+/// `undrawable, <label> (cont.): U+...` lines of at most `width` characters. After
+/// `max_lines` range lines in total the rest is summarised as
+/// `undrawable: … N more ranges (M characters) not shown`.
+pub fn format_ranges(groups: &[(&str, Vec<u32>)], width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let (mut hidden_ranges, mut hidden_chars) = (0usize, 0usize);
+    for (label, codes) in groups {
+        let tokens = range_tokens(codes);
+        let sizes = range_sizes(codes);
+        let mut line = String::new();
+        let mut first = true;
+        for (token, size) in tokens.iter().zip(sizes) {
+            if lines.len() >= max_lines {
+                hidden_ranges += 1;
+                hidden_chars += size;
+                continue;
+            }
+            if line.is_empty() {
+                line = if first {
+                    format!("undrawable, {label}: U+{token}")
+                } else {
+                    format!("undrawable, {label} (cont.): U+{token}")
+                };
+                first = false;
+            } else if line.len() + 1 + token.len() > width {
+                lines.push(std::mem::take(&mut line));
+                if lines.len() >= max_lines {
+                    hidden_ranges += 1;
+                    hidden_chars += size;
+                    continue;
+                }
+                line = format!("undrawable, {label} (cont.): U+{token}");
+            } else {
+                line.push(',');
+                line.push_str(token);
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    if hidden_ranges > 0 {
+        lines.push(format!(
+            "undrawable: … {hidden_ranges} more ranges ({hidden_chars} characters) not shown"
+        ));
+    }
+    lines
+}
+
+/// The number of code points in each range [`range_tokens`] forms from `codes`.
+fn range_sizes(codes: &[u32]) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    let mut iter = codes.iter().copied().peekable();
+    while let Some(start) = iter.next() {
+        let mut end = start;
+        while iter.peek() == Some(&(end + 1)) {
+            end = iter.next().expect("peeked");
+        }
+        sizes.push((end - start) as usize + 1);
+    }
+    sizes
 }
 
 impl fmt::Debug for FontSet {
@@ -291,11 +431,13 @@ impl FontSet {
             ("emoji", &paths.emoji),
             ("extra", &paths.extra),
         ];
+        let mut scans: Vec<Option<FontScan>> = vec![None; slots.len()];
         for (index, (key, path)) in slots.into_iter().enumerate() {
             let Some(path) = path else { continue };
             match load_font_file(path) {
                 Ok((font, scan)) => {
                     report_scan(key, path, &scan, &mut report);
+                    scans[index] = Some(scan);
                     match key {
                         "emoji" => set.emoji.insert(0, font),
                         "extra" => set.extra = Some(font),
@@ -310,11 +452,11 @@ impl FontSet {
                 Err(error) => errors.push(format!("defaults.fonts.{key}: {error}")),
             }
         }
-        if errors.is_empty() {
-            Ok((set, report))
-        } else {
-            Err(errors)
+        if !errors.is_empty() {
+            return Err(errors);
         }
+        report.details = describe_lookup(&slots, &scans);
+        Ok((set, report))
     }
 
     /// The font whose metrics lay out every line: the first regular face.
@@ -525,6 +667,7 @@ pub fn scan_font(data: &[u8], index: u32) -> Option<FontScan> {
     use ttf_parser::{Face, RasterImageFormat, Tag};
     let face = Face::parse(data, index).ok()?;
     let raw = face.raw_face();
+    let has_sbix = raw.table(Tag::from_bytes(b"sbix")).is_some();
     let mut scan = FontScan {
         vector_colour: raw.table(Tag::from_bytes(b"COLR")).is_some()
             || raw.table(Tag::from_bytes(b"SVG ")).is_some(),
@@ -555,9 +698,11 @@ pub fn scan_font(data: &[u8], index: u32) -> Option<FontScan> {
         }
         scan.total += 1;
         if face.outline_glyph(id, &mut NoOutline).is_some() {
+            scan.outlines += 1;
             continue;
         }
-        match face.glyph_raster_image(id, u16::MAX) {
+        let raster = face.glyph_raster_image(id, u16::MAX);
+        match raster {
             Some(image)
                 if matches!(
                     image.format,
@@ -566,7 +711,15 @@ pub fn scan_font(data: &[u8], index: u32) -> Option<FontScan> {
             {
                 scan.bitmaps += 1
             }
-            _ => scan.undrawable.push(code),
+            _ => scan.undrawable.push((
+                code,
+                classify_undrawable(
+                    face.is_color_glyph(id),
+                    face.glyph_svg_image(id).is_some(),
+                    raster.is_some(),
+                    has_sbix,
+                ),
+            )),
         }
     }
     Some(scan)
@@ -588,16 +741,92 @@ fn report_scan(key: &str, path: &str, scan: &FontScan, report: &mut FontReport) 
             scan.total,
             fallback_description(key)
         ));
-        let list: Vec<String> = scan
-            .undrawable
-            .iter()
-            .map(|code| format!("U+{code:04X}"))
-            .collect();
-        report.details.push(format!(
-            "defaults.fonts.{key}: characters that cannot be drawn: {}",
-            list.join(" ")
-        ));
     }
+}
+
+/// The `-d fonts` listing: every font in lookup order - configured ones with their scan
+/// ([`describe_scan`]), embedded ones with a remark - numbered from 1. `slots` are the
+/// `defaults.fonts` slots in [`FONT_KEYS`] order with their paths, `scans` the matching
+/// scan results.
+fn describe_lookup(slots: &[(&str, &Option<String>)], scans: &[Option<FontScan>]) -> Vec<String> {
+    let mut lines = vec![
+        "lookup order (a character is drawn from the first font that has it; each style \
+         tries its own fonts, then for bold/italic the configured regular font, then the \
+         emoji fonts, then extra):"
+            .to_string(),
+    ];
+    let mut number = 0;
+    for (index, (key, path)) in slots.iter().enumerate() {
+        if let (Some(path), Some(scan)) = (path, &scans[index]) {
+            number += 1;
+            lines.extend(describe_scan(number, key, path, scan));
+        }
+        if *key != "extra" {
+            number += 1;
+            let name = match *key {
+                "regular" => "DejaVu Sans Mono",
+                "bold" => "DejaVu Sans Mono Bold",
+                "italic" => "DejaVu Sans Mono Oblique",
+                "bold_italic" => "DejaVu Sans Mono Bold Oblique",
+                _ => "Noto Emoji",
+            };
+            lines.push(format!(
+                "{number} {key:<11} embedded {name} (built in, not scanned)"
+            ));
+        }
+    }
+    lines
+}
+
+/// Where a configured font's undrawable characters go, as shown in `-d fonts`.
+fn fallback_remark(key: &str) -> &'static str {
+    match key {
+        "regular" => "drawn from embedded DejaVu Sans Mono instead",
+        "bold" => "drawn from embedded DejaVu Sans Mono Bold instead",
+        "italic" => "drawn from embedded DejaVu Sans Mono Oblique instead",
+        "bold_italic" => "drawn from embedded DejaVu Sans Mono Bold Oblique instead",
+        "emoji" => "drawn from embedded Noto Emoji instead",
+        _ => "shown as a box",
+    }
+}
+
+/// The `-d fonts` lines for one configured font: its path, its character counts, and
+/// its undrawable characters grouped by reason as labelled range lists (see
+/// [`format_ranges`]), at most [`FONT_DEBUG_MAX_LINES`] of them.
+fn describe_scan(number: usize, key: &str, path: &str, scan: &FontScan) -> Vec<String> {
+    let mut lines = vec![
+        format!("{number} {key:<11} \"{path}\""),
+        format!(
+            "    {} characters: {} outline, {} colour bitmap, {} undrawable{}",
+            scan.total,
+            scan.outlines,
+            scan.bitmaps,
+            scan.undrawable.len(),
+            if scan.undrawable.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", fallback_remark(key))
+            }
+        ),
+    ];
+    let mut groups: Vec<(Undrawable, Vec<u32>)> = Vec::new();
+    for (code, reason) in &scan.undrawable {
+        match groups.iter_mut().find(|(group, _)| group == reason) {
+            Some((_, codes)) => codes.push(*code),
+            None => groups.push((*reason, vec![*code])),
+        }
+    }
+    groups.sort_by_key(|(reason, _)| *reason);
+    let labelled: Vec<(&str, Vec<u32>)> = groups
+        .into_iter()
+        .map(|(reason, codes)| (reason.label(), codes))
+        .collect();
+    lines.extend(
+        format_ranges(&labelled, FONT_DEBUG_LINE_WIDTH, FONT_DEBUG_MAX_LINES)
+            .into_iter()
+            .map(|line| format!("    {line}")),
+    );
+    lines
 }
 
 /// Reads, scans and parses one configured font file. A trailing `#N` on `spec` selects
@@ -1400,7 +1629,11 @@ mod tests {
         for (name, bytes, expected) in [
             ("regular", FONT_BYTES, vec![]),
             ("bold", FONT_BOLD_BYTES, vec![]),
-            ("oblique", FONT_ITALIC_BYTES, vec![0x1D3D]),
+            (
+                "oblique",
+                FONT_ITALIC_BYTES,
+                vec![(0x1D3D, Undrawable::Empty)],
+            ),
             ("bold oblique", FONT_BOLD_ITALIC_BYTES, vec![]),
             ("emoji", EMOJI_BYTES, vec![]),
         ] {
@@ -1409,7 +1642,103 @@ mod tests {
             assert_eq!(scan.undrawable, expected, "{name}");
             assert!(!scan.vector_colour, "{name}");
             assert_eq!(scan.bitmaps, 0, "{name}");
+            assert_eq!(scan.outlines + scan.undrawable.len(), scan.total, "{name}");
         }
+    }
+
+    /// Number of ranges on one `format_ranges` line (the comma-separated list after
+    /// `U+`; the label itself contains a comma too).
+    fn tokens(line: &str) -> usize {
+        line.split_once("U+")
+            .map_or(0, |(_, list)| list.split(',').count())
+    }
+
+    /// Ranges merge consecutive code points, keep singles apart and use at least four
+    /// hex digits (more above U+FFFF).
+    #[test]
+    fn format_ranges_merges_and_labels() {
+        assert!(format_ranges(&[], 100, 20).is_empty());
+        assert_eq!(
+            format_ranges(
+                &[("empty glyph", vec![0x115F, 0x1160, 0x3164, 0xFFA0, 0x1F600])],
+                100,
+                20
+            ),
+            vec!["undrawable, empty glyph: U+115F-1160,3164,FFA0,1F600"]
+        );
+        assert_eq!(
+            format_ranges(&[("a", vec![0x41]), ("b", vec![0x42, 0x43])], 100, 20),
+            vec!["undrawable, a: U+0041", "undrawable, b: U+0042-0043"]
+        );
+    }
+
+    /// Long lists wrap into labelled continuation lines no longer than the width.
+    #[test]
+    fn format_ranges_wraps() {
+        let codes: Vec<u32> = (0..40).map(|i| 0x1000 + 2 * i).collect();
+        let lines = format_ranges(&[("empty glyph", codes)], 60, 20);
+        assert!(lines.len() > 1);
+        assert!(lines[0].starts_with("undrawable, empty glyph: U+1000,1002"));
+        assert!(lines[1..]
+            .iter()
+            .all(|line| line.starts_with("undrawable, empty glyph (cont.): U+")));
+        assert!(lines.iter().all(|line| line.len() <= 60), "{lines:?}");
+        let listed: usize = lines.iter().map(|line| tokens(line)).sum();
+        assert_eq!(listed, 40);
+    }
+
+    /// After `max_lines` range lines (counted across all reasons) the rest is summarised
+    /// in one line with the hidden range and character counts.
+    #[test]
+    fn format_ranges_caps_lines() {
+        // 200 separate code points, one range each, then a 2-character range.
+        let singles: Vec<u32> = (0..200).map(|i| 0x2000 + 2 * i).collect();
+        let lines = format_ranges(
+            &[
+                ("COLR colour layers", singles),
+                ("empty glyph", vec![0x9000, 0x9001]),
+            ],
+            60,
+            3,
+        );
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let shown: usize = lines[..3].iter().map(|line| tokens(line)).sum();
+        // Hidden: the remaining singles plus the 9000-9001 range.
+        assert_eq!(
+            lines[3],
+            format!(
+                "undrawable: … {} more ranges ({} characters) not shown",
+                200 - shown + 1,
+                200 - shown + 2
+            )
+        );
+        assert!(!lines.iter().any(|line| line.contains("empty glyph")));
+    }
+
+    /// Each combination of what a glyph has maps to the most specific reason.
+    #[test]
+    fn classify_undrawable_prefers_specific_reasons() {
+        assert_eq!(
+            classify_undrawable(true, true, true, true),
+            Undrawable::Colr
+        );
+        assert_eq!(
+            classify_undrawable(false, true, true, true),
+            Undrawable::Svg
+        );
+        assert_eq!(
+            classify_undrawable(false, false, true, true),
+            Undrawable::UnsupportedBitmap
+        );
+        assert_eq!(
+            classify_undrawable(false, false, false, true),
+            Undrawable::ProbablySbix
+        );
+        assert_eq!(
+            classify_undrawable(false, false, false, false),
+            Undrawable::Empty
+        );
+        assert_eq!(Undrawable::Colr.label(), "COLR colour layers");
     }
 
     /// Blank-by-design characters include whitespace, joiners, variation selectors and

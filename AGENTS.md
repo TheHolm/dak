@@ -90,7 +90,9 @@ under other platforms.
   `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant.
   `tests/colour_fonts.rs` uses in-memory fonts from `tests/common/font_builder.rs`
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
-  (`device`/`scene`/`action`) by `-d`/`--debug`
+  (`device`/`scene`/`action`/`fonts`) by `-d`/`--debug`; `fonts` prints the font
+  lookup order and undrawable-character ranges built by `FontSet::load`, and only
+  has anything to print when `defaults.fonts` names a font
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
 - `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
   key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,

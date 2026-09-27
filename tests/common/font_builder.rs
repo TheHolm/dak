@@ -3,9 +3,9 @@
 //!
 //! Each font maps a few characters to glyphs that are an outline (a filled square),
 //! empty (no outline at all), or a CBDT colour bitmap (a PNG). COLR/CPAL and SVG tables
-//! can be added as minimal, valid-but-empty tables: enough for a reader to see that the
-//! font carries vector colour data, while none of its mapped glyphs has anything drawable
-//! from it, the same as a real COLR/SVG-only emoji font as far as dak is concerned.
+//! can be added: every *empty* glyph then gets a COLR base-glyph record (one layer) or an
+//! SVG document, so it is a colour glyph without an outline - the same as in a real
+//! COLR/SVG-only emoji font as far as dak is concerned.
 
 #![allow(dead_code)]
 
@@ -275,13 +275,29 @@ pub fn build_font_with_metrics(
         tables.push((*b"CBLC", cblc));
     }
 
+    let empty_ids: Vec<u16> = glyphs
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, glyph))| matches!(glyph, Glyph::Empty))
+        .map(|(index, _)| index as u16 + 1)
+        .collect();
     if colour.colr {
+        // Version 0: one base glyph record per empty glyph, all sharing one layer
+        // (glyph 0 in palette colour 0).
+        let records = empty_ids.len() as u16;
         let mut colr = Vec::new();
         u16be(&mut colr, 0); // version 0
-        u16be(&mut colr, 0); // numBaseGlyphRecords
-        u32be(&mut colr, 14);
-        u32be(&mut colr, 14);
-        u16be(&mut colr, 0); // numLayerRecords
+        u16be(&mut colr, records); // numBaseGlyphRecords
+        u32be(&mut colr, 14); // baseGlyphRecordsOffset
+        u32be(&mut colr, 14 + 6 * u32::from(records)); // layerRecordsOffset
+        u16be(&mut colr, 1); // numLayerRecords
+        for id in &empty_ids {
+            u16be(&mut colr, *id); // glyphID
+            u16be(&mut colr, 0); // firstLayerIndex
+            u16be(&mut colr, 1); // numLayers
+        }
+        u16be(&mut colr, 0); // layer glyphID
+        u16be(&mut colr, 0); // paletteIndex
         tables.push((*b"COLR", colr));
         let mut cpal = Vec::new();
         for value in [0u16, 0, 1, 0] {
@@ -292,11 +308,24 @@ pub fn build_font_with_metrics(
         tables.push((*b"CPAL", cpal));
     }
     if colour.svg {
+        // One tiny SVG document per empty glyph.
+        let document = b"<svg xmlns='http://www.w3.org/2000/svg'/>";
+        let entries = empty_ids.len() as u32;
+        let list_header = 2 + 12 * entries;
         let mut svg = Vec::new();
-        u16be(&mut svg, 0);
+        u16be(&mut svg, 0); // version
         u32be(&mut svg, 10); // offsetToSVGDocumentList
-        u32be(&mut svg, 0);
-        u16be(&mut svg, 0); // numEntries
+        u32be(&mut svg, 0); // reserved
+        u16be(&mut svg, entries as u16); // numEntries
+        for (index, id) in empty_ids.iter().enumerate() {
+            u16be(&mut svg, *id); // startGlyphID
+            u16be(&mut svg, *id); // endGlyphID
+            u32be(&mut svg, list_header + index as u32 * document.len() as u32); // svgDocOffset
+            u32be(&mut svg, document.len() as u32); // svgDocLength
+        }
+        for _ in &empty_ids {
+            svg.extend_from_slice(document);
+        }
         tables.push((*b"SVG ", svg));
     }
 

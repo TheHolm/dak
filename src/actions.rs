@@ -48,8 +48,9 @@ pub struct LoadedConfig {
     /// The fonts button text is drawn with: `defaults.fonts` loaded in front of the
     /// embedded ones (just the embedded ones when the config names none).
     pub fonts: Arc<FontSet>,
-    /// Detail from scanning `defaults.fonts` (such as every code point a font cannot
-    /// draw), printed as `scene` debug output; the one-line summaries are in `warnings`.
+    /// The `-d fonts` listing from loading `defaults.fonts`: every font in lookup order
+    /// and each configured font's undrawable characters (empty without configured
+    /// fonts); the one-line summaries are in `warnings`.
     pub font_details: Vec<String>,
 }
 

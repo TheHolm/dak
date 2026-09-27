@@ -10,7 +10,7 @@ use common::font_builder::{build_font, solid_png, write_font, ColourTables, Glyp
 use dak::actions::load_config_from_path;
 use dak::color::Color;
 use dak::markup::{parse, Markup};
-use dak::text::{render_lines, scan_font, FontPaths, FontSet, MAX_FONT_FILE_BYTES};
+use dak::text::{render_lines, scan_font, FontPaths, FontSet, Undrawable, MAX_FONT_FILE_BYTES};
 use mirajazz::types::{ImageFormat, ImageMirroring, ImageMode, ImageRotation};
 
 // See src/lib.rs for why this is needed on FreeBSD only.
@@ -91,7 +91,8 @@ fn scan_skips_blank_characters() {
     );
     let scan = scan_font(&font, 0).unwrap();
     assert_eq!(scan.total, 2);
-    assert_eq!(scan.undrawable, vec!['B' as u32]);
+    assert_eq!(scan.outlines, 1);
+    assert_eq!(scan.undrawable, vec![('B' as u32, Undrawable::Empty)]);
 }
 
 /// Garbage is not a font.
@@ -169,7 +170,15 @@ fn config_accepts_bitmap_font_quietly() {
     let (font, config) = load_emoji_font("colour.ttf", &bitmap_font());
     let config = config.unwrap();
     assert!(config.warnings.is_empty(), "{:?}", config.warnings);
-    assert!(config.font_details.is_empty());
+    // The -d fonts listing names the font but has nothing undrawable to show.
+    assert!(config
+        .font_details
+        .iter()
+        .any(|line| line == "    1 characters: 0 outline, 1 colour bitmap, 0 undrawable"));
+    assert!(!config
+        .font_details
+        .iter()
+        .any(|line| line.contains("undrawable,")));
     let _ = std::fs::remove_file(font);
 }
 
@@ -275,11 +284,13 @@ fn config_warns_about_partly_drawable_font() {
                 "defaults.fonts.{key}: 2 of 3 characters cannot be drawn; they {outcome}"
             )]
         );
-        assert_eq!(
-            config.font_details,
-            vec![format!(
-                "defaults.fonts.{key}: characters that cannot be drawn: U+0042 U+0043"
-            )]
+        assert!(
+            config
+                .font_details
+                .iter()
+                .any(|line| line == "    undrawable, empty glyph: U+0042-0043"),
+            "{:?}",
+            config.font_details
         );
     }
 }
@@ -327,4 +338,74 @@ fn oversized_font_is_refused() {
     let errors = error_texts(config.unwrap_err());
     assert!(errors.contains("is larger than 256 MiB"), "{errors}");
     let _ = std::fs::remove_file(path);
+}
+
+/// The scan names the reason a glyph cannot be drawn: COLR layers, an SVG picture, or
+/// nothing at all.
+#[test]
+fn scan_reports_reasons() {
+    let glyphs = [('A', Glyph::Square), ('B', Glyph::Empty)];
+    for (colour, reason) in [
+        (
+            ColourTables {
+                colr: true,
+                svg: false,
+            },
+            Undrawable::Colr,
+        ),
+        (
+            ColourTables {
+                colr: false,
+                svg: true,
+            },
+            Undrawable::Svg,
+        ),
+        (ColourTables::default(), Undrawable::Empty),
+    ] {
+        let scan = scan_font(&build_font(&glyphs, colour), 0).unwrap();
+        assert_eq!(scan.undrawable, vec![('B' as u32, reason)]);
+    }
+}
+
+/// `-d fonts` lists every font in lookup order - configured ones with path, counts and
+/// labelled undrawable ranges, embedded ones marked as built in - numbered from 1.
+#[test]
+fn debug_listing_shows_lookup_order_and_reasons() {
+    let emoji = build_font(
+        &[
+            ('A', Glyph::Square),
+            ('\u{1F600}', Glyph::Empty),
+            ('\u{1F601}', Glyph::Empty),
+        ],
+        ColourTables {
+            colr: true,
+            svg: false,
+        },
+    );
+    let (font, config) = load_emoji_font("listing.ttf", &emoji);
+    let config = config.unwrap();
+    let path = font.display();
+    assert_eq!(
+        config.font_details,
+        vec![
+            "lookup order (a character is drawn from the first font that has it; each style tries its own fonts, then for bold/italic the configured regular font, then the emoji fonts, then extra):".to_string(),
+            "1 regular     embedded DejaVu Sans Mono (built in, not scanned)".to_string(),
+            "2 bold        embedded DejaVu Sans Mono Bold (built in, not scanned)".to_string(),
+            "3 italic      embedded DejaVu Sans Mono Oblique (built in, not scanned)".to_string(),
+            "4 bold_italic embedded DejaVu Sans Mono Bold Oblique (built in, not scanned)".to_string(),
+            format!("5 emoji       \"{path}\""),
+            "    3 characters: 1 outline, 0 colour bitmap, 2 undrawable (drawn from embedded Noto Emoji instead)".to_string(),
+            "    undrawable, COLR colour layers: U+1F600-1F601".to_string(),
+            "6 emoji       embedded Noto Emoji (built in, not scanned)".to_string(),
+        ]
+    );
+}
+
+/// Without configured fonts there is nothing to list: `-d fonts` stays silent.
+#[test]
+fn debug_listing_empty_without_configured_fonts() {
+    let path = write_config_with_defaults("{}", r#"{"on_start": {"actions": {}}}"#);
+    let config = load_config_from_path(path.to_str().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(config.font_details.is_empty());
 }
