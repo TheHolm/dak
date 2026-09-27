@@ -68,22 +68,11 @@
    whether this is a new setup type (`image_fifo`/`text_fifo`) or an extension of
    the existing `refresh`, and cleanup of the FIFO reader task on scene change.
    FIFOs are POSIX, so both target platforms are covered.
-9. Signal-driven control: reload the config on `SIGHUP` and optionally run an action
-   (or switch scenes) on `SIGUSR1`/`SIGUSR2`. Only `tokio::signal::ctrl_c()` is
-   handled today; the config is read once at startup and never re-read. A reload
-   must re-validate and diff the new config against live state (connected devices,
-   active scene, running `image_exec`/`text_exec` tasks, armed timers, variables),
-   decide the semantics - preserve the current scene/variables vs. reset - and
-   decide what to do when the new config fails validation (keep running the old one
-   and log the errors). `SIGUSR1`/`SIGUSR2` mapping to a named action overlaps with
-   the existing scene/timer machinery and may be the simpler half to land first.
-   Design-heavy and it interacts with the input/timer loop, so it needs care around
-   reload races. A `SIGHUP` reload should also restart the device scan, picking up
-   keypads plugged in (or newly defined) since startup, and drop definitions that were
-   removed. Separately, `SIGTERM` (`systemctl stop`, `service dak stop`, `kill`)
-   should shut down cleanly like Ctrl-C - clear the changed buttons, close the device -
-   instead of killing the process on the spot and leaving the last images on the
-   keypad; so should `SIGHUP` until reload exists.
+9. Signal-driven actions: run an action (or switch scenes) on `SIGUSR2`. The other
+   signals are taken: `SIGINT`/`SIGTERM` stop, `SIGHUP` reloads the config (resetting
+   scenes and variables) and `SIGUSR1` rescans for devices (`src/control.rs`). A
+   reload that *preserves* the current scene and variables (diffing old and new
+   config against live state) is a possible refinement.
 10. D-Bus integration to watch and/or submit events (probably not). Would expose
     button/encoder events on the session bus and/or let `dak` react to other
     applications' signals (e.g. show now-playing). Adds a dependency (`zbus`/`dbus`),

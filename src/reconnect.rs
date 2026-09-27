@@ -297,7 +297,7 @@ pub fn reconnected_message(device_number: u8, name: &str, serial: &str) -> Strin
 ///
 /// This is the "wait for the device to come back" loop: `attempt` receives the 1-based
 /// attempt number, rediscovers and reconnects, returning `None` while the device is
-/// still absent (or not yet ready to be opened); `cancel` is Ctrl-C, so the program can
+/// still absent (or not yet ready to be opened); `cancel` is the stop signal, so the program can
 /// still be stopped while it waits. `cancel` is also checked during an attempt, not
 /// only between attempts.
 pub async fn wait_until<T, A, Fut, C>(
@@ -693,13 +693,17 @@ mod tests {
             },
             rx,
         );
+        // Cancel once it has demonstrably polled more than once, rather than after a
+        // fixed delay that a loaded test machine might not give it enough time in.
         let cancel = async {
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            while attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
             let _ = tx.send(());
         };
         let (found, ()) = tokio::join!(waiter, cancel);
         assert_eq!(found, WaitOutcome::Cancelled);
-        // Timing-dependent count: it polled more than once, then stopped for good.
+        // It polled more than once, then stopped for good.
         let polled = attempts.load(Ordering::SeqCst);
         assert!(polled >= 2, "{polled}");
         tokio::time::sleep(Duration::from_millis(20)).await;

@@ -1,6 +1,6 @@
 [package]
 name = "dak"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"
@@ -28,6 +28,13 @@ assets = [
     { source = "man/dak.1", dest = "usr/share/man/man1/dak.1", mode = "644" },
     { source = "man/dak-config.5", dest = "usr/share/man/man5/dak-config.5", mode = "644" },
     { source = "debian/copyright", dest = "usr/share/doc/dak/copyright", mode = "644" },
+    # systemd user unit: `systemctl --user enable --now dak`.
+    { source = "debian/dak.service", dest = "usr/lib/systemd/user/dak.service", mode = "644" },
+    # Rescan-on-plug udev rule and XDG autostart entry, shipped as examples only
+    # (not active).
+    { source = "examples/service/99-dak-rescan.rules", dest = "usr/share/doc/dak/examples/99-dak-rescan.rules", mode = "644" },
+    { source = "examples/service/dak.desktop", dest = "usr/share/doc/dak/examples/dak.desktop", mode = "644" },
+    { source = "examples/service.json", dest = "usr/share/doc/dak/examples/service.json", mode = "644" },
 ]
 
 [dependencies]
@@ -37,6 +44,9 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "ti
 
 serde_json = { version = "1.0.150"}
 serde = { version = "1", features = ["derive"] }
+# fork/setsid, flock, kill, syslog and the other POSIX calls the daemon support
+# needs (Linux and FreeBSD alike); already in the dependency graph through tokio.
+libc = "0.2"
 ab_glyph = "0.2"
 # Direct access to font tables (the same version ab_glyph already uses, so no new
 # code): the startup scan of configured fonts and colour-table detection.

@@ -115,3 +115,109 @@ sudo usbconfig -d ugenX.Y reset   # replug the device, or reset it like this,
                                    # instead of /dev/uhidN
 ```
 (log out and back in too, so your shell picks up the new group membership).
+
+## Running as a service
+
+dak can run in the background, started with your session: through a systemd user
+unit, or (FreeBSD, Linux without systemd) through your desktop's autostart or X
+session script. Either way it locks each keypad it drives (see "One dak
+per keypad" in the README), so a second user's dak waits (`--wait`) instead of
+fighting over it.
+
+### Linux (systemd user unit)
+
+The `.deb` installs a user unit, `/usr/lib/systemd/user/dak.service`. It runs dak
+inside your graphical session (so actions see `DISPLAY`, `WAYLAND_DISPLAY` and the
+session D-Bus) and stops it when you log out:
+
+```
+systemctl --user enable --now dak      # start now and with every graphical login
+systemctl --user status dak            # shows e.g. "1 device connected"
+systemctl --user reload dak            # re-read ~/.config/dak/config.json (SIGHUP)
+systemctl --user kill -s USR1 dak      # look for keypads again (SIGUSR1)
+journalctl --user -u dak -p warning    # warnings and errors only
+```
+
+To pass other flags (e.g. `-c` or `-d device`), run `systemctl --user edit dak` and
+add:
+
+```
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dak --wait -c /path/to/config.json
+```
+
+A broken config makes dak exit with status 3, which the unit does not restart; fix
+it and `systemctl --user restart dak`. From a source build, copy
+`debian/dak.service` to `~/.config/systemd/user/` and adjust the `ExecStart` path.
+
+### Starting at login without systemd (FreeBSD, other Linux)
+
+FreeBSD has no per-user service manager: rc.d starts system services at boot,
+before anyone logs in, and dak must run inside your session (its actions need your
+`DISPLAY`/Wayland/D-Bus). Start it with the session instead, detached:
+
+- **Desktop autostart** (XFCE, KDE, MATE, LXQt, ... - anything following the XDG
+  autostart spec): copy the shipped example into your autostart folder.
+
+  ```
+  mkdir -p ~/.config/autostart
+  cp /usr/local/share/examples/dak/dak.desktop ~/.config/autostart/   # FreeBSD .pkg
+  cp /usr/share/doc/dak/examples/dak.desktop ~/.config/autostart/     # Debian/Ubuntu .deb
+  ```
+
+  In a checkout it is `examples/service/dak.desktop`. It runs `dak --detach --wait`
+  and is ignored by systemd-based sessions (`X-systemd-skip=true`), which should use
+  the user unit above instead. Do not copy it to `/etc/xdg/autostart`: it would start
+  dak for every user.
+
+- **`startx` / X session script**: add to `~/.xinitrc` (or `~/.xsession`) before the
+  window manager:
+
+  ```
+  dak --detach --wait
+  ```
+
+`--detach` returns once the keypad is connected (or a warning if none is attached
+yet), and `dak` logs to syslog (`/var/log/messages`) unless its config's `logging`
+section says otherwise.
+
+**Stopping it at logout.** A detached dak runs in its own session, so logging out
+does not stop it - it keeps the keypad, and the next user's `dak --wait` waits
+forever. Stop it from your logout path:
+
+```
+pkill -u "$USER" -x dak
+```
+
+for example in `~/.xinitrc` after the window manager exits (start the window
+manager without `exec`, then put the `pkill` line after it), in your display
+manager's session cleanup hook (LightDM `session-cleanup-script`, SDDM `Xstop`), or
+in `~/.logout` (csh/tcsh) / `~/.bash_logout`. dak cleans up (clears the buttons,
+releases the keypad) on the `SIGTERM` `pkill` sends.
+
+### Picking a keypad up again when it is plugged in
+
+A dak that gave up on an unplugged keypad (`device_reconnect_max_attempts`) or
+started without one keeps running as a service and waits for `SIGUSR1`. Example
+hooks send that signal automatically whenever a keypad appears; they are shipped but
+not active:
+
+- Linux: `/usr/share/doc/dak/examples/99-dak-rescan.rules` (in a checkout:
+  `examples/service/99-dak-rescan.rules`)
+
+  ```
+  sudo cp /usr/share/doc/dak/examples/99-dak-rescan.rules /etc/udev/rules.d/
+  sudo udevadm control --reload
+  ```
+
+- FreeBSD: `/usr/local/share/examples/dak/dak-rescan.conf` (in a checkout:
+  `examples/service/dak-rescan.conf`)
+
+  ```
+  sudo cp /usr/local/share/examples/dak/dak-rescan.conf /usr/local/etc/devd/
+  sudo service devd restart
+  ```
+
+Both signal every running dak (`pkill -USR1 -x dak`); one with nothing to look for
+ignores it.

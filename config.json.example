@@ -17,6 +17,9 @@
     // fonts - see the README's "Text markup" and "Fonts" sections.
     "markup": "tmux"
   },
+  // Where log lines go; without this section dak picks the console in a terminal,
+  // the journal under systemd and syslog when detached. See the README's "Logging".
+  // "logging": { "output": ["console", "file"], "level": "info" },
   "scenes": {
     "on_start": {
       "setup": {

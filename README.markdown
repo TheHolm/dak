@@ -13,7 +13,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.10.1**.
+The current version is **v0.14.0**.
 
 ## Usage
 
@@ -30,6 +30,13 @@ Options:
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
   -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action, fonts
+      --log-level <LEVEL> Log level: error, warning, info or debug
+      --log-file <PATH>   Also append log lines (timestamped) to PATH
+      --syslog            Also send log lines to syslog
+      --detach            Run in the background (returns once the keypads are connected)
+      --pid-file <PATH>   Write the process id to PATH (removed on exit)
+      --wait              Wait for keypads held by another dak to be released
+      --replace           Stop the dak holding a keypad (same user, or root) and take it over
       --map               Run the interactive device-mapping wizard instead of
                           normal operation (see Devices below) and exit
   -h, --help              Print usage help and exit
@@ -57,6 +64,10 @@ controlled with `-d` / `--debug` (repeatable, or comma-separated values added up
 | `fonts`   | only when `defaults.fonts` names a font: every font in lookup order (embedded ones marked as built in), each configured font's character counts, and the characters it cannot draw with the reason — listed as ranges like `U+1F1E6-1F1FF,1F3FB`, at most 20 lines per font |
 
 `-d` values are additive, e.g. `-d device -d scene` or `-d device,scene`.
+
+Where these lines go (console, systemd journal, syslog, a log file) and how detailed
+they are is set by the config's `logging` section, see [Logging](#logging);
+`--log-level`, `--log-file` and `--syslog` override it for one run.
 
 ### Config file search order
 
@@ -92,12 +103,13 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 `config.json` drives all runtime behavior. The **dak-config(5)** man page is
 the compact reference for this file format; the rest of this section is the
 same material with more explanation and full examples. The top level of the
-config is a dictionary with up to five keys:
+config is a dictionary with up to six keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
 - `"variables"` — optional declared variables that actions read and assign (see [Variables](#variables))
 - `"defaults"` — optional press-detection timing knobs, connect-time brightness levels, colours, text markup and fonts (see [Defaults](#defaults))
+- `"logging"` — optional log destinations and detail (see [Logging](#logging))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
@@ -537,7 +549,7 @@ At startup each definition is matched against the discovered hardware:
 - A definition whose serial is anything but `"unknown"` matches only the device reporting that exact serial, which tells identical devices apart.
 - A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
 
-Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with an error.
+Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with status 4 (see "Exit status" in `dak(1)`).
 
 A device that disappears while dak is running - the computer goes to sleep, the keypad is unplugged, or the USB bus resets - does not stop the program. dak prints `device #N disconnected (...); waiting for it to come back` and looks for the same device (matched the same way as at startup): right away, then every `device_reconnect_interval` seconds (default 15), for up to `device_reconnect_max_attempts` attempts (default 0 = forever). Both can be set in `defaults` or per device, inside the device's definition:
 
@@ -545,7 +557,7 @@ A device that disappears while dak is running - the computer goes to sleep, the 
 "1": { "device_id": "0300:3002", "serial": "unknown", "device_reconnect_interval": 5, "device_reconnect_max_attempts": 60, "...": "..." }
 ```
 
-When the attempts run out, dak prints `error: device #N did not come back after M attempts; giving up on it` and stops driving that device; other devices keep running, and once none is left dak exits with a non-zero status (so a service manager can restart it). Once the device is back, dak prints `device #N reconnected (...)`, reapplies the current brightness and repaints exactly what was on the buttons before: the current scene, buttons inherited from earlier scenes, and variables are all kept, refreshing buttons resume, and `text_exec`/`image_exec` programs run again. A key held down at the moment of the disconnect is treated as released. Ctrl-C still exits while waiting. Only the very first connection at startup failing is fatal for a device; other devices keep running either way.
+When the attempts run out, dak prints `error: device #N did not come back after M attempts; giving up on it; send SIGUSR1 to look for it again` and stops driving that device, releasing its lock; other devices keep running. `SIGUSR1` (`pkill -USR1 -x dak`, `systemctl --user kill -s USR1 dak`) starts a fresh round of attempts. Once no device is left, dak exits with status 4 when run from a terminal; as a service (`--detach`, or under systemd) it keeps running and waits for `SIGUSR1`. Once the device is back, dak prints `device #N reconnected (...)`, reapplies the current brightness and repaints exactly what was on the buttons before: the current scene, buttons inherited from earlier scenes, and variables are all kept, refreshing buttons resume, and `text_exec`/`image_exec` programs run again. A key held down at the moment of the disconnect is treated as released. Ctrl-C or `SIGTERM` still stops dak while waiting. Only the very first connection at startup failing is fatal for a device; other devices keep running either way.
 
 **FreeBSD:** reconnecting may be flaky there and needs more troubleshooting. It worked reliably when the keypad was reset from inside a FreeBSD 15.1 VM (`usbconfig power_off`/`power_on`, `usbconfig reset`), but after unplugging and re-plugging it through VM USB passthrough the keypad once stopped answering and the kernel could not re-enumerate it (`USB_ERR_TIMEOUT`), leaving dak waiting for a device that never came back. It has not been tried on bare-metal FreeBSD yet.
 
@@ -582,6 +594,100 @@ A complete config combining both sections looks like:
   }
 }
 ```
+
+### Logging
+
+The optional top-level `logging` section decides where log lines go and which are
+written. Without it dak does what is normal for how it was started, so most setups
+never need it:
+
+- **run from a terminal** — lines go to the console (info on stdout, warnings and
+  errors on stderr), as before;
+- **run by systemd** — lines go to the journal with their priority, so
+  `journalctl --user -u dak -p warning` shows only the problems. journald adds the
+  timestamps, unit name and pid itself, and forwards to syslog if the system is set
+  up that way;
+- **detached** from the terminal — lines go to syslog.
+
+```json
+"logging": {
+  "output": ["console", "file"],       // or "auto" (default), "journal", "syslog"
+  "file": "~/.local/state/dak/dak.log", // this is the default location
+  "syslog_facility": "user",            // or "daemon", "local0" ... "local7"
+  "level": "info",                      // "error", "warning", "info" or "debug"
+  "debug": ["device", "scene"],         // debug subsystems, like -d
+  "timestamps": "auto"                  // "auto" (file only), true or false
+}
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `output` | one or more of `console`, `journal` (stderr with `<N>` priority prefixes), `syslog`, `file`; or `auto` alone | `"auto"` |
+| `file` | log file for the `file` output; `~` is expanded, the directory is created | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
+| `syslog_facility` | syslog facility | `user` |
+| `level` | most detailed level written; errors are always written, `warning` also hides the banner and connect lines | `info` |
+| `debug` | debug subsystems (`device`, `scene`, `actions`, `fonts`); written only at level `debug` | none |
+| `timestamps` | `auto` stamps only file lines (journal and syslog stamp their own), `true` stamps console, journal and file lines | `auto` |
+
+The command line wins over the config: `--log-level` replaces `level`, `-d` adds
+subsystems and (unless `--log-level` is given) raises the level to `debug`, and
+`--log-file`/`--syslog` add their output next to the configured ones. A log file that
+cannot be opened stops dak at startup with exit status 3. Lines from before the config
+is read (banner, config location, config errors) always go to the console, or the
+journal under systemd.
+
+### Running in the background
+
+`dak --detach` runs dak as a classic daemon: it forks into the background, starts a new
+session, changes to `/` and points stdin/stdout/stderr at `/dev/null`. The config and
+the log outputs are checked first, so their errors still show in the terminal, and the
+command only returns once the daemon is up - with status 0 and e.g.
+`dak is running in the background: 1 device connected` - or with the daemon's own exit
+status and last error when it could not start (e.g. status 4 when no configured keypad
+is attached). Once detached, `auto` logging goes to syslog; set `logging` or pass
+`--log-file` for a file instead. `--pid-file PATH` records the process id (also without
+`--detach`) and removes the file on exit.
+
+Under systemd don't detach: the `.deb` ships a `Type=notify` user unit
+(`systemctl --user enable --now dak`); without systemd (FreeBSD) start it from your
+desktop's autostart with the shipped `dak.desktop` example, or from `~/.xinitrc`, and
+stop it at logout with `pkill -u "$USER" -x dak`. See "Running as a service" in
+[INSTALL.md](INSTALL.md), which also has udev/devd hooks that make dak pick a keypad up
+when it is plugged in. Run as a unit, dak tells systemd when it is ready (`READY=1`, with a `STATUS=` line) and when it is
+stopping. Commands started by actions and `text_exec`/`image_exec` always get
+`/dev/null` as stdin, so a program waiting for input can never hang on the terminal,
+and a failing `text_exec`/`image_exec` program's stderr is quoted in the error.
+
+### Signals
+
+| Signal | Effect |
+|---|---|
+| `SIGINT` (Ctrl-C), `SIGTERM` | stop cleanly: clear the changed buttons, shut the keypads down, exit 0; a second one exits at once |
+| `SIGHUP` | reload: reopen the log file, re-read the config; an invalid one is reported and the running one kept, a valid one replaces logging and restarts every keypad from `on_start` with fresh variables (locks of keypads still used are kept, new ones are picked up) |
+| `SIGUSR1` | rescan: keypads that gave up reconnecting try again, configured keypads that were missing or busy are looked for again; running ones are left alone |
+
+When no configured keypad is available, dak exits with status 4 from a terminal but
+keeps running (waiting for `SIGUSR1`) as a service, so a keypad plugged in later can be
+picked up without a restart loop.
+
+### One dak per keypad
+
+Only one `dak` drives a keypad at a time, whichever user started it: two would both
+paint the buttons and both react to every press. Before opening a keypad dak locks a
+file named after it (`/run/lock/dak-<vid>-<pid>-<serial>.lock`, or under `/tmp` where
+`/run/lock` does not exist, or `$DAK_LOCK_DIR`) and writes who holds it; the kernel
+releases the lock whenever that dak ends, even after a crash. When another dak has it:
+
+- by default the keypad is skipped with a warning such as
+  `device 0300:3002 s/n ABCD1234EF56 is in use by dak (user alice, pid 1234, since ...)`,
+  and if no configured keypad is left dak exits with status 5;
+- with `--wait` dak waits until it is released and then takes it - handy when switching
+  users: the next user's dak picks the keypad up as soon as the previous one stops;
+- with `--replace` dak sends the holder `SIGTERM`, waits up to 10 s for it to clean up,
+  and takes over. Only for your own instances, or anyone's as root.
+
+The lock is kept while a lost keypad is being waited for, so nobody takes it over in
+the meantime. `dak --map` locks the keypad too, and refuses one in use.
 
 ## Device install
 

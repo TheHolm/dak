@@ -92,6 +92,7 @@ steps:
       - >-
         mkdir -p dist stage-root/usr/local/bin stage-root/usr/local/share/doc/dak
         stage-root/usr/local/share/man/man1 stage-root/usr/local/share/man/man5
+        stage-root/usr/local/share/examples/dak
       - cp target/freebsd/x86_64-unknown-freebsd/release/dak stage-root/usr/local/bin/dak
       - chmod 555 stage-root/usr/local/bin/dak
       # copyright is the same combined licence file the .debs ship (debian/copyright):
@@ -105,6 +106,15 @@ steps:
       - cp man/dak.1 stage-root/usr/local/share/man/man1/dak.1
       - cp man/dak-config.5 stage-root/usr/local/share/man/man5/dak-config.5
       - chmod 644 stage-root/usr/local/share/man/man1/dak.1 stage-root/usr/local/share/man/man5/dak-config.5
+      # Examples only (not active): the XDG autostart entry, the rescan-on-plug devd
+      # rule and the service config.
+      - >-
+        cp examples/service/dak.desktop examples/service/dak-rescan.conf examples/service.json
+        stage-root/usr/local/share/examples/dak/
+      - >-
+        chmod 644 stage-root/usr/local/share/examples/dak/dak.desktop
+        stage-root/usr/local/share/examples/dak/dak-rescan.conf
+        stage-root/usr/local/share/examples/dak/service.json
       # Uses ${CI_COMMIT_TAG#v} directly rather than an intermediate VERSION=
       # shell variable - an earlier version of this step assigned VERSION
       # once at the top and referenced it here, many commands later, and it
@@ -118,12 +128,15 @@ steps:
         --version "${CI_COMMIT_TAG#v}"
         --stage-root stage-root
         --output "dist/dak-${CI_COMMIT_TAG#v}-freebsd-amd64.pkg"
-      # Fail the release if either man page or the licence file did not make it into
-      # the built .pkg, rather than shipping a package that silently dropped one.
+      # Fail the release if a man page, the licence file, the autostart or the devd
+      # example did not make it into the built .pkg, rather than shipping a package
+      # that silently dropped one.
       - >-
         zstd -dc dist/dak-*.pkg | tar -tf - | grep -qF 'usr/local/share/man/man1/dak.1'
         && zstd -dc dist/dak-*.pkg | tar -tf - | grep -qF 'usr/local/share/man/man5/dak-config.5'
         && zstd -dc dist/dak-*.pkg | tar -tf - | grep -qF 'usr/local/share/doc/dak/copyright'
+        && zstd -dc dist/dak-*.pkg | tar -tf - | grep -qF 'usr/local/share/examples/dak/dak.desktop'
+        && zstd -dc dist/dak-*.pkg | tar -tf - | grep -qF 'usr/local/share/examples/dak/dak-rescan.conf'
 
   - name: deb-ubuntu2604
     image: ubuntu:26.04
@@ -147,12 +160,15 @@ steps:
       # Ubuntu PPAs use for the same purpose (e.g. ~ubuntu20.04).
       - cargo deb --deb-revision "1~ubuntu2604"
       - cp target/deb-ubuntu2604/debian/*.deb dist/
-      # Fail the release if either man page did not make it into the built .deb
-      # (cargo-deb gzips them per Debian policy), rather than shipping a package
-      # that silently dropped one.
+      # Fail the release if a man page (cargo-deb gzips them per Debian policy), the
+      # systemd user unit or the udev/autostart examples did not make it into the .deb,
+      # rather than shipping a package that silently dropped one.
       - >-
         dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/share/man/man1/dak.1.gz'
         && dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/share/man/man5/dak-config.5.gz'
+        && dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/lib/systemd/user/dak.service'
+        && dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/share/doc/dak/examples/99-dak-rescan.rules'
+        && dpkg-deb -c target/deb-ubuntu2604/debian/*.deb | grep -qF 'usr/share/doc/dak/examples/dak.desktop'
       # Likewise fail it unless /usr/share/doc/dak/copyright carries the full text of
       # every licence (Debian Policy 12.5, followed by Ubuntu): none of them is in
       # /usr/share/common-licenses, so a copyright file that only names them is wrong.
@@ -181,6 +197,9 @@ steps:
       - >-
         dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/share/man/man1/dak.1.gz'
         && dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/share/man/man5/dak-config.5.gz'
+        && dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/lib/systemd/user/dak.service'
+        && dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/share/doc/dak/examples/99-dak-rescan.rules'
+        && dpkg-deb -c target/deb-trixie/debian/*.deb | grep -qF 'usr/share/doc/dak/examples/dak.desktop'
       - dpkg-deb --fsys-tarfile target/deb-trixie/debian/*.deb | tar -xO ./usr/share/doc/dak/copyright > /tmp/copyright
       - cmp /tmp/copyright debian/copyright
       - >-

@@ -1,0 +1,58 @@
+{
+  // A config for running dak as a service (the systemd user unit, the XDG autostart
+  // entry, or `dak --detach`). Only the `logging` section and the reconnect settings
+  // matter here; the scene is a minimal clock.
+  //
+  // - logging: "auto" writes to the journal under systemd and to syslog when detached.
+  //   The log file is added for users who prefer `tail -f`; it is reopened on
+  //   SIGHUP (`systemctl --user reload dak`), so logrotate can rotate it.
+  // - device_reconnect_max_attempts: after 40 attempts, 15 s apart (10 minutes), dak
+  //   gives up on a lost keypad and releases it; `systemctl --user kill -s USR1 dak`
+  //   (or the udev/devd hook in examples/service/) makes it look again.
+  "version": "1.0",
+  "logging": {
+    "output": ["journal", "file"],
+    "file": "~/.local/state/dak/dak.log",
+    "level": "info",
+    "syslog_facility": "user"
+  },
+  "defaults": {
+    "device_reconnect_interval": 15,
+    "device_reconnect_max_attempts": 40
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 30 }
+      },
+      "actions": {}
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

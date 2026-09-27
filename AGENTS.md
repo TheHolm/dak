@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.13.0 (declared as `0.13.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.14.0 (declared as `0.14.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -89,10 +89,52 @@ under other platforms.
   section 9. `render_lines` draws `markup::Line`s; `render_text`/`render_text_colored`/
   `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant.
   `tests/colour_fonts.rs` uses in-memory fonts from `tests/common/font_builder.rs`
-- `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
-  (`device`/`scene`/`action`/`fonts`) by `-d`/`--debug`; `fonts` prints the font
-  lookup order and undrawable-character ranges built by `FontSet::load`, and only
-  has anything to print when `defaults.fonts` names a font
+- `src/exit.rs` — the exit statuses (0 ok, 1 failure, 2 usage, 3 config, 4 no
+  device, 5 all devices busy); `EXIT_CODES` is checked against `dak(1)`'s EXIT STATUS
+  by `tests/man_pages.rs`, and `tests/exit_status.rs` runs the binary for them
+- `src/daemon.rs` — background service support: `detach` (pipe, fork, setsid,
+  fork, chdir `/`, stdio to `/dev/null`, pid file; `unsafe`, must run before the
+  tokio runtime exists) with a `Readiness` pipe over which the daemon sends one
+  `StartupReport` so `dak --detach` returns the daemon's real startup status and last
+  error (`log::last_error`); `write_pid_file`/`remove_pid_file`; `notify`/`notify_to`,
+  a hand-written `sd_notify` client (path or Linux `@abstract` `NOTIFY_SOCKET`). `serve`
+  in `main.rs` counts each device task's `StartSignal` (connected / waiting for a lock)
+  and reports READY once all have reported or ended. `tests/daemon.rs` runs the binary
+- `src/control.rs` — signal handling: one task (`spawn_signal_handler`) owns the
+  SIGINT/SIGTERM/SIGHUP/SIGUSR1 listeners for the program's whole life and records
+  requests in a `Controller` (quit flag; reload and rescan counters, so bursts
+  collapse; a second quit exits at once). `main.rs`'s `Supervisor` owns the device
+  tasks (a `JoinSet`), a `LockTable` of held device locks, and a per-generation
+  `StopSource`: SIGHUP validates the config, reinstalls logging, stops and restarts
+  every task (keeping locks still needed); SIGUSR1 starts tasks for missing devices,
+  while a task that gave up reconnecting parks (`park_until_rescan`: releases its lock,
+  waits for a rescan, relocks). Foreground exits 4 when idle; `--detach`/systemd
+  (`service_mode`) keep waiting. Device tasks get a level-triggered
+  `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
+  themselves, so a signal arriving mid-event is never lost. `main` is a plain
+  function that loads the config before building the tokio runtime by hand
+- `src/lock.rs` — one dak per keypad: an `flock(2)` lock file per device
+  (`DeviceKey::file_name`, `dak-<vid>-<pid>-<serial>.lock`) in `lock_dir()`
+  (`$DAK_LOCK_DIR`, else `/run/lock`, else `/tmp`), holding a `Holder` record (pid,
+  uid, user, since). `try_lock`/`acquire` with `Conflict::{Refuse, Wait, Replace}`
+  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s). Opened
+  `O_NOFOLLOW|O_NONBLOCK`, without `O_CREAT` first (protected_regular), created 0666
+  - see `NOTES.md` section 10. `main.rs` locks each device before connecting and keeps
+  the lock through reconnects; `--map` locks too. `tests/device_lock.rs` re-runs its
+  own test binary as a second lock-holding process for the `--replace` tests
+- `src/log.rs` — centralized, filterable output. `Log` (still `Copy`) filters by
+  `Level` (error/warning/info/debug; errors always pass) and, for debug lines, per
+  `Subsystem` (`device`/`scene`/`action`/`fonts`) from `-d`/`logging.debug`; `fonts`
+  prints the font lookup order and undrawable-character ranges built by
+  `FontSet::load`. Lines go to a process-wide `Sinks` (`install`ed once the config is
+  read; plain console before that and in tests): `console`, `journal` (stderr with
+  `<N>` priority prefixes), `syslog` (libc `syslog(3)`), `file` (appended, reopenable).
+  `check_logging` validates the top-level `logging` section into `LoggingConfig`;
+  `LogSettings::resolve` merges it with `CliLogging` (`--log-level`, `--log-file`,
+  `--syslog`, `-d`) and resolves `auto` from `Environment` (`JOURNAL_STREAM` matching
+  fd 2 -> journal, detached -> syslog, else console). `LOGGING_KEYS`, `LOG_OUTPUTS`,
+  `LOG_LEVELS`, `SYSLOG_FACILITIES`, `TIMESTAMP_VALUES` are vocabulary constants
+  `tests/man_pages.rs` checks against `dak-config.5`; `tests/logging.rs` runs the binary
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
 - `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
   key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,
@@ -108,6 +150,14 @@ under other platforms.
   and OFL-1.1 texts; the only licence file installed by both the `.deb`s (as a
   cargo-deb asset) and the FreeBSD `.pkg`. `tests/packaging.rs` keeps it in step with
   `LICENSE`/`fonts/*`. See `NOTES.md` section 8 for why (Debian/Ubuntu policy)
+- `debian/dak.service` — the systemd user unit (`Type=notify`, `--wait`, reload via
+  SIGHUP, `RestartPreventExitStatus=3`, `KillMode=process`, bound to
+  `graphical-session.target`), a cargo-deb asset;
+  `examples/service/` — `dak.desktop` (XDG autostart `dak --detach --wait` for
+  non-systemd desktops such as FreeBSD; there is deliberately no rc.d script, see
+  `NOTES.md` section 11) and udev/devd rescan-on-plug hooks, all shipped as inactive
+  examples in both packages; `examples/service.json` — the service example config. `tests/packaging.rs`
+  checks their key settings and that both packaging paths ship them
 - `config.json` — the user's own runtime config (gitignored, not checked in):
   scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `config.json.example` — checked-in template new users copy to `config.json`
@@ -127,8 +177,10 @@ under other platforms.
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
 - `INSTALL.md` — building from source (both platforms, plus a FreeBSD-specific
-  note about a stray cross-compile `.cargo/config.toml`) and one-time device/
-  permissions setup (Linux udev rules, FreeBSD hidraw setup)
+  note about a stray cross-compile `.cargo/config.toml`), one-time device/
+  permissions setup (Linux udev rules, FreeBSD hidraw setup), and running as a
+  service (systemd user unit, XDG autostart/xinitrc with a logout `pkill`, rescan
+  hooks)
 - `RELEASE_NOTES.md` — history of tagged releases; see the merge/release
   convention below
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
@@ -148,9 +200,10 @@ under other platforms.
 
 Work in progress. Current known issues:
 
-- `main.rs` config errors are printed, but the program still exits with `MirajazzError::BadData` regardless of the specific failure
-- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop) is
-  only unit-tested through its pieces (`SwappableDevice`, `wait_until`,
+- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop,
+  parking after giving up) and a SIGHUP reload restarting a live device session are
+  only tested through their pieces (`park_until_rescan`, `LockTable`, the
+  device-less reload/rescan runs in `tests/daemon.rs`) and (`SwappableDevice`, `wait_until`,
   `SceneRunner::redraw_all`, `current_brightness`); the end-to-end
   disconnect/rediscover/repaint sequence needs real hardware being unplugged
 - `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's

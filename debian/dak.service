@@ -1,0 +1,35 @@
+# systemd user unit for dak (Dynamic Ajazz Keyboard).
+#
+#   systemctl --user enable --now dak     start now and with every graphical login
+#   systemctl --user reload dak           re-read the configuration (SIGHUP)
+#   systemctl --user kill -s USR1 dak     look for keypads again (after unplugging)
+#   journalctl --user -u dak              the log (-p warning: only problems)
+#
+# A user unit, so actions run inside your session: they see DISPLAY,
+# WAYLAND_DISPLAY and the session D-Bus, and ~/.config/dak/config.json is found.
+# Override settings with `systemctl --user edit dak`, e.g. to pass -c or -d.
+[Unit]
+Description=DAK (Dynamic Ajazz Keyboard) keypad controller
+Documentation=man:dak(1) man:dak-config(5)
+# Tied to the graphical session: logging out stops dak and releases the keypad,
+# so the next user's dak (started with --wait) can pick it up.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+# dak reports READY=1 once its keypads are connected, RELOADING=1 on reload and
+# STOPPING=1 on stop. It does not fork: --detach is not wanted here.
+Type=notify
+# --wait: take a keypad held by another user's dak as soon as it is released.
+ExecStart=/usr/bin/dak --wait
+ExecReload=/bin/kill -HUP $MAINPID
+# Status 3 is a configuration error; restarting will not fix it.
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=3
+# Programs started by "launch" actions live in their own process groups and must
+# survive a stop or restart of dak itself.
+KillMode=process
+
+[Install]
+WantedBy=graphical-session.target

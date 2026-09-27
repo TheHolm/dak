@@ -70,5 +70,14 @@ helper tools it mentions.
   including a colour emoji font and a CJK font (`extra`).
   Needs only `date`.
 
+- [`service.json`](service.json) - a config for running dak as a service (systemd user
+  unit, XDG autostart or `--detach`): a `logging` section writing to the journal
+  plus a log file that SIGHUP reopens for rotation, and reconnect limits after which a
+  lost keypad is released until a rescan (`SIGUSR1`). The scene is just a clock. The
+  [`service/`](service/) folder has the plug-in hooks that send that rescan
+  automatically - a udev rule (`99-dak-rescan.rules`) and a devd rule
+  (`dak-rescan.conf`) - and an XDG autostart entry (`dak.desktop`) for starting dak
+  with a desktop that has no systemd, such as on FreeBSD. Needs only `date`.
+
 See the README's [Variables](../README.markdown#variables) and
 [Text markup](../README.markdown#text-markup) sections for the syntax these examples use.

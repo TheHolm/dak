@@ -38,6 +38,8 @@ FreeBSD/cross-compiling) and states its own environment inline.
 7. [Device disconnect/reconnect on FreeBSD](#7-device-disconnectreconnect-on-freebsd)
 8. [Package licence files (`debian/copyright`)](#8-package-licence-files-debiancopyright)
 9. [Font formats and the startup glyph scan](#9-font-formats-and-the-startup-glyph-scan)
+10. [Device lock files shared between users](#10-device-lock-files-shared-between-users)
+11. [Running as a service (systemd, autostart, hooks)](#11-running-as-a-service-systemd-autostart-hooks)
 
 ---
 
@@ -896,3 +898,68 @@ Gotchas found on the way:
 - Supporting COLR/SVG later: estimated ~1.3-1.8k lines hand-written (COLRv1
   painter on tiny-skia + resvg for SVG) or ~300 via usvg's own text rendering
   (which would also bring shaping: ZWJ sequences, flags, Arabic); +2-4 MB.
+
+---
+
+## 10. Device lock files shared between users
+
+`src/lock.rs` keeps one `flock(2)` lock file per keypad so two `dak`s (any users)
+never drive the same device. Things learned while building it:
+
+- Linux happily lets several processes open one `/dev/hidrawN`; FreeBSD's
+  `hidraw(4)` refuses the second open with `EBUSY` (an opaque `HidError::Other`).
+  The lock gives both platforms the same, explained behaviour.
+- The directory must be shared by all users: `/run/lock` (Debian/Ubuntu: tmpfs,
+  mode 1777) else `/tmp`; FreeBSD has no `/run/lock`, so `/tmp`. Both are sticky.
+- `fs.protected_regular` (on by default on Debian/Ubuntu, value 2 on some) makes an
+  `open(O_CREAT)` of *another user's existing* file in a sticky world-writable
+  directory fail with `EACCES`, even with mode 0666. So the file is opened without
+  `O_CREAT` first and only created (`O_CREAT|O_EXCL`) when missing.
+- Created files are `fchmod`ed to 0666 (the umask would leave 0644) so the next user
+  can rewrite the holder record. If a file is still not writable (another user's,
+  0644), it is opened read-only: `flock` works on read-only fds, only the record is
+  not updated.
+- `O_NOFOLLOW` stops a planted symlink, `O_NONBLOCK` stops a planted FIFO from hanging
+  the open, and a non-regular file is refused.
+- `flock` locks belong to the open file description: two opens in one process conflict
+  like two processes do (the tests rely on this), and a forked child that inherited
+  the fd would keep the lock alive - the file is opened `O_CLOEXEC` and locks are taken
+  after any detaching fork.
+  Also: while *any* thread forks a child, that child briefly holds a copy of every
+  fd until its exec closes the `O_CLOEXEC` ones, so a just-released lock can look
+  held for an instant. Harmless at runtime (`--wait` retries), but tests must poll.
+- `--replace` trusts the recorded pid only while the lock is held (a live holder wrote
+  it), and signals only its own uid unless root.
+- Not verified on FreeBSD hardware yet; the Linux runs here had the keypad enumerable
+  via sysfs but no `/dev/hidraw*` node, so the lock paths were tested up to the point
+  the device is opened.
+
+---
+
+## 11. Running as a service (systemd, autostart, hooks)
+
+- The systemd unit is a **user** unit (`debian/dak.service`, installed to
+  `usr/lib/systemd/user/`): actions need the user's session (DISPLAY, Wayland,
+  D-Bus) and config. `Type=notify`: `serve()` sends `READY=1` once every device task
+  reported (connected / waiting for a lock), `RELOADING=1` + `MONOTONIC_USEC` on
+  SIGHUP (required by systemd >= 253 for notify-reload semantics), `STOPPING=1`.
+  Without devices it still sends `READY=1` (status: send SIGUSR1) so the unit does
+  not time out; `service_mode` keeps it running instead of exiting 4.
+- `KillMode=process`: `launch` children (own process groups) survive `systemctl
+  stop`; the default `control-group` would kill them.
+- `RestartPreventExitStatus=3`: config errors do not restart-loop.
+- No rc.d script (one was written and dropped): rc.d starts system services at
+  boot, before any login, with one fixed user, and FreeBSD has no per-user login
+  hook for services - but dak must run in the user's session (DISPLAY, Wayland,
+  D-Bus). So FreeBSD (and non-systemd Linux) start it from the session: the XDG
+  autostart example `examples/service/dak.desktop` (`dak --detach --wait`,
+  `X-systemd-skip=true` so systemd sessions use the unit instead) or `~/.xinitrc`.
+  A detached dak has its own session and survives logout; INSTALL.md documents
+  `pkill -u "$USER" -x dak` in the logout path. Not verified on a FreeBSD desktop
+  yet.
+- udev/devd hooks just `pkill -USR1 -x dak`; a dak with nothing to look for only
+  logs a debug line. The udev rule matches `SUBSYSTEM=="hidraw"` with `ATTRS{}` (the
+  ids live on the USB parent), so it fires once the node exists. The devd rule
+  matches `attach` on vendor/product; `attach` fires before `hidraw` is ready on
+  some systems - if so, dak's rescan simply retries on its reconnect interval.
+- `--detach` is for autostart/xinitrc and hand starts; systemd must not use it.

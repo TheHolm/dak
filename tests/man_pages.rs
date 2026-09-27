@@ -18,6 +18,7 @@ use dak::actions::{
     CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
 };
 use dak::cli::Cli;
+use dak::log::{LOGGING_KEYS, LOG_LEVELS, LOG_OUTPUTS, SYSLOG_FACILITIES, TIMESTAMP_VALUES};
 use dak::markup::MARKUP_VALUES;
 use dak::text::FONT_KEYS;
 use dak::variables::{RESERVED_NAMES, VARIABLE_KEYS};
@@ -71,6 +72,43 @@ path. A command that contains an unquoted shell operator is run through the
 .BR sh (1)
 found on
 .BR PATH .
+.TP
+.B JOURNAL_STREAM
+Set by systemd when stderr goes to the journal. When it names the actual
+stderr, the
+.B auto
+log output writes journal lines (see
+.B LOGGING
+in
+.BR dak\-config (5)).
+.TP
+.B NOTIFY_SOCKET
+Set by systemd for a
+.B Type=notify
+service. When present,
+.B dak
+reports
+.B READY=1
+once its devices are connected (or waiting for another instance),
+.B STOPPING=1
+when it is told to stop, and a
+.B STATUS=
+line.
+.TP
+.B DAK_LOCK_DIR
+The directory device lock files are kept in, instead of
+.I /run/lock
+(or
+.I /tmp
+where that does not exist). Every
+.B dak
+that may compete for a keypad must use the same directory.
+.TP
+.BR XDG_STATE_HOME
+Where the default log file lives:
+.IR $XDG_STATE_HOME/dak/dak.log ,
+else
+.IR ~/.local/state/dak/dak.log .
 .SH FILES
 .TP
 .I ~/.config/dak/config.json
@@ -78,14 +116,142 @@ The preferred per\-user configuration location.
 .TP
 .I ./config.json
 Configuration in the current directory.
+.TP
+.I ~/.local/state/dak/dak.log
+The default log file, when the
+.B file
+log output is used.
+.TP
+.I PIDFILE
+The file named by
+.BR \-\-pid\-file ;
+holds the process id while
+.B dak
+runs and is removed on exit.
+.TP
+.I /usr/lib/systemd/user/dak.service
+The systemd user unit shipped by the Debian/Ubuntu package
+.RB ( "systemctl \-\-user enable \-\-now dak" ).
+.TP
+.I /usr/share/doc/dak/examples/dak.desktop
+.TQ
+.I /usr/local/share/examples/dak/dak.desktop
+An inactive XDG autostart entry
+.RB ( "dak \-\-detach \-\-wait" )
+for desktops without systemd, such as FreeBSD; copy it to
+.IR ~/.config/autostart/ .
+A detached
+.B dak
+does not end at logout; stop it from the logout path with
+.BR "pkill \-u $USER \-x dak" .
+.TP
+.I /usr/share/doc/dak/examples/99\-dak\-rescan.rules
+.TQ
+.I /usr/local/share/examples/dak/dak\-rescan.conf
+Inactive udev and devd rules that send
+.B SIGUSR1
+to every
+.B dak
+when a keypad is plugged in.
+.TP
+.I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
+One lock file per keypad (in
+.I /tmp
+where
+.I /run/lock
+does not exist), holding the process id, user and start time of the
+.B dak
+using it.
+.SH "RUNNING IN THE BACKGROUND"
+With
+.B \-\-detach
+.B dak
+forks into the background, starts a new session, changes to
+.I /
+and points its standard input, output and error at
+.IR /dev/null .
+The configuration and the log outputs are checked before forking, so their
+errors appear in the terminal; the command then waits until the daemon has
+connected its devices (or is waiting for a device held by another instance)
+and exits with status 0, or exits with the daemon's own status and last error
+when it failed to start. The
+.B auto
+log output goes to syslog once detached. Programs run by actions get
+.I /dev/null
+as standard input in every mode.
+.PP
+Under systemd do not use
+.BR \-\-detach :
+run
+.B dak
+in the foreground as a
+.B Type=notify
+service instead; it reports readiness through
+.BR NOTIFY_SOCKET .
+.SH SIGNALS
+.TP
+.BR SIGINT ", " SIGTERM
+Stop cleanly: clear the button images this session changed, shut every
+device down and exit with status 0. A second one while that cleanup is
+still running exits at once with status 1.
+.TP
+.B SIGHUP
+Reload: reopen the log file (for log rotation) and re\-read the
+configuration. When it is invalid the errors are logged and the running
+configuration is kept. When it is valid, logging is set up from it again and
+every device is restarted with it, from its
+.B on_start
+scene with the variables at their initial values; devices still in use keep
+their lock, and newly defined or plugged\-in ones are picked up.
+.TP
+.B SIGUSR1
+Rescan: devices that gave up reconnecting (see
+.B device_reconnect_max_attempts
+in
+.BR dak\-config (5))
+start a fresh round of attempts, and configured devices that were not found
+or were in use by another instance are looked for again. Running devices are
+left alone. A device that has given up releases its lock, so another
+instance may take it in the meantime.
+.PP
+When no configured device is attached (at startup, or once every device has
+given up),
+.B dak
+exits with status 4 when run from a terminal, but keeps running and waits for
+.B SIGUSR1
+when it runs as a service: with
+.BR \-\-detach ,
+or under systemd
+.RB ( NOTIFY_SOCKET
+set).
 .SH "EXIT STATUS"
 .TP
 .B 0
-Normal termination, including termination by Ctrl\-C.
+Normal termination, including termination by Ctrl\-C or
+.BR SIGTERM .
 .TP
-.B non\-zero
-No configured device was found, a device could not be connected, or the
-configuration could not be loaded.
+.B 1
+Unspecified failure, for example a device that could not be opened, or a
+repeated stop signal that ended the program before its cleanup finished.
+.TP
+.B 2
+Invalid command line.
+.TP
+.B 3
+Configuration error: the configuration file could not be read or failed
+validation. Restarting will not help until it is fixed.
+.TP
+.B 4
+No configured device found: no device defined in the configuration is
+attached, or every one was lost and given up on (in the foreground only; see
+.BR SIGNALS ).
+.TP
+.B 5
+Every configured device that was found is held by another running
+.B dak
+(or, with
+.BR \-\-map ,
+the chosen device is).
 .SH EXAMPLES
 .TP
 .B dak
@@ -98,13 +264,40 @@ Run with an explicit configuration path.
 .B dak \-d device,scene
 Print device and scene debug output.
 .TP
+.B dak \-\-log\-level warning \-\-log\-file /tmp/dak.log
+Write only warnings and errors, to the console and to a log file.
+.TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
-.SH NOTES
-Only one process may hold the device open at a time; stop any other instance
-of
+.TP
+.B dak \-\-detach \-\-pid\-file /tmp/dak.pid
+Run in the background, logging to syslog; returns once the devices are
+connected.
+.TP
+.B dak \-\-replace
+Take the keypad over from a
 .B dak
-(or other program using the keypad) before starting a new one.
+already running as the same user.
+.SH NOTES
+Only one
+.B dak
+drives a keypad at a time, whichever user runs it. Before opening a device,
+.B dak
+takes an exclusive lock on its lock file (see
+.BR FILES );
+the kernel drops the lock when the process ends, even if it crashes. When
+another instance holds it, the device is skipped with a message naming that
+instance's user and process id; with
+.B \-\-wait
+.B dak
+waits for it to be released, and with
+.B \-\-replace
+it asks the holder to stop and takes the device over. When every configured
+device is held elsewhere the program exits with status 5. The lock is kept
+while a lost device is being waited for, so no other instance takes it over
+meanwhile. The
+.B \-\-map
+wizard also takes the lock and refuses a device in use.
 .PP
 The device definition printed by
 .B \-\-map
@@ -148,7 +341,7 @@ fn render_dak_1() -> Vec<u8> {
     let man = clap_mangen::Man::new(Cli::command())
         .title("DAK")
         .section("1")
-        .date("2026-09-20")
+        .date("2026-09-27")
         .source(format!("dak {}", env!("CARGO_PKG_VERSION")))
         .manual("User Commands");
     let mut page = Vec::new();
@@ -384,7 +577,7 @@ fn dak_config_5_documents_the_config_vocabulary() {
     let text = canonical_text(
         &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
     );
-    let groups: [(&str, &[&str]); 10] = [
+    let groups: [(&str, &[&str]); 15] = [
         ("top-level key", TOP_LEVEL_KEYS),
         ("defaults key", DEFAULTS_KEYS),
         ("setup type", SETUP_KINDS),
@@ -395,6 +588,11 @@ fn dak_config_5_documents_the_config_vocabulary() {
         ("encoder event", ENCODER_EVENTS),
         ("variable key", VARIABLE_KEYS),
         ("reserved variable name", RESERVED_NAMES),
+        ("logging key", LOGGING_KEYS),
+        ("logging.output value", LOG_OUTPUTS),
+        ("logging.level value", LOG_LEVELS),
+        ("logging.syslog_facility value", SYSLOG_FACILITIES),
+        ("logging.timestamps value", TIMESTAMP_VALUES),
     ];
     for (label, names) in groups {
         for name in names {
@@ -403,6 +601,26 @@ fn dak_config_5_documents_the_config_vocabulary() {
                 "man/dak-config.5 does not document the {label} {name:?}"
             );
         }
+    }
+}
+
+/// The EXIT STATUS section of `dak(1)` lists every status the program can exit with,
+/// taken straight from `dak::exit::EXIT_CODES`, so a new status cannot go undocumented.
+#[test]
+fn dak_1_documents_every_exit_status() {
+    let page = std::fs::read_to_string(DAK_1.path).expect("man/dak.1 readable");
+    let section = page
+        .split(".SH \"EXIT STATUS\"")
+        .nth(1)
+        .expect("man/dak.1 has an EXIT STATUS section")
+        .split("\n.SH ")
+        .next()
+        .unwrap();
+    for (code, meaning) in dak::exit::EXIT_CODES {
+        assert!(
+            section.contains(&format!(".B {code}\n")),
+            "man/dak.1 EXIT STATUS does not document status {code} ({meaning})"
+        );
     }
 }
 

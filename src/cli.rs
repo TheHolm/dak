@@ -23,8 +23,9 @@ bindings distinguish short presses, long presses and double clicks, encoders bin
 per rotation notch, and each scene may run a timer. See dak-config(5) for the configuration \
 file format.\n\n\
 dak is a command-line-only tool: a config file plus a binary, with no GUI. It runs until it \
-is interrupted (Ctrl-C) or the device disconnects, then restores the button images it changed \
-and shuts the device down."
+is told to stop (Ctrl-C or SIGTERM), then restores the button images it changed and shuts the \
+devices down. SIGHUP reloads the configuration and SIGUSR1 looks for missing keypads again. Run \
+from a terminal it also ends once no configured keypad is left; as a service it waits for one."
 )]
 pub struct Cli {
     /// Path to the config file.
@@ -50,6 +51,78 @@ given repeatedly, and several comma-separated subsystems may be given at once; t
 forms are additive"
     )]
     pub debug: Vec<String>,
+
+    /// The most detailed log level written; replaces `logging.level`.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["error", "warning", "info", "debug"],
+        help = "Log level: error, warning, info or debug",
+        long_help = "The most detailed level of log lines written: error, warning, info or \
+debug. Replaces logging.level from the configuration. Errors are always written; debug lines \
+also need their subsystem enabled with -d or logging.debug"
+    )]
+    pub log_level: Option<String>,
+
+    /// Also append log lines to this file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Also append log lines to PATH",
+        long_help = "Also append log lines, each with a timestamp, to PATH (created with its \
+directory when missing), in addition to the configured outputs; replaces logging.file. The file \
+is reopened on SIGHUP, for log rotation"
+    )]
+    pub log_file: Option<PathBuf>,
+
+    /// Also send log lines to syslog.
+    #[arg(
+        long,
+        help = "Also send log lines to syslog",
+        long_help = "Also send log lines to syslog(3), in addition to the configured outputs, \
+with the facility from logging.syslog_facility (default user)"
+    )]
+    pub syslog: bool,
+
+    /// Wait for devices held by another dak instead of skipping them.
+    #[arg(
+        long,
+        conflicts_with = "replace",
+        help = "Wait for devices held by another dak to be released",
+        long_help = "When another dak (of any user) holds a configured device, wait until it releases it and then take it, instead of skipping it. Useful when switching between users: the next user's dak picks the keypad up as soon as the previous one stops"
+    )]
+    pub wait: bool,
+
+    /// Stop the dak holding a device and take it over.
+    #[arg(
+        long,
+        help = "Stop the dak holding a device and take it over",
+        long_help = "When another dak holds a configured device, send it SIGTERM, wait up to 10 seconds for it to clean up and release the device, then take it. Only allowed for your own instances, or for any as root"
+    )]
+    pub replace: bool,
+
+    /// Detach from the terminal and run in the background.
+    #[arg(
+        long,
+        conflicts_with = "map",
+        help = "Detach from the terminal and run in the background",
+        long_help = "Detach from the terminal and run in the background as a daemon: fork, start \
+a new session, change to /, and point stdin, stdout and stderr at /dev/null. The configuration \
+is checked first, and the command only returns once the daemon has connected its devices (exit \
+status 0) or failed to start (its exit status and last error). Log lines go to syslog unless \
+the logging section or --log-file says otherwise. Not needed under systemd"
+    )]
+    pub detach: bool,
+
+    /// Write the process id to this file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the process id to PATH",
+        long_help = "Write the process id (of the daemon, with --detach) to PATH, and remove the \
+file again on exit"
+    )]
+    pub pid_file: Option<PathBuf>,
 
     /// Run the interactive device-mapping wizard instead of normal operation.
     #[arg(
