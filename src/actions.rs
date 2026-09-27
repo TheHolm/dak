@@ -9,7 +9,9 @@ use crate::baseplane::{Kind, Reference};
 use crate::color::Color;
 use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
+use crate::markup::Markup;
 use crate::press::Defaults;
+use crate::text::{FontPaths, FontReport, FontSet, FONT_KEYS};
 use crate::variables::{
     check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
     VarRef, VarType, VarValue, Variables,
@@ -43,6 +45,13 @@ pub struct LoadedConfig {
     pub variables: BTreeMap<String, VarDef>,
     /// Non-fatal warnings collected while validating the config.
     pub warnings: Vec<String>,
+    /// The fonts button text is drawn with: `defaults.fonts` loaded in front of the
+    /// embedded ones (just the embedded ones when the config names none).
+    pub fonts: Arc<FontSet>,
+    /// The `-d fonts` listing from loading `defaults.fonts`: every font in lookup order
+    /// and each configured font's undrawable characters (empty without configured
+    /// fonts); the one-line summaries are in `warnings`.
+    pub font_details: Vec<String>,
 }
 
 /// The config `version` assumed when the top-level `version` key is absent.
@@ -63,6 +72,19 @@ pub const DEFAULTS_KEYS: &[&str] = &[
     "text_color",
     "device_reconnect_interval",
     "device_reconnect_max_attempts",
+    "markup",
+    "fonts",
+];
+
+/// The fields a numbered `setup` entry may carry; anything else is rejected. Also part of
+/// the vocabulary `tests/man_pages.rs` requires `dak-config.5` to document.
+pub const SETUP_ENTRY_FIELDS: &[&str] = &[
+    "type",
+    "params",
+    "refresh",
+    "background",
+    "text_color",
+    "markup",
 ];
 
 /// The reconnect keys a device definition may carry to override the `defaults` values
@@ -368,6 +390,13 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     // value; only existence/type matter here, not the (runtime) values themselves.
     let runtime_variables = Variables::new(variables.clone(), &defaults);
     check_scenes(&runtime_variables, scenes, &mut warnings, &mut errors);
+    let (fonts, font_details) = if defaults.fonts == FontPaths::default() {
+        (FontSet::embedded(), Vec::new())
+    } else {
+        let (fonts, report) = load_fonts(&defaults.fonts, &runtime_variables, &mut errors);
+        warnings.extend(report.warnings);
+        (Arc::new(fonts), report.details)
+    };
 
     if !errors.is_empty() {
         return Err(errors);
@@ -379,6 +408,8 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         defaults,
         variables,
         warnings,
+        fonts,
+        font_details,
     })
 }
 
@@ -481,10 +512,83 @@ fn check_defaults(defaults: &Value, errors: &mut Vec<String>) -> Defaults {
                     result.device_reconnect_max_attempts = number;
                 }
             }
+            "markup" => match value.as_str().map(Markup::parse) {
+                Some(Ok(markup)) => result.markup = markup,
+                Some(Err(error)) => errors.push(format!("defaults.markup: {error}")),
+                None => errors.push(format!(
+                    "defaults.markup must be \"none\" or \"tmux\", got {}",
+                    value_type(value)
+                )),
+            },
+            "fonts" => result.fonts = check_font_paths(value, errors),
             _ => unreachable!("unknown keys are rejected above"),
         }
     }
     result
+}
+
+/// Validates the shape of `defaults.fonts`: an object whose keys are [`FONT_KEYS`] and
+/// whose values are non-empty path strings. The paths are returned as written; they are
+/// expanded and the files loaded by [`load_fonts`] once the variables are known.
+fn check_font_paths(value: &Value, errors: &mut Vec<String>) -> FontPaths {
+    let mut paths = FontPaths::default();
+    let Some(map) = value.as_object() else {
+        errors.push(format!(
+            "defaults.fonts must be an object of font file paths, got {}",
+            value_type(value)
+        ));
+        return paths;
+    };
+    for (key, path) in map {
+        let Some(slot) = paths.slot_mut(key) else {
+            errors.push(format!(
+                "defaults.fonts: unknown key \"{key}\", expected one of {}",
+                quoted_list(FONT_KEYS)
+            ));
+            continue;
+        };
+        match path.as_str().map(str::trim) {
+            Some(path) if !path.is_empty() => *slot = Some(path.to_string()),
+            _ => errors.push(format!(
+                "defaults.fonts.{key} must be a font file path, got {}",
+                value_type(path)
+            )),
+        }
+    }
+    paths
+}
+
+/// Expands the `defaults.fonts` paths (`$` references from the variables' initial
+/// values, then a leading `~`) and loads the files in front of the embedded fonts.
+/// Every unreadable or invalid font is a config error: the program must not start with
+/// text silently drawn in a font the config did not ask for. The scan's findings (see
+/// [`FontReport`]) are returned alongside.
+fn load_fonts(
+    paths: &FontPaths,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+) -> (FontSet, FontReport) {
+    let mut expanded = paths.clone();
+    let mut ok = true;
+    for key in FONT_KEYS {
+        let slot = expanded.slot_mut(key).expect("FONT_KEYS are slots");
+        if let Some(path) = slot.as_deref() {
+            match variables.expand(path) {
+                Ok(path) => *slot = Some(expand_tilde(&path)),
+                Err(error) => {
+                    errors.push(format!("defaults.fonts.{key}: {error}"));
+                    ok = false;
+                }
+            }
+        }
+    }
+    if !ok {
+        return ((*FontSet::embedded()).clone(), FontReport::default());
+    }
+    FontSet::load(&expanded).unwrap_or_else(|font_errors| {
+        errors.extend(font_errors);
+        ((*FontSet::embedded()).clone(), FontReport::default())
+    })
 }
 
 /// Validates the `scenes` section: an object whose keys are scene names.
@@ -703,14 +807,10 @@ fn check_button_op(
         }
     };
     for field in object.keys() {
-        if field != "type"
-            && field != "params"
-            && field != "refresh"
-            && field != "background"
-            && field != "text_color"
-        {
+        if !SETUP_ENTRY_FIELDS.contains(&field.as_str()) {
             errors.push(format!(
-                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected \"type\", \"params\", \"refresh\", \"background\" and \"text_color\""
+                "scene \"{scene_name}\": {location} has unknown field \"{field}\", expected {}",
+                quoted_list(SETUP_ENTRY_FIELDS)
             ));
         }
     }
@@ -815,6 +915,7 @@ fn check_button_op(
         object,
         errors,
     );
+    let markup = check_markup_field(scene_name, &location, kind, object, errors);
 
     match kind {
         "image" | "text" => {
@@ -831,6 +932,15 @@ fn check_button_op(
                 errors.push(format!(
                     "scene \"{scene_name}\": {location} text_value params must be text"
                 ));
+            } else if !dynamic_params {
+                // Literal text is known now, so a malformed markup tag is reported at
+                // load time (it would still be drawn literally, hence only a warning).
+                let markup = markup.unwrap_or(variables.loaded_defaults().markup);
+                for warning in crate::markup::parse(params, markup).warnings {
+                    warnings.push(format!(
+                        "scene \"{scene_name}\": {location} params: {warning}"
+                    ));
+                }
             }
         }
         "image_exec" | "text_exec" | "launch" => {
@@ -864,6 +974,43 @@ fn check_button_op(
                 "scene \"{scene_name}\": {location} unsupported type \"{other}\", expected {}",
                 SETUP_KINDS.join(", ")
             ));
+        }
+    }
+}
+
+/// Validates the optional `markup` field of a numbered setup entry and returns its value.
+///
+/// Only the text types draw text, so the field is rejected on any other type. The value
+/// must be one of [`crate::markup::MARKUP_VALUES`], written literally (it picks how the
+/// text is parsed, so it is not subject to `$` expansion).
+fn check_markup_field(
+    scene_name: &str,
+    location: &str,
+    kind: &str,
+    object: &serde_json::Map<String, Value>,
+    errors: &mut Vec<String>,
+) -> Option<Markup> {
+    let value = object.get("markup")?;
+    if !matches!(kind, "text" | "text_value" | "text_exec") {
+        errors.push(format!(
+            "scene \"{scene_name}\": {location} markup cannot be used with type \"{kind}\""
+        ));
+        return None;
+    }
+    match value.as_str().map(Markup::parse) {
+        Some(Ok(markup)) => Some(markup),
+        Some(Err(error)) => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {location} markup: {error}"
+            ));
+            None
+        }
+        None => {
+            errors.push(format!(
+                "scene \"{scene_name}\": {location} markup must be \"none\" or \"tmux\", got {}",
+                value_type(value)
+            ));
+            None
         }
     }
 }
@@ -1574,13 +1721,16 @@ pub enum SceneOp {
     /// Show the first lines of `path` as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-applies this operation on its own, independent of
     /// any scene switch. `background`/`text_color` are the button's configured colours
-    /// (expanded config text, parsed at draw time), or `None` for the global defaults.
+    /// (expanded config text, parsed at draw time), or `None` for the global defaults;
+    /// `markup` likewise is the entry's own markup syntax, or `None` for
+    /// `defaults.markup`.
     Text {
         reference: Reference,
         path: String,
         refresh_seconds: u64,
         background: Option<String>,
         text_color: Option<String>,
+        markup: Option<Markup>,
     },
     /// Render `text` directly on a button. Unlike [`SceneOp::Text`] the value is the text
     /// itself (already expanded from any `$` references), not a file path, so a variable
@@ -1588,24 +1738,28 @@ pub enum SceneOp {
     /// (1-based). `refresh_seconds` (0 = never) re-applies this operation on its own,
     /// independent of any scene switch - and, like every refreshed entry, re-expands its
     /// `text` from the current variable values each time. `background`/`text_color` are
-    /// the button's configured colours, or `None` for the global defaults.
+    /// the button's configured colours, or `None` for the global defaults, and `markup`
+    /// the entry's markup syntax, or `None` for `defaults.markup`.
     TextValue {
         reference: Reference,
         text: String,
         refresh_seconds: u64,
         background: Option<String>,
         text_color: Option<String>,
+        markup: Option<Markup>,
     },
     /// Run `command` and show its stdout as text on a button. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
     /// scene switch. `background`/`text_color` are the button's configured colours, or
-    /// `None` for the global defaults.
+    /// `None` for the global defaults, and `markup` the entry's markup syntax, or `None`
+    /// for `defaults.markup`.
     TextExec {
         reference: Reference,
         command: CommandSpec,
         refresh_seconds: u64,
         background: Option<String>,
         text_color: Option<String>,
+        markup: Option<Markup>,
     },
     /// Run `command` and set its stdout (an image file) as the button image. References are physical buttons (1-based).
     /// `refresh_seconds` (0 = never) re-runs the command on its own, independent of any
@@ -1651,6 +1805,8 @@ pub struct RawSceneOp {
     pub background: Option<String>,
     /// The entry's raw `text_color` colour text, if any.
     pub text_color: Option<String>,
+    /// The entry's `markup`, if any (validated at load time, so trusted here).
+    pub markup: Option<Markup>,
 }
 
 /// Parses a scene's `setup` into raw entries without expanding or parsing anything.
@@ -1706,6 +1862,10 @@ pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawS
             .get("text_color")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let markup = object
+            .get("markup")
+            .and_then(Value::as_str)
+            .and_then(|value| Markup::parse(value).ok());
 
         operations.push(RawSceneOp {
             scene: scene_name.to_string(),
@@ -1715,6 +1875,7 @@ pub fn raw_scene_operations(scene_name: &str, scenes: &Value) -> Result<Vec<RawS
             refresh_seconds,
             background,
             text_color,
+            markup,
         });
     }
 
@@ -1758,6 +1919,7 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
             refresh_seconds: raw.refresh_seconds,
             background,
             text_color,
+            markup: raw.markup,
         },
         "text_value" => SceneOp::TextValue {
             reference,
@@ -1765,6 +1927,7 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
             refresh_seconds: raw.refresh_seconds,
             background,
             text_color,
+            markup: raw.markup,
         },
         "text_exec" => SceneOp::TextExec {
             reference,
@@ -1772,6 +1935,7 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
             refresh_seconds: raw.refresh_seconds,
             background,
             text_color,
+            markup: raw.markup,
         },
         "image_exec" => SceneOp::ImageExec {
             reference,
@@ -2101,6 +2265,10 @@ pub struct SceneRunner<'a, D: ButtonDevice> {
     /// The shared variable/default state, when attached (see
     /// [`SceneRunner::set_variables`]); `setup` params are expanded against it.
     variables: Option<Arc<Mutex<Variables>>>,
+    /// Markup syntax for text entries without their own `markup` (`defaults.markup`).
+    markup: Markup,
+    /// The fonts text is drawn with (`defaults.fonts` plus the embedded ones).
+    fonts: Arc<FontSet>,
 }
 
 impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
@@ -2139,7 +2307,17 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             refresh_sources: std::collections::HashMap::new(),
             refresh_tx,
             variables: None,
+            markup: Markup::default(),
+            fonts: FontSet::embedded(),
         }
+    }
+
+    /// Sets the default markup syntax and the fonts button text is drawn with, from the
+    /// config's `defaults.markup` and loaded `defaults.fonts`. Until called, a runner
+    /// uses tmux markup and the embedded fonts.
+    pub fn set_text_settings(&mut self, markup: Markup, fonts: Arc<FontSet>) {
+        self.markup = markup;
+        self.fonts = fonts;
     }
 
     /// Sets the global background colour, e.g. from a `$defaults.background := ...`
@@ -2221,6 +2399,41 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             _ => None,
         };
         self.draw_colour(key, "text_color", text, &self.text_color)
+    }
+
+    /// The markup override of `key`'s active `text_exec` entry, if any. See
+    /// [`SceneRunner::active_background`].
+    fn active_markup(&self, key: u8) -> Option<Markup> {
+        match self.active_setup.get(&key) {
+            Some(SceneOp::TextExec { markup, .. }) => *markup,
+            _ => None,
+        }
+    }
+
+    /// Renders `text` for button `key`: parsed with `markup` (the entry's override) or
+    /// the default markup, drawn with the runner's fonts. A malformed markup tag is drawn
+    /// as written and reported as a warning.
+    fn render_button_text(
+        &self,
+        key: u8,
+        text: &str,
+        markup: Option<Markup>,
+        background: &Color,
+        text_color: &Color,
+    ) -> Result<DynamicImage, String> {
+        let parsed = crate::markup::parse(text, markup.unwrap_or(self.markup));
+        for warning in &parsed.warnings {
+            self.log
+                .warn(format!("button {key}: {warning}; shown as written"));
+        }
+        crate::text::render_lines(
+            &parsed.lines,
+            background,
+            text_color,
+            &self.fonts,
+            self.image_format,
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Applies the numbered button operations of `scene_name` to the device.
@@ -2457,6 +2670,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 path,
                 background,
                 text_color,
+                markup,
                 ..
             } => {
                 self.log.debug(
@@ -2473,13 +2687,13 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                     .map_err(|error| error.to_string());
                 match text_result {
                     Ok(content) => {
-                        let render_result = crate::text::render_text_colored(
-                            &crate::text::button_text(&content),
+                        let render_result = self.render_button_text(
+                            key,
+                            &content,
+                            *markup,
                             &background,
                             &text_color,
-                            self.image_format,
-                        )
-                        .map_err(|error| error.to_string());
+                        );
                         match render_result {
                             Ok(image) => {
                                 if let Err(error) = self
@@ -2526,6 +2740,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 text,
                 background,
                 text_color,
+                markup,
                 ..
             } => {
                 self.log.debug(
@@ -2537,13 +2752,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 let text_color =
                     self.draw_colour(key, "text_color", text_color.as_deref(), &self.text_color);
                 // See the `SetImage` branch above: errors are stringified immediately.
-                let render_result = crate::text::render_text_colored(
-                    &crate::text::button_text(text),
-                    &background,
-                    &text_color,
-                    self.image_format,
-                )
-                .map_err(|error| error.to_string());
+                let render_result =
+                    self.render_button_text(key, text, *markup, &background, &text_color);
                 match render_result {
                     Ok(image) => {
                         if let Err(error) = self
@@ -2693,6 +2903,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                 // was recorded there before its task reported back).
                 let background = self.active_background(key);
                 let text_color = self.active_text_color(key);
+                let markup = self.active_markup(key);
                 let image = match kind {
                     ExecOutputKind::Text => {
                         let text = match String::from_utf8(stdout) {
@@ -2708,12 +2919,8 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                                 return;
                             }
                         };
-                        match crate::text::render_text_colored(
-                            &crate::text::button_text(&text),
-                            &background,
-                            &text_color,
-                            self.image_format,
-                        ) {
+                        match self.render_button_text(key, &text, markup, &background, &text_color)
+                        {
                             Ok(image) => image,
                             Err(error) => {
                                 self.log.error(format!(
@@ -3372,8 +3579,8 @@ enum TargetClass {
 /// `devices.*`/`scenes.*` (and the whole `version`/`scenes`/`devices`/`defaults` keys)
 /// are read-only wholesale rather than field-by-field, since their shapes are
 /// config-author-chosen. `defaults.*` has an exact, fixed field list: the two brightness
-/// keys and the two colour keys are writable, the two timing keys and the two reconnect
-/// keys are read-only, and anything else under `defaults` does not exist. Everything else is a variable reference
+/// keys and the two colour keys are writable, the two timing keys, the two reconnect
+/// keys, `markup` and `fonts` (loaded once at startup) are read-only, and anything else under `defaults` does not exist. Everything else is a variable reference
 /// (`$name` or `$var.name`), declared or not.
 fn classify_target(path: &str, variables: &Variables) -> TargetClass {
     match path {
@@ -3384,7 +3591,10 @@ fn classify_target(path: &str, variables: &Variables) -> TargetClass {
         "defaults.short_press_duration"
         | "defaults.double_click_gap"
         | "defaults.device_reconnect_interval"
-        | "defaults.device_reconnect_max_attempts" => TargetClass::ReadOnly(path.to_string()),
+        | "defaults.device_reconnect_max_attempts"
+        | "defaults.markup"
+        | "defaults.fonts" => TargetClass::ReadOnly(path.to_string()),
+        _ if path.starts_with("defaults.fonts.") => TargetClass::ReadOnly(path.to_string()),
         "version" | "scenes" | "devices" | "defaults" => TargetClass::ReadOnly(path.to_string()),
         _ if path.starts_with("devices.") || path.starts_with("scenes.") => {
             TargetClass::ReadOnly(path.to_string())
@@ -4556,6 +4766,7 @@ mod tests {
             refresh_seconds: 0,
             background: None,
             text_color: None,
+            markup: None,
         };
         let text_value = super::SceneOp::TextValue {
             reference: super::Reference::button(3, 5),
@@ -4563,6 +4774,7 @@ mod tests {
             refresh_seconds: 0,
             background: None,
             text_color: None,
+            markup: None,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(9, 8),
@@ -4573,6 +4785,7 @@ mod tests {
             refresh_seconds: 0,
             background: None,
             text_color: None,
+            markup: None,
         };
         let image_exec = super::SceneOp::ImageExec {
             reference: super::Reference::button(1, 9),
@@ -4643,6 +4856,7 @@ mod tests {
             refresh_seconds: 7,
             background: None,
             text_color: None,
+            markup: None,
         };
         let text_value = super::SceneOp::TextValue {
             reference: super::Reference::button(1, 7),
@@ -4650,6 +4864,7 @@ mod tests {
             refresh_seconds: 9,
             background: None,
             text_color: None,
+            markup: None,
         };
         let text_exec = super::SceneOp::TextExec {
             reference: super::Reference::button(1, 3),
@@ -4660,6 +4875,7 @@ mod tests {
             refresh_seconds: 11,
             background: None,
             text_color: None,
+            markup: None,
         };
         let image_exec = super::SceneOp::ImageExec {
             reference: super::Reference::button(1, 4),
@@ -5765,6 +5981,7 @@ mod tests {
                 refresh_seconds: 2,
                 background: None,
                 text_color: None,
+                markup: None,
             }]
         );
     }
@@ -5789,6 +6006,7 @@ mod tests {
                     refresh_seconds: 0,
                     background: None,
                     text_color: None,
+                    markup: None,
                 },
                 super::SceneOp::TextValue {
                     reference: crate::baseplane::Reference::button(1, 2),
@@ -5796,6 +6014,7 @@ mod tests {
                     refresh_seconds: 0,
                     background: None,
                     text_color: None,
+                    markup: None,
                 },
             ]
         );

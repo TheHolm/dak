@@ -5,6 +5,162 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.13.0 — Styled button text, emoji and custom fonts
+
+### User-facing changes
+- Button text (`text`, `text_value`, `text_exec`) now understands tmux-style
+  markup: `#[bold]`, `#[italics]`, `#[fg=red]`, `#[bg=blue]` (highlight),
+  `#[align=left|centre|right]`, `#[default]` and friends, with `##` for a
+  literal `#`. Styles carry over to the next lines until changed. A tag dak
+  cannot parse is shown as written and logged as a warning (for a literal
+  `text_value`, already when the config loads).
+- New, non-tmux `#[u=1F600]` inserts any Unicode character by its code
+  point; `#[u=1F44D,1F3FD]` and `#[u=1F44D,u=1F3FD]` insert several.
+- Emoji and other symbols are drawn with an embedded monochrome Noto Emoji
+  font (in the text colour) instead of a box. A line holds 6 columns; emoji
+  and other wide characters take two, and characters are no longer cut in
+  half. Skin tones, joined emoji and flags show only their first part.
+- Real bold, italic and bold-italic faces of DejaVu Sans Mono are embedded,
+  all the same width, so mixed styles stay monospace.
+- New `markup` setting, `"tmux"` (default) or `"none"`, in `defaults` and per
+  text button. **Behaviour change:** text that happens to contain `#[` or `##`
+  now renders differently; set `"markup": "none"` to keep the old output.
+- New `defaults.fonts` lets you draw text with your own font files
+  (`regular`, `bold`, `italic`, `bold_italic`, `emoji`, `extra`; `~`, `$variables` and
+  `.ttc#N` faces supported, up to 256 MiB). Characters a font lacks fall back
+  to the embedded fonts. A missing or broken font file stops dak from
+  starting. Fonts are loaded once; `$defaults.markup` is readable,
+  `markup`/`fonts` are not assignable.
+- Colour bitmap emoji fonts (CBDT/sbix, e.g. Debian/Ubuntu's
+  `fonts-noto-color-emoji`) are drawn in full colour. COLR and SVG colour
+  fonts cannot be drawn: one with no plain outlines at all stops dak from
+  starting, one that also has outlines is drawn in monochrome with a warning.
+- Configured fonts are checked at startup; if some characters cannot be
+  drawn you get one warning with the count and the embedded font they fall
+  back to.
+- New debug mode `-d fonts` (only active when `defaults.fonts` names a
+  font): lists every font in lookup order, embedded ones included, with
+  each configured font's character counts and its undrawable characters as
+  ranges (`U+1F1E6-1F1FF,1F3FB`) grouped by reason - COLR layers, SVG
+  picture, unsupported bitmap, probably unsupported sbix image, empty glyph
+  - at most 20 lines per font.
+- Chinese/Japanese/Korean work through a new `defaults.fonts.extra` font
+  (e.g. Noto Sans CJK), tried after the emoji fonts; Latin stays in DejaVu
+  and CJK characters take two of the six columns, sized to fill them.
+  Bold/italic text now falls back to your configured `regular` font before
+  giving up, so a CJK `regular` font no longer shows boxes in bold.
+- Not supported yet: right-to-left scripts (Hebrew, Arabic), emoji
+  sequences (skin tones, joined emoji, flags) and COLR/SVG colour fonts.
+  Formatting tags past the visible 6x3 area still take effect.
+- The `.deb` packages now ship a complete `/usr/share/doc/dak/copyright`
+  with the full AGPL text (before, it only named the licence) plus the
+  embedded fonts' licences; the FreeBSD package installs the same file.
+- The release binary is about 3.7 MB larger (the embedded fonts, plus PNG decoding for colour emoji).
+
+### Details
+- New `src/markup.rs`: `Markup::{None, Tmux}` (`MARKUP_VALUES`), `Align`,
+  `Style { bold, italic, fg, bg }`, `Span`, `Line { spans, align }`, and
+  `parse(text, markup) -> Parsed { lines, warnings }`. Tag bodies split on
+  commas and whitespace; each tag is fully validated into `Op`s before any is
+  applied, so a bad attribute leaves the whole tag literal. `u=` starts a
+  code-point list continued by bare hex tokens (hex-only attribute names do
+  not exist, so this is unambiguous); a bare hex token without a preceding
+  `u=`, surrogates and values above U+10FFFF are errors. An unterminated
+  `#[` is literal to the end of its line.
+- `src/text.rs` rewritten around `render_lines(&[Line], background,
+  text_color, &FontSet, ImageFormat)`. `FontSet` holds per-style lookup
+  chains and an emoji chain of `FontArc`s; `FontSet::embedded()` is parsed
+  once (`OnceLock`), where the old code parsed the font on every render.
+  Glyph lookup skips glyphs with id 0 or without an outline (colour-only
+  emoji glyphs). Emoji-chain glyphs are fitted into their cells (never
+  enlarged) and vertically centred on the line; text-face glyphs advance by
+  their own width, so proportional configured fonts keep their spacing. The
+  scale now comes from the widest laid-out line instead of
+  `char_count * advance('M')`. Line cutting uses grapheme clusters and
+  `unicode-width` (new dependencies `unicode-segmentation`,
+  `unicode-width`); U+FE0E/FE0F/200D are dropped. `bg` highlights fill the
+  line box behind their clusters, and glyphs now blend over the actual
+  pixel rather than the canvas colour. `render_text`/`render_text_colored`/
+  `render_error_image`/`button_text` keep their signatures.
+- Colour bitmaps and the scan: `drawable_glyph` also accepts glyphs whose
+  largest raster image is PNG or premultiplied BGRA; `decode_bitmap` decodes
+  them (BGRA un-premultiplied by hand) into a per-`FontSet` cache keyed by
+  font data address and glyph id, and `render_lines` fits the picture into
+  its cells and the line height, keeping its aspect, then alpha-blends it.
+  `resolve` returns a `Resolved { font, id, fitted, bitmap }`. New
+  `scan_font` (direct `ttf-parser` 0.25 dependency, the version ab_glyph
+  already used) walks all Unicode cmap subtables and classifies each mapped
+  character (outline / bitmap / undrawable), skipping `is_blank_by_design`
+  characters, and notes COLR/SVG tables. `load_font_file` now returns
+  `(FontArc, FontScan)` and refuses fonts with nothing drawable;
+  `FONT_KEYS`/`FontPaths` gain `extra`; `FontSet` gains `regular` (tried for
+  bold/italic after the style chain) and `extra` (after the emoji chain,
+  fitted into cells like emoji); the extra slot's gap warning says the
+  characters are shown as a missing-glyph box; fitted glyphs are sized by
+  the font's em box (OS/2 typographic metrics when they span exactly one em,
+  as CJK fonts' do, else centred in the line box) to `FITTED_EM_FILL` = 93%
+  of the line height, capped by their cells' width, and centred on the line
+  by that em box - measured with Noto Sans CJK: 日本語 lights 44-48 of 60
+  pixel columns (31-36 before), with 3 blank rows between three stacked
+  lines (1 at 100%, which looked cramped on the keypad);
+  `FontSet::load` returns `(FontSet, FontReport { warnings, details })`;
+  `LoadedConfig::font_details` carries the code-point lists, printed by
+  `main.rs` as `fonts` debug output (new `Subsystem::Fonts`, `-d fonts`/
+  `font`). `FontScan` records outlines and, per undrawable character, an
+  `Undrawable` reason (`classify_undrawable`: COLR via `is_color_glyph`, SVG
+  via `glyph_svg_image`, other raster formats, an `sbix` table without a
+  readable image, else empty); `format_ranges` merges code points into
+  Cisco-VLAN-style ranges, wraps at 100 columns with labelled `(cont.)`
+  lines and caps them at `FONT_DEBUG_MAX_LINES` = 20 per font plus one
+  "… N more ranges (M characters) not shown" line. `MAX_FONT_FILE_BYTES` is 256 MiB (was
+  32). Scan timings on real fonts are in `NOTES.md` section 9.
+- Fonts added under `fonts/` unmodified: `DejaVuSansMono-{Bold,Oblique,
+  BoldOblique}.ttf` (2.37, same release as the existing regular face) and
+  `NotoEmoji-VariableFont_wght.ttf` (google/fonts `ofl/notoemoji`, upstream
+  googlefonts/emoji-bw v3.000, ab_glyph uses its default instance), plus
+  `fonts/OFL.txt`.
+- Config: `DEFAULTS_KEYS` gains `markup`/`fonts`; new `SETUP_ENTRY_FIELDS`
+  constant replaces the hard-coded field list (the unknown-field message now
+  lists all six). `check_markup_field` allows `markup` on text types only.
+  `check_font_paths` validates the `defaults.fonts` shape; `load_fonts`
+  expands `$` (initial variable values) and `~` then calls `FontSet::load`,
+  whose per-slot errors (missing, not a regular file, >32 MiB, not a font,
+  no such collection face) become config errors. `LoadedConfig` gains
+  `fonts: Arc<FontSet>` (the shared embedded set when none is configured).
+  `Defaults` gains `markup` and `fonts: FontPaths`. `RawSceneOp` and the
+  three text `SceneOp`s carry `markup: Option<Markup>`.
+- `SceneRunner::set_text_settings(markup, fonts)` (called from `run_device`)
+  and a shared `render_button_text` used by the `text`, `text_value` and
+  `text_exec` paths; `active_markup` mirrors `active_background` for exec
+  results. `classify_target` marks `defaults.markup`, `defaults.fonts` and
+  `defaults.fonts.*` read-only; `Variables::read` serves `$defaults.markup`.
+- Packaging: new hand-written DEP-5 `debian/copyright` (full AGPL-3.0-or-later,
+  Bitstream-Vera, Arev and OFL-1.1 texts; none is in
+  `/usr/share/common-licenses` on trixie or Ubuntu 26.04), installed via an
+  explicit cargo-deb asset, which stops cargo-deb generating its name-only
+  file. `[package.metadata.deb] section = "utils"`. Both `.deb` CI jobs now
+  compare the packaged copyright with the repository file, check all four
+  `License:` paragraphs, and run `lintian --info` report-only (locally the
+  only finding is `no-changelog`). The FreeBSD job stages the file as
+  `share/doc/dak/copyright` and asserts it is in the `.pkg`;
+  `scripts/build-freebsd-pkg.py` takes a repeatable `--license` defaulting to
+  `AGPL3 AREV BITSTREAM OFL11` with `licenselogic: multi`. See `NOTES.md`
+  section 8.
+- Tests: parser (`src/markup.rs`), rendering (bold is heavier, italic is
+  slanted, the four faces share one advance, fg/bg colours, alignment,
+  emoji drawn, width cutting), new `tests/text_markup.rs` (config
+  validation, font loading/errors, `~`/`$` expansion, read-only targets),
+  new `SceneRunner` tests for markup in all three text types and custom
+  fonts, new `tests/colour_fonts.rs` with in-memory test fonts from
+  `tests/common/font_builder.rs` (CBDT drawn in own colours/aspect/over
+  highlights, COLR-only/SVG-only/empty fonts refused, COLR+outline and
+  partly-drawable warnings, 256 MiB limit), new `tests/cjk_fonts.rs`
+  (`extra` draws CJK in two columns, emoji fonts win over it, bold/italic
+  fall back to the configured regular font), `embedded_fonts_scan_clean`, new `tests/packaging.rs` (copyright matches the licence files,
+  covers every font, is installed by both packaging paths), and
+  `tests/man_pages.rs` now also checks `SETUP_ENTRY_FIELDS`, `MARKUP_VALUES`
+  and `FONT_KEYS` are documented. New `examples/styled-text.json`.
+
 ## v0.12.0 — Survive sleep, unplug and USB resets
 
 ### User-facing changes

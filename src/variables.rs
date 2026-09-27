@@ -684,6 +684,7 @@ impl Variables {
                 }
                 "background" => Ok(self.background.text().to_string()),
                 "text_color" => Ok(self.text_color.text().to_string()),
+                "markup" => Ok(self.defaults.markup.as_str().to_string()),
                 _ => Err(format!("undefined variable \"{reference}\"")),
             },
         }
@@ -700,7 +701,7 @@ impl Variables {
                 | "double_click_gap"
                 | "device_reconnect_interval"
                 | "device_reconnect_max_attempts" => Some(VarType::Int),
-                "background" | "text_color" => Some(VarType::Str),
+                "background" | "text_color" | "markup" => Some(VarType::Str),
                 _ => None,
             },
         }

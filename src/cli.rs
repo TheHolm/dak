@@ -43,8 +43,9 @@ pub struct Cli {
         long,
         value_delimiter = ',',
         num_args = 1..,
-        help = "Debug subsystems to enable: device, scene, action",
-        long_help = "Debug subsystems to enable: device, scene, action. The option may be \
+        help = "Debug subsystems to enable: device, scene, action, fonts",
+        long_help = "Debug subsystems to enable: device, scene, action, fonts (the fonts in use and the \
+characters configured fonts cannot draw; silent without defaults.fonts). The option may be \
 given repeatedly, and several comma-separated subsystems may be given at once; the two \
 forms are additive"
     )]

@@ -36,6 +36,8 @@ FreeBSD/cross-compiling) and states its own environment inline.
 5. [CI TODO / open questions](#5-ci-todo--open-questions)
 6. [Animated button images: real-hardware findings](#6-animated-button-images-real-hardware-findings)
 7. [Device disconnect/reconnect on FreeBSD](#7-device-disconnectreconnect-on-freebsd)
+8. [Package licence files (`debian/copyright`)](#8-package-licence-files-debiancopyright)
+9. [Font formats and the startup glyph scan](#9-font-formats-and-the-startup-glyph-scan)
 
 ---
 
@@ -785,3 +787,112 @@ USB passthrough, or FreeBSD's xhci. One suspect: the device was passed through
 on a USB3 port (`usb3=1`) although it is a USB 2.0 high-speed device; retry
 with USB3 off, and on bare metal, before blaming dak.
 
+---
+
+## 8. Package licence files (`debian/copyright`)
+
+Since v0.13.0 the binary embeds fonts with their own licences (DejaVu Sans
+Mono: Bitstream Vera + Arev terms; monochrome Noto Emoji: OFL-1.1), so every
+package must carry more than the AGPL. Findings and decisions:
+
+- **Debian Policy 12.5** (Ubuntu adopts Debian Policy wholesale, no
+  Ubuntu-specific rule for this): exactly one uncompressed, non-symlink
+  `/usr/share/doc/<pkg>/copyright` with the full text of every licence,
+  except those in `/usr/share/common-licenses`, which are referenced instead.
+  No separate `LICENSE`/`OFL.txt` files in the package - that is the
+  "20 copies of the same licence" complaint on debian-devel.
+- **common-licenses** is identical on trixie (base-files 13.8) and Ubuntu
+  24.04/26.04: Apache-2.0, Artistic, BSD, CC0-1.0, GFDL*, GPL*, LGPL*,
+  MPL-1.1/2.0. AGPL, OFL-1.1 and Bitstream Vera are **not** there (OFL was
+  requested in Debian bug #884228, 2017, never added), so all are quoted in
+  full.
+- **cargo-deb (3.8)**: without an asset at `usr/share/doc/<pkg>/copyright`
+  it generates one from Cargo.toml metadata. With only `license = "..."` set
+  that file just *names* the licence (a 200-byte file, no text) - the state
+  of every .deb up to v0.12.0. `license-file` would copy a file, but an
+  explicit asset is simpler: when one targets that path cargo-deb logs "Not
+  generating a default copyright" and ships ours verbatim.
+- **`debian/copyright`** (DEP-5) is the single source for both the .debs
+  and the FreeBSD .pkg (`/usr/local/share/doc/dak/copyright`).
+  `tests/packaging.rs` checks it quotes `LICENSE`, `fonts/OFL.txt` and the
+  Bitstream/Arev sections of `fonts/LICENSE.txt` verbatim and lists every
+  `fonts/*.ttf`; if a licence file changes, regenerate the matching
+  paragraph (each body line indented one space, blank lines as ` .`).
+- **FreeBSD manifest** licence names follow the ports tree:
+  `x11-fonts/dejavu` uses `AREV BITSTREAM` (plus `AMS` for the math font we
+  do not embed), `x11-fonts/noto-emoji` uses `OFL11`; with several licences
+  `licenselogic` is `multi` (= all apply, ports' `LICENSE_COMB=multi`).
+  `pkg` treats these as free-form strings; not yet verified with
+  `pkg info -l`/`pkg install` on a real FreeBSD host.
+- **lintian** on the built .deb (run report-only in CI): the only remaining
+  finding is `E: no-changelog usr/share/doc/dak/changelog.Debian.gz` -
+  we ship no Debian changelog. Setting `section = "utils"` in
+  `[package.metadata.deb]` fixed the `recommended-field Section` warning.
+
+---
+
+## 9. Font formats and the startup glyph scan
+
+`src/text.rs` draws with `ab_glyph`, which rasterises outlines only; colour
+bitmaps (CBDT/sbix, PNG or premultiplied BGRA) are decoded with the `image`
+crate and blended as pictures. COLR (v0/v1) and SVG-in-OpenType are **not**
+drawn. `scan_font` (ttf-parser 0.25, already in the tree via ab_glyph) checks
+every mapped character of each configured font at startup.
+
+**Real fonts** (measured 2026-09, release build, on a throwaway Debian 13 VM with
+2 vCPU "QEMU Virtual CPU 2.5+", files in page cache; a Ryzen 5 5600 host was
+~1.5x faster):
+
+| Font | Size | Tables | Chars | Drawable | Scan |
+|---|---|---|---|---|---|
+| DejaVu Sans Mono 2.37 | 0.3 MiB | glyf | 3306 | all but U+FFF9-FFFC* | 3.5 ms |
+| Noto Emoji mono 3.000 | 1.9 MiB | glyf | 1441 | all | 7.3 ms |
+| Noto Color Emoji (Debian `fonts-noto-color-emoji` 2.051) | 10.7 MiB | CBDT | 1455 | all (PNG) | 0.3 ms |
+| Noto Color Emoji (Google Fonts download) | 23.1 MiB | glyf+COLR+SVG | 1448 | none | 0.4 ms |
+| Twemoji Mozilla 0.7.0 | 1.4 MiB | glyf+COLR | 1401 | none | 0.4 ms |
+| Twitter Color Emoji SVGinOT 15.1 | 14.6 MiB | glyf+SVG | 1413 | all (outlines) | 12.8 ms |
+| Noto Sans CJK Regular `.ttc#0` | 18.6 MiB | CFF | 44805 | all but 4 Hangul fillers* | ~130 ms |
+| Noto Sans CJK Super OTC `#0` | 111.8 MiB | CFF | 44805 | same | ~140 ms (+44 ms read) |
+
+\* blank by design; `is_blank_by_design` skips them, so the real run reports
+nothing. DejaVu Sans Mono **Oblique** 2.37 genuinely has an empty U+1D3D (unit
+test `embedded_fonts_scan_clean` allows exactly that).
+
+Gotchas found on the way:
+
+- The "Noto Color Emoji" on fonts.google.com is the COLRv1 build; distro
+  packages ship the CBDT build. GitHub `raw/main` URLs for the noto-emoji fonts
+  404 (the files are LFS/release assets) - `apt-get download
+  fonts-noto-color-emoji` is the easy way to get the CBDT one.
+- COLR fonts have a `glyf` table, but the cmap-mapped base glyphs are empty;
+  the layer glyphs carry the outlines. So "has glyf" does not mean drawable -
+  hence scanning glyphs rather than checking tables.
+- ttf-parser's `glyph_raster_image(id, u16::MAX)` picks the largest strike
+  (109 ppem for Noto Color Emoji); sbix JPEG/TIFF/PDF images return `None`.
+- Tests build fonts in memory (`tests/common/font_builder.rs`): minimal
+  head/hhea/maxp/hmtx/cmap(format 12)/glyf/loca, optional CBDT+CBLC (index
+  format 1, image format 17), empty COLR+CPAL / SVG. `loca` needs numGlyphs+1
+  entries - one short and ttf-parser silently finds no outlines at all.
+- `-d fonts` classifies undrawable glyphs with ttf-parser: `is_color_glyph`
+  (COLR base record), `glyph_svg_image` (SVG document), a raster image in a
+  format we do not decode (mono/grey), an `sbix` table without a readable
+  image (ttf-parser returns `None` for JPEG/TIFF/PDF - so only "probably"),
+  else empty. Counts in the listing differ slightly from the scan-bench
+  numbers above because `is_blank_by_design` skips a few more characters.
+- CJK coverage (checked against the real fonts): DejaVu Sans Mono has **no**
+  CJK ideographs, kana, Hangul syllables (0/11172), half-width katakana,
+  full-width ASCII or CJK punctuation - Noto Sans CJK has all. Noto Sans CJK
+  and the emoji fonts share only 39 characters outside DejaVu, all squared
+  emoji (U+1F170.., U+1F201..); the emoji fonts have no CJK text. Hence the
+  lookup puts `extra` after the emoji fonts. Loading Noto Color Emoji +
+  Noto Sans CJK `#0` (read + scan + parse) takes ~100 ms on the dev host.
+- CJK sizing: Noto Sans CJK's em is only 0.69 of its line box (DejaVu 0.86,
+  Noto Emoji 0.85), so fitting by line box left ideographs at 67% of their
+  two columns. Fitted glyphs are now sized by em box to 93% of the line
+  height (`FITTED_EM_FILL`); 100% left 1 px between stacked lines on the
+  60x60 LCD and looked cramped. Noto Emoji's OS/2 typo metrics copy its line
+  box, not its em, so they are only trusted when they span exactly one em -
+  otherwise a lone emoji moved 4 px down.
+- Supporting COLR/SVG later: estimated ~1.3-1.8k lines hand-written (COLRv1
+  painter on tiny-skia + resvg for SVG) or ~300 via usvg's own text rendering
+  (which would also bring shaping: ZWJ sequences, flags, Arabic); +2-4 MB.

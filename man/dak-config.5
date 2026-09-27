@@ -1,5 +1,5 @@
 .\" Man page for the dak configuration file. See man(7) and groff_man(7).
-.TH DAK-CONFIG 5 "2026-09-20" "dak 0.12.0" "File Formats"
+.TH DAK-CONFIG 5 "2026-09-26" "dak 0.13.0" "File Formats"
 .SH NAME
 dak\-config \- configuration file format for
 .BR dak (1)
@@ -35,8 +35,8 @@ Declared, typed values that actions and setup parameters read and assign. See
 below.
 .TP
 .B defaults
-Press\-detection timing knobs, connect\-time brightness levels, and the button
-background and text colours. See
+Press\-detection timing knobs, connect\-time brightness levels, the button
+background and text colours, the text markup syntax and the fonts. See
 .B DEFAULTS
 below.
 .TP
@@ -59,8 +59,9 @@ below.
 The optional
 .B defaults
 object tunes press detection, the brightness applied when a device
-connects, and the colours used to draw button images and text. Every key is
-optional and falls back to its built\-in value.
+connects, the colours used to draw button images and text, how button text is
+marked up and which fonts draw it. Every key is optional and falls back to its
+built\-in value.
 .nf
 .RS 4
 "defaults": {
@@ -71,7 +72,9 @@ optional and falls back to its built\-in value.
   "background": "#000000",
   "text_color": "#ffffff",
   "device_reconnect_interval": 15,
-  "device_reconnect_max_attempts": 0
+  "device_reconnect_max_attempts": 0,
+  "markup": "tmux",
+  "fonts": { "regular": "~/.fonts/Iosevka\-Regular.ttf" }
 }
 .RE
 .fi
@@ -141,6 +144,23 @@ below.
 How many reconnect attempts to make before giving up on a device (default
 .BR 0 ,
 meaning unlimited).
+.TP
+.B markup
+How button text is parsed:
+.B tmux
+(default) understands the
+.B #[...]
+tags described under
+.BR "TEXT MARKUP" ;
+.B none
+shows text exactly as written. A setup entry's own
+.B markup
+key overrides it.
+.TP
+.B fonts
+An object naming font files to draw button text with, instead of the embedded
+fonts; see
+.BR FONTS .
 .PP
 Both reconnect keys may also appear in a single device definition, where they
 override the
@@ -195,6 +215,211 @@ A per\-button override belongs to the button, not the scene: like the rest of a
 button's content it is kept until a later scene explicitly redefines that
 button. Changing a colour at runtime affects the next draw (a scene switch, a
 refresh tick or a new image); buttons already drawn are not repainted.
+.SH "TEXT MARKUP"
+With
+.B markup
+set to
+.B tmux
+(the default), the text of a
+.BR text ,
+.B text_value
+or
+.B text_exec
+entry may contain tmux status\-line style tags. A tag
+.B #[attr,attr ...]
+changes how the text after it is drawn; attributes are separated by commas
+and/or spaces:
+.TP
+.BR bold ", " nobold
+Bold on or off.
+.TP
+.BR italics ", " italic ", " noitalics ", " noitalic
+Italic on or off.
+.TP
+.B none
+Bold and italic off.
+.TP
+.B default
+Everything back to the defaults: plain, the button's colours, centred.
+.TP
+.BI fg= colour
+Text colour (see
+.BR COLOURS ),
+or
+.B fg=default
+for the button's
+.BR text_color .
+.TP
+.BI bg= colour
+Highlight painted behind the characters, or
+.B bg=default
+for none. The button's own background is still
+.BR background .
+.TP
+.BR align=left ", " align=centre ", " align=center ", " align=right
+Placement of the line. Alignment applies to a whole line; the last
+.B align
+in effect at the end of a line decides it.
+.TP
+.BI u= hex
+A
+.B dak
+extension (not tmux): inserts the Unicode character with that code point, 1 to
+6 hex digits. Bare hex tokens right after it insert more characters, so
+.B #[u=1F44D,1F3FD]
+equals
+.BR #[u=1F44D,u=1F3FD] .
+.PP
+.B ##
+is a literal
+.BR # ;
+any other
+.B #
+not starting a tag is shown as\-is. Styles and alignment carry over to the
+following lines until changed. A tag that does not parse (unknown attribute,
+bad colour or code point, no closing
+.B ]
+on the same line) is shown literally and logged as a warning; in a literal
+.B text_value
+it is also reported when the config loads. For example:
+.nf
+.RS 4
+"params": "#[align=left,bold]CPU\en#[fg=red]$cpu%"
+.RE
+.fi
+.PP
+Markup is interpreted after
+.B $
+references are expanded, so
+.B #[fg=$alert]
+works. In a
+.B text_exec
+command that runs through
+.B sh \-c
+(one containing
+.BR | ,
+.BR ; ,
+.B >
+and similar), an unquoted
+.B #
+starts a shell comment: write
+.B "echo '#[bold]hi' | cat"
+rather than
+.BR "echo #[bold]hi | cat" .
+.PP
+A line shows at most 6 columns: ordinary characters take one, wide
+characters such as emoji and CJK ideographs take two, and a character is never
+split. There is no text shaping: variation selectors and zero\-width joiners
+are dropped, and an emoji made of several code points (skin tone, joined
+sequence, flag) shows only its first one.
+.PP
+Tags are applied even where their text is not shown: lines are cut to 6
+columns and the button to 3 lines only after the whole text is parsed, so a
+style set in the hidden part still carries over to later lines, and the last
+.B align
+of a line decides its alignment even past the cut.
+.PP
+Right\-to\-left scripts are not supported: characters are drawn left to right in
+stored order, so Hebrew appears mirrored and Arabic letters unjoined. Print the
+text already reordered and reshaped (for example with
+.B python\-bidi
+and
+.BR arabic\-reshaper )
+as a workaround.
+.SH FONTS
+Button text is drawn with fonts embedded in
+.BR dak :
+DejaVu Sans Mono in regular, bold, oblique and bold oblique, which all share one
+character width, plus the monochrome Noto Emoji for characters DejaVu lacks.
+.B defaults.fonts
+may name other TrueType/OpenType files, each optional:
+.nf
+.RS 4
+"fonts": {
+  "regular": "/usr/share/fonts/truetype/iosevka/Iosevka\-Regular.ttf",
+  "bold": "...", "italic": "...", "bold_italic": "...",
+  "emoji": "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+  "extra": "/usr/share/fonts/opentype/noto/NotoSansCJK\-Regular.ttc#0"
+}
+.RE
+.fi
+.TP
+.BR regular ", " bold ", " italic ", " bold_italic
+The font for text in that style.
+.TP
+.B emoji
+The fallback for characters none of the text fonts have (emoji, symbols).
+.TP
+.B extra
+A last\-resort font tried after the emoji fonts, typically for
+Chinese/Japanese/Korean.
+.PP
+Paths expand a leading
+.B ~
+and
+.B $
+references (with the variables' initial values). A path ending in
+.BI # N
+picks face
+.I N
+(from 0) of a
+.B .ttc
+font collection. Files are loaded once at startup; a missing, unreadable,
+larger than 256 MiB or invalid font file is a config error, and fonts cannot be
+changed at runtime.
+.PP
+Each character is looked up in the configured font of its style, then the
+embedded font of that style, then (for bold/italic text) the configured
+.B regular
+font, then the configured
+.B emoji
+font, then the embedded Noto Emoji, then the configured
+.B extra
+font; if none has it, a box is drawn. A character both an emoji font and
+.B extra
+have is thus drawn as an emoji. Characters from the emoji fonts and
+.B extra
+are fitted into their columns. A
+proportional font works, but lines of wide letters are then drawn smaller to
+fit.
+.PP
+The embedded fonts have no CJK characters (ideographs, kana, Hangul, half\-width
+and full\-width forms); name a CJK font as
+.B extra
+(Latin stays in DejaVu; CJK in the font's one weight, so
+.B #[bold]
+does not embolden it unless
+.B bold
+also names a CJK Bold font) or as
+.B regular
+(all text in that font). In
+.B NotoSansCJK\-Regular.ttc
+the face selects the region:
+.B #0
+Japanese,
+.B #1
+Korean,
+.B #2
+Simplified Chinese,
+.B #3
+Traditional Chinese,
+.B #4
+Hong Kong.
+.PP
+A glyph is drawable when the font has an outline or a colour bitmap (CBDT or
+sbix, PNG or BGRA). Bitmap emoji are drawn as pictures in their own colours;
+.B fg=
+does not affect them. COLR and SVG colour glyphs cannot be drawn. Every
+configured font is scanned at startup: a font with no drawable character (a
+COLR\- or SVG\-only colour font) is a config error; a COLR/SVG font that also
+has outlines is used in monochrome with a warning; and characters a font
+cannot draw are counted in one warning and fall back to the slot's embedded
+font. With
+.B "\-d fonts"
+every font is listed in lookup order, and each configured font's undrawable
+characters are shown as code point ranges grouped by reason (COLR colour
+layers, SVG colour picture, unsupported bitmap, probably unsupported sbix
+image, empty glyph), at most 20 lines per font.
 
 .SH VARIABLES
 The optional
@@ -272,9 +497,10 @@ parameter
 .BR double_click_gap ,
 .BR device_reconnect_interval ,
 .BR device_reconnect_max_attempts ,
-.B background ,
-.BR text_color ;
-the last two are colours, the rest int), reflecting any runtime changes. A
+.BR background ,
+.BR text_color ,
+.BR markup ;
+the last three are strings, the rest int), reflecting any runtime changes. A
 colour reads back exactly as it was set, so a name stays a name.
 .PP
 References are substituted in every action string, in setup
@@ -328,7 +554,11 @@ and the colour keys
 .B background
 and
 .BR text_color .
-The read\-only timing and reconnect parameters cannot be assigned.
+The read\-only timing, reconnect,
+.B markup
+and
+.B fonts
+parameters cannot be assigned.
 .TP
 .B <op>
 .B :=
@@ -460,9 +690,10 @@ and
 .BR params ,
 plus an optional
 .BR refresh ,
-.B background
+.BR background ,
+.B text_color
 and
-.BR text_color .
+.BR markup .
 .TP
 .B image
 .IB params " is a path"
@@ -478,7 +709,9 @@ in red.
 .TP
 .B text
 .I params
-is a path to a file; the first 6 characters of its first 3 lines are shown.
+is a path to a file; the first 6 columns of its first 3 lines are shown, with
+markup applied (see
+.BR "TEXT MARKUP" ).
 .TP
 .B text_value
 .I params
@@ -529,6 +762,21 @@ value). Allowed on
 and
 .BR text_exec
 only.
+.TP
+.B markup
+.B tmux
+or
+.B none
+(default: the
+.B defaults.markup
+value), how this entry's text is parsed. Allowed on
+.BR text ,
+.B text_value
+and
+.BR text_exec
+only, and not subject to
+.B $
+expansion.
 .TP
 .B refresh
 Seconds, default

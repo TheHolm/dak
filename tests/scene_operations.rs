@@ -164,6 +164,7 @@ fn scene_operations_extract_text() {
 
             background: None,
             text_color: None,
+            markup: None,
         }]
     );
 }
@@ -208,6 +209,7 @@ fn scene_operations_expands_tilde_in_image_and_text_params() {
 
                 background: None,
                 text_color: None,
+                markup: None,
             },
         ]
     );
@@ -242,6 +244,7 @@ fn scene_operations_extract_text_exec() {
 
             background: None,
             text_color: None,
+            markup: None,
         }]
     );
 }
@@ -275,6 +278,7 @@ fn scene_operations_extract_text_exec_with_refresh() {
 
             background: None,
             text_color: None,
+            markup: None,
         }]
     );
 }
@@ -302,6 +306,7 @@ fn scene_operations_extract_text_exec_quoted_args() {
 
             background: None,
             text_color: None,
+            markup: None,
         }]
     );
 }
@@ -564,6 +569,7 @@ fn scene_operations_accept_encoder_references() {
             refresh_seconds: 0,
             background: None,
             text_color: None,
+            markup: None,
         }]
     );
 }
@@ -596,6 +602,7 @@ fn scene_operations_extract_colour_overrides() {
                 refresh_seconds: 0,
                 background: Some("navy".to_string()),
                 text_color: Some("lime".to_string()),
+                markup: None,
             },
         ]
     );

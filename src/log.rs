@@ -16,6 +16,9 @@ pub enum Subsystem {
     Scene,
     /// What actions ran and what triggered them (key presses, timers, ...).
     Actions,
+    /// The fonts in use: the lookup order and, for each configured `defaults.fonts`
+    /// file, which characters it cannot draw and why. Silent without configured fonts.
+    Fonts,
 }
 
 impl Subsystem {
@@ -25,6 +28,7 @@ impl Subsystem {
             "device" => Some(Subsystem::Device),
             "scene" => Some(Subsystem::Scene),
             "action" | "actions" => Some(Subsystem::Actions),
+            "fonts" | "font" => Some(Subsystem::Fonts),
             _ => None,
         }
     }
@@ -35,6 +39,7 @@ impl Subsystem {
             Subsystem::Device => "device",
             Subsystem::Scene => "scene",
             Subsystem::Actions => "actions",
+            Subsystem::Fonts => "fonts",
         }
     }
 }
@@ -49,6 +54,7 @@ pub struct Log {
     device: bool,
     scene: bool,
     actions: bool,
+    fonts: bool,
 }
 
 impl Log {
@@ -60,6 +66,7 @@ impl Log {
                 Some(Subsystem::Device) => log.device = true,
                 Some(Subsystem::Scene) => log.scene = true,
                 Some(Subsystem::Actions) => log.actions = true,
+                Some(Subsystem::Fonts) => log.fonts = true,
                 None => {}
             }
         }
@@ -72,6 +79,7 @@ impl Log {
             Subsystem::Device => self.device,
             Subsystem::Scene => self.scene,
             Subsystem::Actions => self.actions,
+            Subsystem::Fonts => self.fonts,
         }
     }
 
@@ -132,6 +140,8 @@ mod tests {
         assert_eq!(Subsystem::parse("scene"), Some(Subsystem::Scene));
         assert_eq!(Subsystem::parse("action"), Some(Subsystem::Actions));
         assert_eq!(Subsystem::parse("actions"), Some(Subsystem::Actions));
+        assert_eq!(Subsystem::parse("fonts"), Some(Subsystem::Fonts));
+        assert_eq!(Subsystem::parse("font"), Some(Subsystem::Fonts));
     }
 
     /// Anything else is not a subsystem; filtering must not silently enable it.
@@ -147,6 +157,7 @@ mod tests {
         assert_eq!(Subsystem::Device.label(), "device");
         assert_eq!(Subsystem::Scene.label(), "scene");
         assert_eq!(Subsystem::Actions.label(), "actions");
+        assert_eq!(Subsystem::Fonts.label(), "fonts");
     }
 
     /// A default log disables every debug subsystem: only info/warnings/errors print.
@@ -156,6 +167,19 @@ mod tests {
         assert!(!log.enabled(Subsystem::Device));
         assert!(!log.enabled(Subsystem::Scene));
         assert!(!log.enabled(Subsystem::Actions));
+        assert!(!log.enabled(Subsystem::Fonts));
+    }
+
+    /// `-d fonts` enables only the fonts subsystem.
+    #[test]
+    fn from_debug_values_enables_fonts() {
+        let log = Log::from_debug_values(&["fonts".to_string()]);
+        assert!(log.enabled(Subsystem::Fonts));
+        assert!(!log.enabled(Subsystem::Scene));
+        assert_eq!(
+            log.debug_line(Subsystem::Fonts, "x"),
+            Some("debug[fonts]: x".to_string())
+        );
     }
 
     /// `-d` values enable exactly their own subsystem, and unknown values are ignored.

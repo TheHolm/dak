@@ -61,5 +61,14 @@ helper tools it mentions.
   every tick so it tracks the encoder's changes (the `%` is literal text, ending the
   reference name).
 
-See the README's [Variables](../README.markdown#variables) section for the syntax these
-examples use.
+- [`styled-text.json`](styled-text.json) - button text markup: a bold left-aligned
+  heading over a right-aligned value whose colour comes from a variable (`1b01` switches
+  it on press), a single emoji inserted by code point (`#[u=1F600]`), mixed
+  bold/italic with a highlighted line, a `text_exec` whose program prints the tags
+  itself, the same kind of text shown literally with `"markup": "none"`, and a line of
+  wide emoji. A commented-out `defaults.fonts` block shows how to use your own fonts,
+  including a colour emoji font and a CJK font (`extra`).
+  Needs only `date`.
+
+See the README's [Variables](../README.markdown#variables) and
+[Text markup](../README.markdown#text-markup) sections for the syntax these examples use.

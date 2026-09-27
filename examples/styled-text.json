@@ -1,0 +1,69 @@
+{
+  // Styled button text: tmux-style markup, emoji and (optionally) your own fonts.
+  // See the README's "Text markup" and "Fonts" sections.
+  "variables": {
+    "alert": { "type": "str", "value": "red" }
+  },
+  "defaults": {
+    // "tmux" is already the default; set "none" to show every "#[" literally.
+    "markup": "tmux"
+    // Uncomment (and add a comma above) to draw text in fonts of your own. Any key
+    // may be left out; a missing or broken file stops dak from starting.
+    // "fonts": {
+    //   "regular": "~/.local/share/fonts/Iosevka-Regular.ttf",
+    //   "bold": "~/.local/share/fonts/Iosevka-Bold.ttf",
+    //   "emoji": "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    //   // Chinese/Japanese/Korean (Debian/Ubuntu: fonts-noto-cjk); #0 = Japanese.
+    //   "extra": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0"
+    // }
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        // Bold heading on the left, a coloured value on the right.
+        "1b01": { "type": "text_value", "params": "#[align=left,bold]CPU\n#[align=right,nobold,fg=$alert]97%" },
+        // A single emoji, by code point, fills the button.
+        "1b02": { "type": "text_value", "params": "#[fg=yellow,u=1F600]" },
+        // Mixed styles on one line, plus a highlighted warning line.
+        "1b03": { "type": "text_value", "params": "#[bold]B#[italics]I#[nobold]i\n#[default,bg=red] ALERT" },
+        // A program can print markup too: here date's format string carries the tags
+        // (%n is a newline). Quote tags in commands, as "#" can start a shell comment.
+        "1b04": { "type": "text_exec", "params": "date '+#[fg=lime]%H:%M%n#[u=2714]'", "refresh": 30 },
+        // The same kind of text, shown literally.
+        "1b05": { "type": "text_value", "params": "#[bold]raw", "markup": "none" },
+        // Wide characters (most emoji) count as two of the six columns per line.
+        "1b06": { "type": "text_value", "params": "#[u=1F44D,1F44E,2764]\n#[fg=aqua,u=2600,2601,2602]" }
+      },
+      "actions": {
+        "1b01": { "short_press": "$alert := \"lime\"", "long_press": "$alert := \"red\"" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

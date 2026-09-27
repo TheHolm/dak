@@ -2591,3 +2591,151 @@ async fn runner_redraws_on_a_swapped_in_connection() {
     assert_eq!(fresh.keys(&calls), [2]);
     let _ = std::fs::remove_file(&image_path);
 }
+
+/// A runner on `mock` with default colours, as the markup/font tests below need.
+fn text_runner(mock: &MockButtonDevice) -> SceneRunner<'_, MockButtonDevice> {
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, _refresh_rx) = tokio::sync::mpsc::channel(4);
+    SceneRunner::new(
+        1,
+        mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    )
+}
+
+/// Whether `image` holds a clearly red pixel (red text drawn by a `fg=red` tag).
+fn has_red(image: &DynamicImage) -> bool {
+    image
+        .to_rgb8()
+        .pixels()
+        .any(|p| p.0[0] > 200 && p.0[1] < 60 && p.0[2] < 60)
+}
+
+/// Sum of the green channel over `image`, a proxy for how much white text it holds.
+fn ink(image: &DynamicImage) -> u64 {
+    image.to_rgb8().pixels().map(|p| p.0[1] as u64).sum()
+}
+
+/// A `text_value` is parsed as tmux markup by default, so `#[fg=red]` colours the text.
+#[tokio::test]
+async fn text_value_uses_tmux_markup_by_default() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "#[fg=red]M" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert!(has_red(&mock.last_image(0).unwrap()));
+}
+
+/// `"markup": "none"` on the entry shows the tag as plain (white) characters.
+#[tokio::test]
+async fn text_value_markup_none_shows_tags_literally() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "#[fg=red]M", "markup": "none" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    let image = mock.last_image(0).unwrap();
+    assert!(!has_red(&image));
+    assert!(ink(&image) > 0);
+}
+
+/// The runner's default markup comes from `set_text_settings`, and an entry's own
+/// `markup` overrides it.
+#[tokio::test]
+async fn set_text_settings_default_markup_and_entry_override() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    runner.set_text_settings(dak::markup::Markup::None, dak::text::FontSet::embedded());
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "#[fg=red]M" },
+        "1b02": { "type": "text_value", "params": "#[fg=red]M", "markup": "tmux" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert!(!has_red(&mock.last_image(0).unwrap()));
+    assert!(has_red(&mock.last_image(1).unwrap()));
+}
+
+/// A `text` file's content is parsed as markup too.
+#[tokio::test]
+async fn text_file_content_uses_markup() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    let path = std::env::temp_dir().join(format!("dak-markup-{}.txt", std::process::id()));
+    std::fs::write(&path, "#[fg=red]M\n").unwrap();
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text", "params": path.to_str().unwrap() }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert!(has_red(&mock.last_image(0).unwrap()));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `text_exec` output is parsed with its entry's markup: tmux by default, literal with
+/// `"markup": "none"`.
+#[tokio::test]
+async fn text_exec_output_uses_entry_markup() {
+    for (markup, expect_red) in [(None, true), (Some("none"), false)] {
+        let mock = MockButtonDevice::default();
+        let mut runner = text_runner(&mock);
+        let mut entry = json!({ "type": "text_exec", "params": "sleep 10" });
+        if let Some(markup) = markup {
+            entry["markup"] = json!(markup);
+        }
+        let scenes = scenes_with_buttons(json!({ "1b02": entry }));
+        runner.enter_scene("main", &scenes).await.unwrap();
+        runner
+            .handle_exec_event(ExecEvent::Output {
+                key: 2,
+                generation: 2,
+                kind: ExecOutputKind::Text,
+                stdout: b"#[fg=red]M\n".to_vec(),
+            })
+            .await;
+        let image = mock.last_image(1).expect("output was not staged");
+        assert_eq!(has_red(&image), expect_red, "markup {markup:?}");
+    }
+}
+
+/// Fonts passed to `set_text_settings` are used for drawing: a configured "regular"
+/// font that is actually DejaVu Bold draws heavier text than the embedded regular face.
+#[tokio::test]
+async fn set_text_settings_fonts_are_used() {
+    let dir = std::env::temp_dir().join(format!("dak-fonts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bold = dir.join("bold.ttf");
+    std::fs::copy("fonts/DejaVuSansMono-Bold.ttf", &bold).unwrap();
+    let (fonts, _) = dak::text::FontSet::load(&dak::text::FontPaths {
+        regular: Some(bold.to_str().unwrap().to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "MMM" }
+    }));
+    let plain = MockButtonDevice::default();
+    text_runner(&plain)
+        .enter_scene("main", &scenes)
+        .await
+        .unwrap();
+    let custom = MockButtonDevice::default();
+    let mut runner = text_runner(&custom);
+    runner.set_text_settings(dak::markup::Markup::Tmux, std::sync::Arc::new(fonts));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let (plain, custom) = (
+        ink(&plain.last_image(0).unwrap()),
+        ink(&custom.last_image(0).unwrap()),
+    );
+    assert!(custom > plain * 11 / 10, "custom {custom} vs plain {plain}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

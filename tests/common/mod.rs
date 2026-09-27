@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use dak::actions::load_config_from_path;
 
+pub mod font_builder;
+
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Writes `contents` to a unique temp file and returns its path.

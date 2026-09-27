@@ -23,6 +23,7 @@ pub mod color;
 pub mod hardware;
 pub mod log;
 pub mod map;
+pub mod markup;
 pub mod press;
 pub mod reconnect;
 pub mod text;

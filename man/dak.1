@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH DAK 1 2026-09-20 "dak 0.12.0" "User Commands"
+.TH DAK 1 2026-09-20 "dak 0.13.0" "User Commands"
 .SH NAME
 dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
 .SH SYNOPSIS
@@ -17,7 +17,7 @@ dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It 
 Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory
 .TP
 \fB\-d\fR, \fB\-\-debug\fR \fI<DEBUG>...\fR
-Debug subsystems to enable: device, scene, action. The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
+Debug subsystems to enable: device, scene, action, fonts (the fonts in use and the characters configured fonts cannot draw; silent without defaults.fonts). The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
 .TP
 \fB\-\-map\fR
 Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits

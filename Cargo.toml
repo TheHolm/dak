@@ -1,23 +1,33 @@
 [package]
 name = "dak"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"
 # `license` and `license-file` are mutually exclusive in Cargo.toml; AGPL-3.0-or-later
-# has a valid SPDX identifier so that's used here rather than license-file - cargo-deb
-# still copies the full text from ./LICENSE into the .deb's debian/copyright.
+# has a valid SPDX identifier so that's used here rather than license-file. This is
+# only the program's own licence: the embedded fonts keep theirs, and every licence's
+# full text is in debian/copyright (see the deb assets below).
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/theholm/dak"
 
 # `$auto` keeps cargo-deb's implicit assets (the `dak` binary) and the two man
 # pages are added on top of it, at the paths Debian's man(7) expects. cargo-deb
 # compresses anything under usr/share/man/ itself, per Debian policy.
+#
+# debian/copyright is installed explicitly as the package's one licence file (Debian
+# Policy 12.5, which Ubuntu follows too): with an asset at that path cargo-deb does not
+# generate its own, which only named the licence ("License: AGPL-3.0-or-later")
+# without its text - not enough, since AGPL, the fonts' Bitstream Vera/Arev terms and
+# OFL-1.1 are all absent from /usr/share/common-licenses and so must be quoted in full.
 [package.metadata.deb]
+# Debian archive section; without it lintian warns "recommended-field Section".
+section = "utils"
 assets = [
     "$auto",
     { source = "man/dak.1", dest = "usr/share/man/man1/dak.1", mode = "644" },
     { source = "man/dak-config.5", dest = "usr/share/man/man5/dak-config.5", mode = "644" },
+    { source = "debian/copyright", dest = "usr/share/doc/dak/copyright", mode = "644" },
 ]
 
 [dependencies]
@@ -28,6 +38,13 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "ti
 serde_json = { version = "1.0.150"}
 serde = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
+# Direct access to font tables (the same version ab_glyph already uses, so no new
+# code): the startup scan of configured fonts and colour-table detection.
+ttf-parser = "0.25"
+# Grapheme clusters and display widths, so button text is cut to 6 columns without
+# splitting a character (emoji count as two columns).
+unicode-segmentation = "1"
+unicode-width = "0.2"
 clap = { version = "4", features = ["derive"] }
 
 # Only used by tests/man_pages.rs to render man/dak.1 from the clap definition in
