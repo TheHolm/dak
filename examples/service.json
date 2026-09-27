@@ -23,7 +23,7 @@
   "scenes": {
     "on_start": {
       "setup": {
-        "1b01": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 30 }
+        "1b01": { "type": "text_exec", "params": "date +%H:%M", "refresh": 30 }
       },
       "actions": {}
     }

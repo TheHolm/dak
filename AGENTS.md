@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.14.0 (declared as `0.14.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.14.1 (declared as `0.14.1` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -135,12 +135,35 @@ under other platforms.
   fd 2 -> journal, detached -> syslog, else console). `LOGGING_KEYS`, `LOG_OUTPUTS`,
   `LOG_LEVELS`, `SYSLOG_FACILITIES`, `TIMESTAMP_VALUES` are vocabulary constants
   `tests/man_pages.rs` checks against `dak-config.5`; `tests/logging.rs` runs the binary
-- `src/map.rs` — interactive device-mapping wizard (`dak --map`)
+- `src/map.rs` — interactive device-mapping wizard (`dak --map`). All prompts go
+  through a `Console<R: BufRead, O: Write, E: Write>` (`Console::stdio()` in a real
+  run, byte buffers in tests); every question re-asks after an invalid answer but ends
+  the wizard with `MapError::InputClosed`/`MapError::Input` at end of input or on a
+  read error (only `ask_number_with_default` keeps its default at EOF), so a closed
+  stdin can never spin. `run_map_wizard` is only device glue (discovery, lock,
+  connect, shutdown); the steps are testable functions: `choose_device`,
+  `choose_protocol_version`, `map_connected` (steps 2-6, generic over
+  `ButtonDevice<Error = MirajazzError>` and `input::InputSource`) and
+  `recheck_display`
+- `src/input.rs` — the input side of a connection: the `InputSource` trait (async
+  `read_report`, implemented for mirajazz's `DeviceStateReader` and `Arc<T>`),
+  `decode_report`/`encode_report` (`ACK` prefix, code at byte 9, state at byte 10)
+  shared by `main.rs` and `map.rs`, and `ScriptedInput`, a channel-fed fake the tests
+  of both use
 - `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
   key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,
   used by `tests/hardware.rs` and `tests/hardware_read_loop.rs` to detect and drive
   real hardware; `main.rs` and `map.rs` keep their own private copies of the same
   constants for their own connection setup rather than depending on this module
+- `main.rs`'s device loop is split for testing: `run_device` keeps the connection
+  side (connect, `'connection` loop, reconnect, cleanup) and hands every event to a
+  `Session<D: ButtonDevice>` (`on_report`/`on_timer`/`on_click`/`on_exec`/
+  `on_refresh`/`reset_after_disconnect`; `run_connection` is the `select!` loop over
+  an `InputSource` and the `SessionChannels`); `route` is the pure raw-code to
+  `Dispatch` translation. `await_reconnect` is generic over a `Reopen` trait
+  (`ReopenDevice` rediscovers and connects the real keypad; tests script outcomes).
+  `Supervisor` samples the reload/rescan counters when it is created (not when `run`
+  starts), so a signal arriving during startup is not lost
 - `src/lib.rs` — library crate exposing config loading/validation and the scene
   runner so both the binary and the integration tests can drive it
 - `fonts/` — the fonts embedded with `include_bytes!` (all unmodified upstream files:
@@ -200,37 +223,49 @@ under other platforms.
 
 Work in progress. Current known issues:
 
-- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop,
-  parking after giving up) and a SIGHUP reload restarting a live device session are
-  only tested through their pieces (`park_until_rescan`, `LockTable`, the
-  device-less reload/rescan runs in `tests/daemon.rs`) and (`SwappableDevice`, `wait_until`,
-  `SceneRunner::redraw_all`, `current_brightness`); the end-to-end
-  disconnect/rediscover/repaint sequence needs real hardware being unplugged
-- `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's
-  interactive I/O still have no test coverage (both need a physical device *and*
-  driving actual button presses/encoder turns/typed answers, which
-  `tests/hardware.rs`/`tests/hardware_read_loop.rs` deliberately don't attempt).
-  Between them, those two files cover, against real hardware when attached
-  (skipping themselves otherwise): enumeration, connect/identify/shutdown,
-  `set_brightness`, the `set_button_image`/`flush`/`clear_button_image` image
-  path, and opening the raw input reader without erroring. The raw-input-reader
-  test lives in its own `tests/hardware_read_loop.rs` binary rather than
-  alongside the others in `tests/hardware.rs`: on FreeBSD it starts a background
-  reader thread that (deliberately, to avoid a worse shutdown-hang bug) never
-  releases the device's `hidraw` node for the rest of the process's life once
-  nothing more ever reads from it, which would otherwise make every hardware
-  test that ran afterwards *in the same process* falsely report "no device
-  attached" instead of a real pass. Both files also serialize their own tests
+- What still has no automated coverage is the glue that needs a real keypad: in
+  `run_device`, everything between connecting and handing the connection to the
+  `Session` (connect, device info logging, the `'connection` loop's reader setup and
+  cleanup/shutdown), `ReopenDevice::reopen`, `connect_device`'s success path, the
+  `ButtonDevice for Device` wrappers, and `run_map_wizard`'s discovery/lock/connect/
+  shutdown glue. Everything they call is tested with fakes (`Session`, `route`,
+  `run_connection` over `input::ScriptedInput`, `await_reconnect` over a scripted
+  `Reopen`, `map_connected`/`Console`), so the remaining end-to-end check is a
+  manual run against hardware: pressing buttons, unplugging and re-plugging.
+  `tests/hardware.rs`/`tests/hardware_read_loop.rs` cover, against real hardware
+  when attached (skipping themselves otherwise): enumeration,
+  connect/identify/shutdown, `set_brightness`, the
+  `set_button_image`/`flush`/`clear_button_image` image path, and opening the raw
+  input reader without erroring, and (`reader_releases_the_device_when_dropped`)
+  that a dropped reader releases the device so the same process can reopen it.
+  The raw-input-reader tests live in their own `tests/hardware_read_loop.rs` binary
+  rather than alongside the others in `tests/hardware.rs`: on FreeBSD the backend's
+  reader thread used to keep the `hidraw` node open for the rest of the process's
+  life once started, which made every later hardware test *in the same process*
+  falsely report "no device attached" (and broke SIGHUP reload until v0.14.1; see
+  `NOTES.md` section 7). Keeping them separate means a regression cannot spoil
+  `tests/hardware.rs`. Both files also serialize their own tests
   against each other via `tests/hardware_common`'s `lock_hardware()` (see its
   doc comment): the real device only allows one open handle at a time, and
   `cargo test`'s default parallelism otherwise races multiple tests against it,
   intermittently causing that same false "no device" skip or, worse, genuine
   test failures
+- Hardware-verified in v0.14.1 on both Debian 13 and FreeBSD 15.1 (VMs with the
+  keypad passed through): full `cargo test`, `dak --map`, every press kind on all
+  buttons and encoders, encoder turns, scene switches, SIGHUP reload, and unplug/
+  re-plug with repaint. Config actions should use bare program names (`expr`,
+  `date`), not `/usr/bin/...`: FreeBSD keeps several of them in `/bin`
+- A keypad that is enumerable but cannot be opened (e.g. a container that sees
+  the host's sysfs but has no `/dev/hidraw*` node) makes the hardware tests skip,
+  but `dak --map` still lists it; `tests/exit_status.rs`'s `--map` test accepts
+  both outcomes (no device: 4; device listed: stdin EOF at the first question: 1)
 
 ## Commands
 
 - Build/check: `cargo build`
 - Run: `cargo run` (requires the USB device and udev rules from README)
+- Coverage: `cargo llvm-cov --summary-only` (add `--show-missing-lines` for line
+  numbers); see `NOTES.md` section 12 for the gotchas (stale profiles, forked daemon)
 - Tests: `cargo test` (integration tests in `tests/` split by topic — validation, scene_operations, action_types — extracting shared helpers into `tests/common/`, plus unit tests for private helpers; `tests/hardware.rs` needs a real Ajazz device and skips itself when none is attached, so `cargo test` always succeeds either way)
 
 ## Conventions
@@ -255,3 +290,6 @@ Work in progress. Current known issues:
   feature; `Z` (patch) is bumped for bugfixes and other changes that don't
   add, remove, or change functionality
 - Never commit changes unless the user explicitly asks to commit
+- No test may depend on the user's own (gitignored) `config.json` or on a
+  keypad being attached: `cargo test` must pass on a fresh checkout on any
+  machine. Use temp files (`tests/common`) or the checked-in examples

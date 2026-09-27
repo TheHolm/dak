@@ -130,7 +130,9 @@ file again on exit"
         help = "Run the interactive device-mapping wizard and exit",
         long_help = "Run the interactive device-mapping wizard instead of normal operation: \
 no config is read and no actions run; the wizard walks through capturing the connected \
-device's buttons and encoders and prints the resulting device definition as JSON, then exits"
+device's buttons and encoders and prints the resulting device definition as JSON, then exits. \
+The answers are read from standard input; when it ends (or cannot be read) before the wizard is \
+done, the wizard stops with exit status 1 and prints nothing"
     )]
     pub map: bool,
 }

@@ -561,11 +561,19 @@ pub fn check_logging(
 /// The default log file: `$XDG_STATE_HOME/dak/dak.log`, else
 /// `~/.local/state/dak/dak.log`; `None` when neither variable is set.
 pub fn default_log_file() -> Option<PathBuf> {
-    if let Some(state) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+    default_log_file_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`default_log_file`] for the given `XDG_STATE_HOME` and `HOME` values (empty values
+/// count as unset), so the fallback order is testable without changing the environment.
+fn default_log_file_from(
+    state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(state) = state_home.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(state).join("dak").join("dak.log"));
     }
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
+    home.filter(|v| !v.is_empty())
         .map(|home| PathBuf::from(home).join(".local/state/dak/dak.log"))
 }
 
@@ -1388,6 +1396,122 @@ mod tests {
     fn unopenable_log_file_is_an_error() {
         let error = FileSink::open(Path::new("/proc/definitely/not/here.log")).unwrap_err();
         assert!(error.contains("/proc/definitely"), "{error}");
+    }
+
+    /// A log directory that cannot be created (a regular file is in the way) is
+    /// reported as such, and an opened sink remembers its path.
+    #[test]
+    fn uncreatable_log_directory_is_an_error() {
+        let dir = scratch_dir("blocked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("file");
+        std::fs::write(&blocker, "").unwrap();
+        let error = FileSink::open(&blocker.join("sub").join("dak.log")).unwrap_err();
+        assert!(error.contains("cannot create log directory"), "{error}");
+
+        let path = dir.join("ok.log");
+        let sink = FileSink::open(&path).unwrap();
+        assert_eq!(sink.path(), path.as_path());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every wrong JSON type in the `logging` section is an error naming the key and
+    /// the type found (the value-level errors are covered by
+    /// `bad_logging_values_are_errors`).
+    #[test]
+    fn wrongly_typed_logging_values_are_errors() {
+        for (section, expected) in [
+            (
+                json!({"output": 5}),
+                "logging.output must be a string or an array of strings, got a number",
+            ),
+            (
+                json!({"output": {}}),
+                "logging.output must be a string or an array of strings, got an object",
+            ),
+            (
+                json!({"output": [null]}),
+                "logging.output entries must be strings, got null",
+            ),
+            (
+                json!({"output": ["console", true]}),
+                "logging.output entries must be strings, got a boolean",
+            ),
+            (json!({"file": ""}), "logging.file must not be empty"),
+            (
+                json!({"file": []}),
+                "logging.file must be a path string, got an array",
+            ),
+            (
+                json!({"syslog_facility": 1}),
+                "logging.syslog_facility must be a string, got a number",
+            ),
+            (
+                json!({"level": ["info"]}),
+                "logging.level must be a string, got an array",
+            ),
+            (
+                json!({"debug": "device"}),
+                "logging.debug must be an array of subsystem names, got a string",
+            ),
+            (
+                json!({"debug": [1]}),
+                "logging.debug entries must be strings, got a number",
+            ),
+            (
+                json!({"timestamps": 1}),
+                "logging.timestamps must be \"auto\", true or false, got a number",
+            ),
+            (
+                json!({"timestamps": null}),
+                "logging.timestamps must be \"auto\", true or false, got null",
+            ),
+        ] {
+            let (_, errors, _) = check(section.clone());
+            assert_eq!(errors, vec![expected.to_string()], "for {section}");
+        }
+    }
+
+    /// Every accepted `timestamps` form maps to its setting, and repeated debug
+    /// subsystems are listed once.
+    #[test]
+    fn timestamps_forms_and_debug_duplicates() {
+        for (value, expected) in [
+            (json!(true), Timestamps::On),
+            (json!(false), Timestamps::Off),
+            (json!("true"), Timestamps::On),
+            (json!("false"), Timestamps::Off),
+            (json!("auto"), Timestamps::Auto),
+        ] {
+            let (config, errors, _) = check(json!({ "timestamps": value.clone() }));
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(config.timestamps, expected, "for {value}");
+        }
+        let (config, errors, _) = check(json!({"debug": ["scene", "scene", "fonts"]}));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.debug, vec![Subsystem::Scene, Subsystem::Fonts]);
+    }
+
+    /// The default log file prefers `XDG_STATE_HOME`, falls back to `HOME`, treats
+    /// empty values as unset, and is `None` without either.
+    #[test]
+    fn default_log_file_fallback_order() {
+        use std::ffi::OsString;
+        let some = |text: &str| Some(OsString::from(text));
+        assert_eq!(
+            default_log_file_from(some("/state"), some("/home/u")),
+            Some(PathBuf::from("/state/dak/dak.log"))
+        );
+        assert_eq!(
+            default_log_file_from(some(""), some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state/dak/dak.log"))
+        );
+        assert_eq!(
+            default_log_file_from(None, some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state/dak/dak.log"))
+        );
+        assert_eq!(default_log_file_from(None, some("")), None);
+        assert_eq!(default_log_file_from(None, None), None);
     }
 
     /// The file output falls back to the XDG state directory.

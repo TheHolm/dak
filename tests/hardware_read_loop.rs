@@ -10,30 +10,19 @@
 //! separate file is sufficient - do not move it back into `tests/hardware.rs`
 //! or otherwise merge it into a shared process with other hardware tests.
 //!
-//! Why: [`read_loop_does_not_error_without_input`] opens the device's raw
-//! input reader and starts a read. On FreeBSD (see
+//! Why: reading starts, on FreeBSD (see
 //! `vendor/async-hid-freebsd/src/backend/hidraw_bsd/mod.rs`'s module doc
-//! comment), reading starts a dedicated background OS thread that loops on a
-//! blocking `read(2)` of the `/dev/hidrawN` fd and - deliberately, to avoid a
-//! worse bug where an abandoned read leaves a thread stuck forever and hangs
-//! process shutdown - that thread is never cancelled or joined on drop, only
-//! on a transport error (i.e. the device disconnecting). Since this test
-//! doesn't press a button, no report ever arrives, no read error ever occurs,
-//! and the thread (and the fd it holds via `Arc`) stays alive for the rest of
-//! the process's life. FreeBSD's `hidraw(4)` refuses a second concurrent open
-//! of the same node (`EBUSY`), so any *other* hardware test that tried to
-//! `Device::connect()` afterwards **in the same process** would fail to open
-//! that node - and since [`dak::hardware::is_present`] treats a failed connect
-//! exactly like "no device attached", every test after this one would silently
-//! and misleadingly report `skipping: no Ajazz device attached` and pass
-//! trivially, instead of actually exercising the hardware.
-//!
-//! Confirmed by hand against real hardware: running every test in
-//! `tests/hardware.rs` in one process (this test included) left 2 of 6 tests
-//! falsely skipped every single time, while running any subset that excludes
-//! this test - or running this test alone - always passed for real. Giving
-//! this test its own binary/process is the fix: whatever it leaks dies with
-//! that process, and every other hardware test keeps running in a clean one.
+//! comment), a dedicated background OS thread holding the `/dev/hidrawN` fd, and
+//! `hidraw(4)` refuses a second concurrent open of the same node (`EBUSY`). That
+//! thread used to sit in a blocking `read(2)` that only a report or a device error
+//! ended, so on an idle keypad it kept the node open for the rest of the process's
+//! life, and every later hardware test in the same process falsely reported
+//! `skipping: no Ajazz device attached` (a failed connect counts as "no device").
+//! The same leak broke dak's SIGHUP reload on FreeBSD (found against real
+//! hardware in v0.14.1). The thread now polls with a timeout and is joined when
+//! the reader is dropped, and [`reader_releases_the_device_when_dropped`] checks
+//! exactly that; the tests stay in their own binary so a regression cannot spoil
+//! `tests/hardware.rs` again.
 
 // See src/lib.rs for why this is needed on FreeBSD only: each integration test file
 // compiles as its own crate, so it needs its own copy of the rename.
@@ -72,4 +61,30 @@ async fn read_loop_does_not_error_without_input() {
     }
 
     device.shutdown().await.expect("shutdown should succeed");
+}
+
+/// Reads from an idle keypad (starting the FreeBSD backend's reader thread), drops
+/// the connection, and connects again straight away in the same process: the
+/// dropped reader must have released the device node. On FreeBSD a leaked reader
+/// thread kept `/dev/hidrawN` open, so this second connect failed and dak's SIGHUP
+/// reload lost its keypad; on Linux it always worked.
+#[tokio::test(flavor = "multi_thread")]
+async fn reader_releases_the_device_when_dropped() {
+    let _guard = lock_hardware().await;
+    if skip_without_hardware().await {
+        return;
+    }
+
+    for round in 1..=3 {
+        let device = connect().await;
+        let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
+        let _ = tokio::time::timeout(Duration::from_millis(300), reader.raw_read_data(512)).await;
+        drop(reader);
+        device.shutdown().await.expect("shutdown should succeed");
+        drop(device);
+        assert!(
+            dak::hardware::is_present().await,
+            "round {round}: the device could not be opened again after its reader was dropped"
+        );
+    }
 }

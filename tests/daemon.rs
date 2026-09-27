@@ -14,6 +14,36 @@ use std::time::Duration;
 
 use dak::exit;
 
+/// A spawned `dak` that is killed when dropped if it is still running, so a failing
+/// test never leaves its daemon behind.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    /// Kills and reaps the child unless it already exited.
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+impl std::ops::Deref for Running {
+    type Target = std::process::Child;
+
+    /// The child process.
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Running {
+    /// The child process.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Whether process `pid` still exists.
 fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
@@ -266,17 +296,19 @@ fn service_without_devices_waits_and_handles_reload_and_rescan() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dak"))
-        .arg("-c")
-        .arg(&config)
-        .arg("--log-file")
-        .arg(&log_file)
-        .env("NOTIFY_SOCKET", &socket_path)
-        .env(dak::lock::LOCK_DIR_ENV, &dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_dak"))
+            .arg("-c")
+            .arg(&config)
+            .arg("--log-file")
+            .arg(&log_file)
+            .env("NOTIFY_SOCKET", &socket_path)
+            .env(dak::lock::LOCK_DIR_ENV, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let pid = child.id() as i32;
 
     let ready = recv_until(&socket, "READY=1");
@@ -323,16 +355,18 @@ fn sighup_reopens_the_log_file() {
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dak"))
-        .arg("-c")
-        .arg(&config)
-        .arg("--log-file")
-        .arg(&log_file)
-        .env("NOTIFY_SOCKET", &socket_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_dak"))
+            .arg("-c")
+            .arg(&config)
+            .arg("--log-file")
+            .arg(&log_file)
+            .env("NOTIFY_SOCKET", &socket_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let pid = child.id() as i32;
     recv_until(&socket, "READY=1");
     let rotated = dir.join("dak.log.1");
@@ -344,6 +378,76 @@ fn sighup_reopens_the_log_file() {
     assert!(std::fs::read_to_string(&rotated)
         .unwrap()
         .contains("received SIGHUP"));
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(child.wait().unwrap().code(), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A device definition no attached keypad can match (its serial is made up).
+const ABSENT_DEVICE: &str = r#"{"1": {
+    "device_id": "0300:3002", "device_name": "absent", "serial": "DAK-TEST-ABSENT",
+    "key_count": 9, "encoder_count": 3, "screens": 6,
+    "buttons": [{"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1}],
+    "encoders": []
+}}"#;
+
+/// A service whose configured device is absent: SIGUSR1 looks for it and says it is
+/// still missing; a reload prints the new config's warnings; a reload whose log file
+/// cannot be opened keeps logging to the previous one.
+#[test]
+fn service_rescans_for_absent_devices_and_reports_reload_problems() {
+    let dir = common::temp_dir();
+    let log_file = dir.join("dak.log");
+    let config = dir.join("config.json");
+    let write_config = |logging_file: &Path, scenes: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"logging": {{"output": "file", "file": "{}"}},
+                    "scenes": {scenes}, "devices": {ABSENT_DEVICE}}}"#,
+                logging_file.display()
+            ),
+        )
+        .unwrap();
+    };
+    write_config(&log_file, r#"{"on_start": {}}"#);
+    let socket_path = dir.join("notify.sock");
+    let socket = UnixDatagram::bind(&socket_path).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_dak"))
+            .arg("-c")
+            .arg(&config)
+            .env("NOTIFY_SOCKET", &socket_path)
+            .env(dak::lock::LOCK_DIR_ENV, &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.id() as i32;
+    recv_until(&socket, "READY=1");
+    wait_for_log(&log_file, "DAK-TEST-ABSENT");
+
+    unsafe { libc::kill(pid, libc::SIGUSR1) };
+    wait_for_log(&log_file, "rescan: no missing device was found");
+
+    write_config(&log_file, r#"{"on_start": {"actions": {"1b01": {}}}}"#);
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    recv_until(&socket, "READY=1");
+    let text = wait_for_log(&log_file, "configuration reloaded");
+    assert!(text.contains("warning: "), "{text}");
+
+    write_config(
+        Path::new("/proc/dak-no-such-dir/dak.log"),
+        r#"{"on_start": {}}"#,
+    );
+    unsafe { libc::kill(pid, libc::SIGHUP) };
+    recv_until(&socket, "READY=1");
+    wait_for_log(&log_file, "keeping the previous log outputs");
+
     unsafe { libc::kill(pid, libc::SIGTERM) };
     assert_eq!(child.wait().unwrap().code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);

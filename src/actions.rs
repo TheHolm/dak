@@ -1445,8 +1445,10 @@ fn check_variable_assignment(
 }
 
 /// Validates a `$(command)` right-hand side: every reference inside it must resolve, and
-/// a literal program that needs no shell is checked for existence. The output's type is
-/// only known at action time, so no range/type check happens here.
+/// a program that needs no shell is checked for existence - also when only its
+/// *arguments* hold references (`/bin/expr $count + 1`), since the program word itself
+/// is then still literal. The output's type is only known at action time, so no
+/// range/type check happens here.
 fn validate_command_rhs(
     scene_name: &str,
     path: &str,
@@ -1456,11 +1458,21 @@ fn validate_command_rhs(
     warnings: &mut Vec<String>,
 ) {
     let refs = check_references(scene_name, path, inner, variables, errors);
-    if refs.is_empty() && !command_needs_shell(inner) {
-        match parse_command_line(inner) {
-            Ok(command) => check_executable(scene_name, path, &command.program, warnings),
-            Err(error) => errors.push(format!("scene \"{scene_name}\": {path}: {error}")),
+    if command_needs_shell(inner) {
+        return;
+    }
+    match parse_command_line(inner) {
+        Ok(command) if !command.program.contains('$') => {
+            check_executable(scene_name, path, &command.program, warnings)
         }
+        // The program itself comes from a reference: only known at action time.
+        Ok(_) => {}
+        // With references the text is only final once expanded; the action reports
+        // a bad command line then.
+        Err(error) if refs.is_empty() => {
+            errors.push(format!("scene \"{scene_name}\": {path}: {error}"))
+        }
+        Err(_) => {}
     }
 }
 
@@ -4570,17 +4582,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// With no config in `$HOME`, the current directory's `config.json` is picked
-    /// ahead of the binary directory (the test process's harness directory).
+    /// The default config is searched for in `$HOME/.config/dak/`, then the current
+    /// directory, then the binary's directory (which of them holds a file is
+    /// [`super::pick_config_path`]'s business, tested above). This checks the order
+    /// without depending on a `config.json` in the working directory: the user's own
+    /// one is gitignored and absent from a fresh checkout.
     #[test]
-    fn resolve_config_path_cwd_wins_when_home_has_no_config() {
+    fn config_search_dirs_are_home_then_cwd_then_binary() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = temp_dir();
         let _home_guard = SetHome::new(&home);
 
-        let picked = super::resolve_config_path(None);
+        let dirs = super::config_search_dirs();
 
-        assert_eq!(picked, std::env::current_dir().unwrap().join("config.json"));
+        let binary_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".config").join("dak"),
+                std::env::current_dir().unwrap(),
+                binary_dir
+            ]
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -6205,5 +6232,199 @@ mod tests {
                 "a value that is neither a string nor an array yields no actions: {value:?}"
             );
         }
+    }
+
+    /// `apply_assignment` rejects (returning `None` and leaving every variable as it
+    /// was) an assignment that cannot be applied: reading an undefined variable, an int
+    /// variable whose stored value is not an integer, a command right-hand side (those
+    /// run on their own task), an undeclared target, a type mismatch, a string for a
+    /// brightness default and a number for a colour default.
+    #[test]
+    fn apply_assignment_rejects_unappliable_assignments() {
+        let log = crate::log::Log::default();
+        let variable = |name: &str| super::AssignTarget::Variable(name.to_string());
+        let reference = |name: &str| {
+            super::AssignRhs::Variable(crate::variables::VarRef {
+                scope: crate::variables::Scope::Var,
+                name: name.to_string(),
+            })
+        };
+        let mut variables = assignment_variables();
+        // An int variable holding a non-integer can only come from outside validation.
+        variables.store_mut().set(
+            "other",
+            crate::variables::VarValue::Str("seven".to_string()),
+        );
+        let snapshot = |variables: &crate::variables::Variables| {
+            ["count", "other", "name"].map(|name| variables.store().get(name).cloned())
+        };
+        let before = snapshot(&variables);
+
+        for (target, rhs) in [
+            (variable("count"), reference("nope")),
+            (variable("count"), reference("other")),
+            (
+                variable("count"),
+                super::AssignRhs::Command("echo 1".to_string()),
+            ),
+            (variable("missing"), super::AssignRhs::Int(1)),
+            (variable("count"), super::AssignRhs::Str("x".to_string())),
+            (variable("name"), super::AssignRhs::Int(1)),
+            (
+                super::AssignTarget::Default(super::SettableDefault::EncoderBrightness),
+                super::AssignRhs::Str("bright".to_string()),
+            ),
+            (
+                super::AssignTarget::Default(super::SettableDefault::TextColor),
+                super::AssignRhs::Int(3),
+            ),
+        ] {
+            let effect = super::apply_assignment(
+                &target,
+                super::AssignOp::ClampWarn,
+                &rhs,
+                &mut variables,
+                true,
+                log,
+            );
+            assert_eq!(effect, None, "{target:?} <- {rhs:?}");
+            assert_eq!(snapshot(&variables), before, "{target:?} <- {rhs:?}");
+        }
+    }
+
+    /// A string variable copied into another string variable goes through the string
+    /// branch (and its truncation policy).
+    #[test]
+    fn apply_assignment_copies_string_variables() {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "long".to_string(),
+            crate::variables::VarDef::string(10, "abcdefgh".to_string()),
+        );
+        defs.insert(
+            "short".to_string(),
+            crate::variables::VarDef::string(3, "x".to_string()),
+        );
+        let mut variables =
+            crate::variables::Variables::new(defs, &crate::press::Defaults::default());
+        super::apply_assignment(
+            &super::AssignTarget::Variable("short".to_string()),
+            super::AssignOp::ClampSilent,
+            &super::AssignRhs::Variable(crate::variables::VarRef {
+                scope: crate::variables::Scope::Var,
+                name: "long".to_string(),
+            }),
+            &mut variables,
+            true,
+            crate::log::Log::default(),
+        );
+        assert_eq!(
+            variables.store().get("short"),
+            Some(&crate::variables::VarValue::Str("abc".to_string()))
+        );
+    }
+
+    /// Encoder brightness assignments report the encoder side effect and store the
+    /// value, just like the button one.
+    #[test]
+    fn apply_assignment_sets_encoder_brightness() {
+        let mut variables = assignment_variables();
+        let effect = super::apply_assignment(
+            &super::AssignTarget::Default(super::SettableDefault::EncoderBrightness),
+            super::AssignOp::Strict,
+            &super::AssignRhs::Int(40),
+            &mut variables,
+            true,
+            crate::log::Log::default(),
+        );
+        assert_eq!(
+            effect,
+            Some(super::DefaultEffect::Brightness(
+                super::SettableDefault::EncoderBrightness,
+                40
+            ))
+        );
+        assert_eq!(
+            variables
+                .read(&crate::variables::VarRef {
+                    scope: crate::variables::Scope::Defaults,
+                    name: "encoder_brightness".to_string(),
+                })
+                .unwrap(),
+            "40"
+        );
+    }
+
+    /// A `$(command)` assignment to a string variable falls back to the variable's
+    /// initial value when its output is unusable (not UTF-8, or the command failed),
+    /// for the lenient operators; the strict operator reports the failure instead.
+    #[tokio::test]
+    async fn command_assignment_failures_use_the_default_or_fail() {
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(assignment_variables()));
+        let run = |op: super::AssignOp, command: &str| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            super::start_command_assignment(
+                super::AssignTarget::Variable("name".to_string()),
+                op,
+                command,
+                &variables,
+                tx,
+                crate::log::Log::default(),
+            );
+            async move {
+                let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("the command finishes")
+                    .expect("a result is sent");
+                match event {
+                    super::ExecEvent::Assignment(done) => done.outcome,
+                    other => panic!("unexpected event {other:?}"),
+                }
+            }
+        };
+        let fallback = Ok(crate::variables::VarValue::Str("abc".to_string()));
+        assert_eq!(
+            run(super::AssignOp::ClampWarn, "printf '\\377'").await,
+            fallback
+        );
+        assert_eq!(run(super::AssignOp::ClampSilent, "false").await, fallback);
+        let strict = run(super::AssignOp::Strict, "printf '\\377'").await;
+        assert!(
+            strict.as_ref().is_err_and(|e| e.contains("not UTF-8")),
+            "{strict:?}"
+        );
+        assert_eq!(
+            run(super::AssignOp::ClampWarn, "printf hi").await,
+            Ok(crate::variables::VarValue::Str("hi".to_string()))
+        );
+    }
+
+    /// An empty timer object is no timer; seconds from an int variable whose value is
+    /// not a valid number of seconds (negative) and a malformed reference are errors.
+    #[test]
+    fn timer_seconds_edge_cases() {
+        let variables = scene_variables();
+        let empty = json!({ "main": { "actions": { "timer": {} } } });
+        assert_eq!(
+            super::timer_for_scene_with("main", &empty, &variables).unwrap(),
+            None
+        );
+
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::int(-10, 10, -3),
+        );
+        let negative = crate::variables::Variables::new(defs, &crate::press::Defaults::default());
+        let scenes = json!({ "main": { "actions": { "timer": { "$period": "@Main" } } } });
+        let error = super::timer_for_scene_with("main", &scenes, &negative).unwrap_err();
+        assert!(
+            error.contains("resolved to \"-3\", which is not a valid number of seconds"),
+            "{error}"
+        );
+
+        let malformed = json!({ "main": { "actions": { "timer": { "${period": "@Main" } } } });
+        let error = super::timer_for_scene_with("main", &malformed, &variables).unwrap_err();
+        assert!(error.contains("actions.timer"), "{error}");
     }
 }

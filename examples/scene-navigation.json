@@ -30,7 +30,7 @@
       "setup": {
         "1b01": {
           "type": "text_exec",
-          "params": "/usr/bin/date +%H:%M:%S",
+          "params": "date +%H:%M%n%S",
           "refresh": 1
         },
         "1b02": { "type": "text_value", "params": "BACK" }
@@ -44,8 +44,8 @@
     },
     "System": {
       "setup": {
-        "1b01": { "type": "text_exec", "params": "/usr/bin/uptime" },
-        "1b02": { "type": "text_exec", "params": "/usr/bin/uname -r" },
+        "1b01": { "type": "text_exec", "params": "uptime" },
+        "1b02": { "type": "text_exec", "params": "uname -r" },
         "1b03": { "type": "clear" }
       },
       "actions": {

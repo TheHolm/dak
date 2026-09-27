@@ -570,5 +570,69 @@ mod tests {
             .describe(&key)
             .contains("another user"));
         assert!(LockError::Timeout(None).describe(&key).contains("10s"));
+        assert_eq!(
+            LockError::Io("boom".into()).describe(&key),
+            "device 0300:3002 s/n S1: cannot lock it: boom"
+        );
+    }
+
+    /// Unknown lines in a holder record (from a newer dak, say) are ignored.
+    #[test]
+    fn holder_records_ignore_unknown_lines() {
+        let text = "pid=1\nfuture=yes\nuid=2\nno separator\nuser=u\nsince=s\n";
+        let holder = Holder::parse(text).unwrap();
+        assert_eq!((holder.pid, holder.uid), (1, 2));
+    }
+
+    /// A fresh scratch directory for the acquire tests.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dak_lockunit_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An I/O error taking the lock (a missing lock directory) is passed through as is,
+    /// whatever the conflict policy.
+    #[tokio::test]
+    async fn acquire_passes_io_errors_through() {
+        let key = DeviceKey::new(1, 2, Some("IO"), "");
+        let stop = crate::control::StopSource::new();
+        let missing = std::env::temp_dir().join("dak_lockunit_does_not_exist/deeper");
+        for conflict in [Conflict::Refuse, Conflict::Wait, Conflict::Replace] {
+            let result = acquire_with_timeout(
+                &missing,
+                &key,
+                conflict,
+                Duration::ZERO,
+                &stop.signal(),
+                |_| panic!("no wait on an I/O error"),
+            )
+            .await;
+            assert!(matches!(result, Err(LockError::Io(_))), "{conflict:?}");
+        }
+    }
+
+    /// `--replace` against a holder that has not written its record yet has nobody to
+    /// signal, so it reports the device busy (the caller may retry) instead of waiting.
+    #[tokio::test]
+    async fn replace_without_a_holder_record_is_busy() {
+        let dir = scratch_dir("norecord");
+        let key = DeviceKey::new(1, 2, Some("NOREC"), "");
+        let held = try_lock(&dir, &key).unwrap();
+        std::fs::write(held.path(), "").unwrap();
+        let stop = crate::control::StopSource::new();
+        let result = acquire_with_timeout(
+            &dir,
+            &key,
+            Conflict::Replace,
+            Duration::ZERO,
+            &stop.signal(),
+            |_| panic!("no wait without a holder"),
+        )
+        .await;
+        assert!(matches!(result, Err(LockError::Busy(None))), "{result:?}");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

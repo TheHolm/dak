@@ -40,6 +40,7 @@ FreeBSD/cross-compiling) and states its own environment inline.
 9. [Font formats and the startup glyph scan](#9-font-formats-and-the-startup-glyph-scan)
 10. [Device lock files shared between users](#10-device-lock-files-shared-between-users)
 11. [Running as a service (systemd, autostart, hooks)](#11-running-as-a-service-systemd-autostart-hooks)
+12. [Measuring test coverage](#12-measuring-test-coverage)
 
 ---
 
@@ -789,6 +790,43 @@ USB passthrough, or FreeBSD's xhci. One suspect: the device was passed through
 on a USB3 port (`usb3=1`) although it is a USB 2.0 high-speed device; retry
 with USB3 off, and on bare metal, before blaming dak.
 
+### v0.14.1 hardware run (FreeBSD 15.1 VM, keypad passed through)
+
+Unplug/re-plug through the hypervisor reconnected and repainted fine this time;
+the "not re-enumerated" problem above did not recur. Everything else passed
+too: `cargo test` with the keypad (hardware tests really ran), `dak --map`,
+presses, turns and scene switches. Two things were found and fixed:
+
+- **SIGHUP lost the keypad.** The `hidraw_bsd` reader thread sat in a blocking
+  `read(2)` that nothing ended on an idle keypad, so after a reload the old
+  session's thread still held `/dev/hidraw0` open (`fstat` showed it, `procstat
+  -kk` showed the thread in `hidraw_read`). `hidraw(4)` allows one open, so
+  rediscovery skipped the device as busy ("defined in config was not found"),
+  and SIGUSR1 did not help. The thread now waits in `poll(2)` for 200 ms at a
+  time (`hidraw_poll` exists and times out properly), stops once its channel's
+  receiver is gone, and `HidrawDevice`'s `Drop` joins it. Joining matters: a
+  version without the join still failed the first reload, because the
+  reconnect happened before the thread noticed. Checked with three SIGHUPs in a
+  row (one `hidraw` fd, steady thread count) and by
+  `tests/hardware_read_loop.rs`'s `reader_releases_the_device_when_dropped`,
+  which fails against the old backend.
+- **Encoder turns "did nothing".** They arrived and ran their actions, but the
+  test config used `$(/usr/bin/expr ...)`, and FreeBSD has `expr` in `/bin`.
+  Validation skipped the missing-program check whenever the command held a
+  `$var`. It now checks the program word unless the program itself is a
+  reference. The shipped examples use bare names found in `PATH`.
+
+Probing `/dev/hidraw0` with a plain C `read`/`poll` loop got no reports at
+all: the keypad only sends input after mirajazz's initialization (brightness,
+clear), so test input paths through dak, not raw.
+
+`dak --map` in a VM: turning an encoder exactly one notch is hard, and a missed
+notch followed by a push used to record the push's release as the second
+direction. The capture now ignores pushes and extra notches; only a change of
+code separates the directions. A timing-based variant (quiet period per
+direction) was tried and dropped: reports of the next step arrived during the
+previous one's window and shifted the whole capture.
+
 ---
 
 ## 8. Package licence files (`debian/copyright`)
@@ -963,3 +1001,52 @@ never drive the same device. Things learned while building it:
   matches `attach` on vendor/product; `attach` fires before `hidraw` is ready on
   some systems - if so, dak's rescan simply retries on its reconnect interval.
 - `--detach` is for autostart/xinitrc and hand starts; systemd must not use it.
+
+---
+
+## 12. Measuring test coverage
+
+Environment: `cargo-llvm-cov` 0.9.x with the `llvm-tools` rustup component, on
+Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg's
+`rust` has no llvm-tools). Last measured for v0.14.1: 95.6% of lines on Linux.
+
+- Run `cargo llvm-cov --summary-only` (`--show-missing-lines` for line numbers,
+  `--no-fail-fast` to get a report despite a failing test). Point
+  `CARGO_LLVM_COV_TARGET_DIR` somewhere outside the repo to keep the instrumented
+  build (slow: the first one takes well over 10 minutes) apart from `target/`.
+- **Stale profiles.** Reusing a coverage target dir after large source changes
+  produced nonsense totals (files reported with more lines than they have, 66%
+  overall) even after `cargo llvm-cov clean --workspace`. A fresh target dir gave
+  the real numbers. If a file's line total does not roughly match `wc -l`, start
+  from an empty target dir.
+- **Forked daemon.** Code that only runs in the `--detach` daemon *is* counted.
+  Checked by running the instrumented binary with
+  `LLVM_PROFILE_FILE=.../dak-%p-%m.profraw`: only one file appeared (named after the
+  parent's pid), yet `serve`'s READY/readiness lines, which only the daemon runs,
+  had counts in it. The forked child keeps writing to the profile file it inherited.
+  So `daemon.rs`'s remaining misses are the real failure branches
+  (`pipe`/`fork`/`setsid`/`chdir`/`dup2` errors), not a measuring gap.
+- **Spawned test processes and pipes.** Tests that spawn `dak` (or `sleep` from an
+  action) keep inherited stdout/stderr open. Running `cargo test ... | tail` then
+  waits for those children too, and an agent's shell tool can look hung. Redirect
+  to a file and use `</dev/null`.
+- **FreeBSD.** `cargo install cargo-llvm-cov` and the instrumented run work
+  natively. `vendor/*` is not in the report (path dependencies that are not
+  workspace members are excluded), so the FreeBSD HID backend has no numbers.
+  FreeBSD-only lines in `src/`: the non-Linux `@abstract` `NOTIFY_SOCKET` branch in
+  `daemon::notify_to` (untested), and `lock_dir`'s `/tmp` fallback (covered there,
+  since FreeBSD has no `/run/lock`).
+- **Unreachable on purpose.** Roughly 250 lines are `unreachable!` arms,
+  syscall-failure branches, `Default`/`Debug` boilerplate, and the hardware glue
+  listed under "Status / known gaps" in `AGENTS.md`. Do not add tests just to hit
+  these.
+- **Parallel-test races seen while raising coverage** (both fixed in v0.14.1):
+  1. A lock file just released can look held for a moment. Another test's `fork`
+     briefly copies the fd, which stays open until `exec` closes it (`O_CLOEXEC`).
+     Tests that release and retake a lock must retry (see `lock_frees_up`,
+     `rescan_until_done`).
+  2. `Supervisor::run` used to sample the reload/rescan counters itself, after
+     `READY=1`. A SIGUSR1/SIGHUP arriving right after READY was counted before the
+     sample and silently dropped. That was a real bug, seen on FreeBSD under
+     parallel load. The counters are now sampled in `Supervisor::new`.
+

@@ -2739,3 +2739,86 @@ async fn set_text_settings_fonts_are_used() {
     assert!(custom > plain * 11 / 10, "custom {custom} vs plain {plain}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- remaining edge cases --
+
+/// A `text_value` draw the device refuses is logged and does not stop the scene: the
+/// trailing flush still runs (the `text_value` counterpart of
+/// `text_op_write_failure_is_logged`).
+#[tokio::test]
+async fn text_value_write_failure_is_logged() {
+    let device = FailingButtonDevice::default();
+    device.fail_image_writes(true);
+    let (mut runner, _exec_rx) = redraw_runner(&device);
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "hi" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    assert_eq!(device.attempts(), vec!["SetImage", "Flush"]);
+}
+
+/// A malformed markup tag is drawn as written (a warning is logged) rather than
+/// failing the button.
+#[tokio::test]
+async fn malformed_markup_is_drawn_literally() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "#[bogus" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    let image = mock.last_image(0).expect("the text is still drawn");
+    assert!(ink(&image) > 0, "the literal tag text is visible");
+    assert!(!is_red_label(&image), "no error label");
+}
+
+/// A refresh tick for a button without any operation does nothing, and one for an
+/// operation applied directly (no raw source from `enter_scene`) redraws the applied
+/// operation.
+#[tokio::test]
+async fn refresh_without_raw_source_uses_the_applied_operation() {
+    let mock = MockButtonDevice::default();
+    let mut runner = text_runner(&mock);
+    runner.refresh_button(3).await.unwrap();
+    assert!(mock.calls().is_empty(), "nothing to refresh");
+
+    let scenes = scenes_with_buttons(json!({
+        "1b02": { "type": "text_value", "params": "hi" }
+    }));
+    let operations = dak::actions::scene_operations("main", &scenes).unwrap();
+    runner.apply_scene_operations(&operations).await.unwrap();
+    mock.calls.lock().unwrap().clear();
+    runner.refresh_button(2).await.unwrap();
+    assert_eq!(mock.kinds(&mock.calls()), ["SetImage", "Flush"]);
+    assert_eq!(mock.keys(&mock.calls()), [1]);
+}
+
+/// `redraw_all` skips (with a warning) a button whose params no longer resolve - here
+/// its variable is gone from the variables swapped in since - and still repaints the
+/// others and flushes.
+#[tokio::test]
+async fn redraw_all_skips_buttons_that_no_longer_resolve() {
+    let mock = MockButtonDevice::default();
+    let (mut runner, _exec_rx) = redraw_runner(&mock);
+    let mut defs = std::collections::BTreeMap::new();
+    defs.insert("name".to_string(), VarDef::string(20, "one".to_string()));
+    runner.set_variables(std::sync::Arc::new(Mutex::new(Variables::new(
+        defs,
+        &Defaults::default(),
+    ))));
+    let scenes = scenes_with_buttons(json!({
+        "1b01": { "type": "text_value", "params": "n=$name" },
+        "1b02": { "type": "text_value", "params": "fixed" }
+    }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+    runner.set_variables(std::sync::Arc::new(Mutex::new(Variables::new(
+        std::collections::BTreeMap::new(),
+        &Defaults::default(),
+    ))));
+    mock.calls.lock().unwrap().clear();
+
+    runner.redraw_all().await.unwrap();
+    let calls = mock.calls();
+    assert_eq!(mock.kinds(&calls), ["SetImage", "Flush"]);
+    assert_eq!(mock.keys(&calls), [1], "only the resolvable button");
+}

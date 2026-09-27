@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 // separately from the library crate, so it needs its own copy of the rename.
 #[cfg(target_os = "freebsd")]
 extern crate mirajazz_freebsd as mirajazz;
+// Only the tests build fake device descriptions, which need async-hid's `DeviceId`.
+#[cfg(all(test, target_os = "freebsd"))]
+extern crate async_hid_freebsd as async_hid;
 
 use clap::Parser;
 use mirajazz::{
@@ -78,7 +81,7 @@ fn run(cli: Cli, log: Log) -> u8 {
                 Ok(()) => exit::SUCCESS,
                 Err(MapError::Device(MirajazzError::DeviceNotFoundError)) => exit::NO_DEVICE,
                 Err(MapError::Busy) => exit::DEVICE_BUSY,
-                Err(MapError::Device(error)) => {
+                Err(error) => {
                     log.error(error);
                     exit::FAILURE
                 }
@@ -437,6 +440,13 @@ struct Supervisor<'a> {
     ),
     /// The first failure status seen.
     status: u8,
+    /// The reload count already acted on. Taken when the supervisor is created (right
+    /// after the signal handler is installed), not when [`Supervisor::run`] starts, so
+    /// a `SIGHUP` arriving during startup - before or after `READY=1` - is still acted
+    /// on once `run` begins.
+    reload_seen: u64,
+    /// The rescan count already acted on; see `reload_seen`.
+    rescan_seen: u64,
 }
 
 impl<'a> Supervisor<'a> {
@@ -453,7 +463,10 @@ impl<'a> Supervisor<'a> {
             &config.defaults,
         )));
         let (generation, quit_watch) = new_generation(&controller);
+        let requested = controller.state();
         Self {
+            reload_seen: requested.reload,
+            rescan_seen: requested.rescan,
             config: Arc::new(config),
             variables,
             log,
@@ -631,8 +644,6 @@ impl<'a> Supervisor<'a> {
     /// Reacts to signals and task ends until the program should exit; returns the
     /// exit status.
     async fn run(&mut self) -> u8 {
-        let mut reload_seen = self.controller.state().reload;
-        let mut rescan_seen = self.controller.state().rescan;
         loop {
             if self.idle() {
                 if !self.service {
@@ -656,12 +667,12 @@ impl<'a> Supervisor<'a> {
                     self.stop_all(true).await;
                     return self.status;
                 }
-                seen = controller.reload_after(reload_seen) => {
-                    reload_seen = seen;
+                seen = controller.reload_after(self.reload_seen) => {
+                    self.reload_seen = seen;
                     self.reload().await;
                 }
-                seen = controller.rescan_after(rescan_seen) => {
-                    rescan_seen = seen;
+                seen = controller.rescan_after(self.rescan_seen) => {
+                    self.rescan_seen = seen;
                     self.rescan().await;
                 }
                 Some(joined) = self.tasks.join_next(), if !self.tasks.is_empty() => {
@@ -1117,11 +1128,11 @@ async fn run_device(
     drop(connected);
 
     // async image_exec/text_exec results land on buttons through this runner and its channel
-    let (exec_tx, mut exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
+    let (exec_tx, exec_rx) = mpsc::channel::<actions::ExecEvent>(8);
 
     // A button with a nonzero `refresh_seconds` sends its own key here once its
     // interval elapses; the runner redraws just that button and re-arms the next tick.
-    let (refresh_tx, mut refresh_rx) = mpsc::channel::<u8>(8);
+    let (refresh_tx, refresh_rx) = mpsc::channel::<u8>(8);
 
     // Buttons this device model has no display on; assigning an image to them is
     // pointless, so the runner warns, skips the work and the transfer.
@@ -1147,51 +1158,29 @@ async fn run_device(
     runner.set_variables(variables.clone());
     runner.set_text_settings(defaults.markup, fonts);
 
-    // Complex press events (short/long press, double click): the detector decides
-    // which event each press or release produces. Widgets are addressed by their
-    // reference, so buttons and pushed encoders share one registry; only the short
-    // press outlives its release — it is confirmed through this channel after the
-    // double-click gap — so a second press inside the gap can cancel the first
-    // click's pending confirmation.
-    let (click_tx, mut click_rx) = mpsc::channel::<(Reference, ClickEvent)>(8);
-    let mut click_detector = ClickDetector::new(&defaults);
-    let mut pending_shorts: HashMap<Reference, PendingShortPress> = HashMap::new();
-
-    if let Err(error) = runner.enter_scene("on_start", &scenes).await {
-        warn_unless_disconnected(
-            log,
-            &runner,
-            format!("failed to apply on_start scene: {error}"),
-        );
-    }
-
-    // Flush. A failure is not fatal: if the device already went away, the input loop
-    // below notices and waits for it to come back.
-    if let Err(error) = device.flush().await {
-        warn_unless_disconnected(
-            log,
-            &runner,
-            format!("failed to flush on_start scene: {error}"),
-        );
-    }
-
+    // Complex press events (short/long press, double click) are confirmed through the
+    // click channel, scene timers fire through the timer channel; see `Session`.
+    let (click_tx, click_rx) = mpsc::channel::<(Reference, ClickEvent)>(8);
+    let (timer_tx, timer_rx) = mpsc::channel::<Vec<String>>(1);
+    let mut session = Session::new(
+        device_number,
+        definition,
+        runner,
+        scenes,
+        defaults,
+        variables.clone(),
+        click_tx,
+        timer_tx,
+        log,
+    );
+    session.enter_on_start(&device).await;
     start.report(Started::Connected);
-
-    let mut current_scene = String::from("on_start");
-    // Button and pushed-encoder controls currently held down, so repeated press
-    // reports of the same widget are not re-dispatched and releases without a
-    // press are ignored.
-    let mut down_controls: std::collections::HashSet<Reference> = std::collections::HashSet::new();
-
-    // Timer events are delivered through a channel so the input loop can react to
-    // them without blocking on the device reader.
-    let (timer_tx, mut timer_rx) = mpsc::channel::<Vec<String>>(1);
-    let mut timer_handle =
-        arm_scene_timer(&current_scene, &scenes, &timer_tx, log, &variables).await;
-
-    // Actions are inherited from the previously active scene (see `action_for_event`),
-    // so the scene we came from is remembered across scene switches.
-    let mut previous_scene: Option<String> = None;
+    let mut channels = SessionChannels {
+        timer_rx,
+        click_rx,
+        exec_rx,
+        refresh_rx,
+    };
 
     // One pass per connection: the input loop runs until the program is told to stop
     // (a stop signal, a closed channel) or the device goes away; then this waits for the
@@ -1204,11 +1193,13 @@ async fn run_device(
             // Lost again while repainting after a reconnect.
             match await_reconnect(
                 device_number,
-                &definition,
-                &device_info,
-                protocol_version,
+                &ReopenDevice {
+                    definition: &session.definition,
+                    protocol_version,
+                },
+                &device_info.name,
                 &device,
-                &mut runner,
+                &mut session.runner,
                 &variables,
                 log,
                 "device lost while reconnecting",
@@ -1222,231 +1213,25 @@ async fn run_device(
                 Reconnect::Cancelled => return Ok(()),
             }
         };
-        let end = loop {
-            tokio::select! {
-                data_result = reader.raw_read_data(512) => {
-                    let data = match data_result {
-                        Ok(data) => data,
-                        Err(error) => break SessionEnd::Disconnected(error.to_string()),
-                    };
-                    if !data.starts_with(&[65, 67, 75]) {
-                        continue;
-                    }
-                    // The raw code in the report names a widget by its captured
-                    // press/release or turn code, not by its number (buttons without a
-                    // display report far larger codes). Translate it through the
-                    // definition and skip reports that no widget uses.
-                    let code = data[9];
-                    let pressed = data[10] != 0;
-                    let state = if pressed { "pressed" } else { "released" };
-                    log.debug(
-                        Subsystem::Device,
-                        format!("Key {code}, {state}"),
-                    );
-
-                    let Some(event) = definition.control_event(code, pressed) else {
-                        log.debug(
-                            Subsystem::Device,
-                            format!("no control uses raw code {code}; skipping"),
-                        );
-                        continue;
-                    };
-
-                    match event {
-                        ControlEvent::Button { number } => {
-                            if number > definition.key_count {
-                                log.debug(
-                                    Subsystem::Device,
-                                    format!("button {number} is out of range (device has {} buttons); skipping", definition.key_count),
-                                );
-                                continue;
-                            }
-                            let reference = Reference::button(device_number, number);
-                            run_pressable_edge(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &reference,
-                                pressed,
-                                &mut down_controls,
-                                &mut click_detector,
-                                &click_tx,
-                                &mut pending_shorts,
-                                &defaults,
-                                &mut timer_handle,
-                                &timer_tx,
-                                &variables,
-                            )
-                            .await;
-                        }
-                        ControlEvent::EncoderPress { number } => {
-                            if number > definition.encoder_count {
-                                log.debug(
-                                    Subsystem::Device,
-                                    format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
-                                );
-                                continue;
-                            }
-                            let reference = Reference::encoder(device_number, number);
-                            run_pressable_edge(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &reference,
-                                pressed,
-                                &mut down_controls,
-                                &mut click_detector,
-                                &click_tx,
-                                &mut pending_shorts,
-                                &defaults,
-                                &mut timer_handle,
-                                &timer_tx,
-                                &variables,
-                            )
-                            .await;
-                        }
-                        ControlEvent::EncoderTurn { number, direction } => {
-                            if number > definition.encoder_count {
-                                log.debug(
-                                    Subsystem::Device,
-                                    format!("encoder {number} is out of range (device has {} encoders); skipping", definition.encoder_count),
-                                );
-                                continue;
-                            }
-                            let event = match direction {
-                                TwistDirection::Clockwise => "turn_cw",
-                                TwistDirection::CounterClockwise => "turn_ccw",
-                            };
-                            run_bound_action(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &Reference::encoder(device_number, number),
-                                event,
-                                &mut timer_handle,
-                                &timer_tx,
-                                &variables,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                action = timer_rx.recv() => {
-                    let Some(actions) = action else {
-                        break SessionEnd::Quit;
-                    };
-                    log.debug(
-                        Subsystem::Actions,
-                        format!("timer for scene \"{current_scene}\" -> {actions:?}"),
-                    );
-                    let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
-                    run_actions(
-                        log,
-                        &mut runner,
-                        &mut current_scene,
-                        &mut previous_scene,
-                        &scenes,
-                        &actions,
-                        &mut timer_handle,
-                        &timer_tx,
-                        &variables,
-                    )
-                    .await;
-                }
-                click = click_rx.recv() => {
-                    let Some((pending_reference, event)) = click else {
-                        break SessionEnd::Quit;
-                    };
-                    // The confirmation task finished on its own; drop its handle.
-                    pending_shorts.remove(&pending_reference);
-                    click_detector.confirm_single();
-                    match event {
-                        ClickEvent::ShortPress => {
-                            log.debug(
-                                Subsystem::Device,
-                                format!("{pending_reference} single press detected"),
-                            );
-                            run_bound_action(
-                                log,
-                                &mut runner,
-                                &mut current_scene,
-                                &mut previous_scene,
-                                &scenes,
-                                &pending_reference,
-                                "short_press",
-                                &mut timer_handle,
-                                &timer_tx,
-                                &variables,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                event = exec_rx.recv() => {
-                    let Some(event) = event else {
-                        break SessionEnd::Quit;
-                    };
-                    match event {
-                        actions::ExecEvent::Assignment(completed) => {
-                            apply_completed_assignment(completed, &variables, &mut runner, log).await;
-                        }
-                        event => runner.handle_exec_event(event).await,
-                    }
-                }
-                key = refresh_rx.recv() => {
-                    let Some(key) = key else {
-                        break SessionEnd::Quit;
-                    };
-                    log.debug(
-                        Subsystem::Scene,
-                        format!("refresh tick for button {key}"),
-                    );
-                    if let Err(error) = runner.refresh_button(key).await {
-                        warn_unless_disconnected(
-                            log,
-                            &runner,
-                            format!("failed to refresh button {key}: {error}"),
-                        );
-                    }
-                }
-                _ = stop.stopped() => {
-                    // A stop signal (SIGINT/SIGTERM, see `control`): route it through
-                    // the same break so the cleanup + shutdown below run.
-                    break SessionEnd::Quit;
-                }
-                _ = device.disconnected() => {
-                    // A draw/flush noticed the device is gone before the reader did.
-                    break SessionEnd::Disconnected("device stopped responding".to_string());
-                }
-            }
-        };
+        let end = session
+            .run_connection(&reader, &mut channels, &stop, &device)
+            .await;
         // The reader holds the connection's input handle open; it must go before any
         // reconnect can open the device again.
         drop(reader);
         match end {
             SessionEnd::Quit => break 'connection,
             SessionEnd::Disconnected(reason) => {
-                // A control held down when the device vanished never reports its release,
-                // and pending short-press confirmations belong to the lost connection.
-                down_controls.clear();
-                for (_, pending) in pending_shorts.drain() {
-                    pending.alive.store(false, Ordering::SeqCst);
-                    pending.handle.abort();
-                }
-                click_detector = ClickDetector::new(&defaults);
+                session.reset_after_disconnect();
                 match await_reconnect(
                     device_number,
-                    &definition,
-                    &device_info,
-                    protocol_version,
+                    &ReopenDevice {
+                        definition: &session.definition,
+                        protocol_version,
+                    },
+                    &device_info.name,
                     &device,
-                    &mut runner,
+                    &mut session.runner,
                     &variables,
                     log,
                     &reason,
@@ -1464,6 +1249,7 @@ async fn run_device(
             }
         }
     }
+    let runner = &mut session.runner;
 
     // Restore the buttons this program touched: clear the image on every button whose
     // image the session changed, then flush. Buttons never changed are left alone - and
@@ -1472,7 +1258,7 @@ async fn run_device(
         if let Err(error) = runner.clear_changed_button_images().await {
             warn_unless_disconnected(
                 log,
-                &runner,
+                runner,
                 format!("failed to restore changed buttons: {error}"),
             );
         }
@@ -1492,6 +1278,361 @@ async fn run_device(
         ),
     }
     Ok(())
+}
+
+/// What one control report resolves to, see [`route`].
+#[derive(Debug, PartialEq)]
+enum Dispatch {
+    /// A press or release edge of a pressable control (a button or a pushed encoder).
+    Edge(Reference),
+    /// An encoder turn, with its event name (`turn_cw`/`turn_ccw`).
+    Turn(Reference, &'static str),
+}
+
+/// Resolves the raw `code` of a report from device `device_number` through its
+/// `definition` to the control it names, or `None` (logged as debug output) when no
+/// control uses the code or the control is beyond the definition's counts.
+///
+/// The raw code names a widget by its captured press/release or turn code, not by its
+/// number (buttons without a display report far larger codes).
+fn route(
+    definition: &Mapping,
+    device_number: u8,
+    code: u8,
+    pressed: bool,
+    log: Log,
+) -> Option<Dispatch> {
+    let Some(event) = definition.control_event(code, pressed) else {
+        log.debug(
+            Subsystem::Device,
+            format!("no control uses raw code {code}; skipping"),
+        );
+        return None;
+    };
+    let (number, count, what) = match event {
+        ControlEvent::Button { number } => (number, definition.key_count, "button"),
+        ControlEvent::EncoderPress { number } | ControlEvent::EncoderTurn { number, .. } => {
+            (number, definition.encoder_count, "encoder")
+        }
+    };
+    if number > count {
+        log.debug(
+            Subsystem::Device,
+            format!("{what} {number} is out of range (device has {count} {what}s); skipping"),
+        );
+        return None;
+    }
+    Some(match event {
+        ControlEvent::Button { number } => Dispatch::Edge(Reference::button(device_number, number)),
+        ControlEvent::EncoderPress { number } => {
+            Dispatch::Edge(Reference::encoder(device_number, number))
+        }
+        ControlEvent::EncoderTurn { number, direction } => Dispatch::Turn(
+            Reference::encoder(device_number, number),
+            match direction {
+                TwistDirection::Clockwise => "turn_cw",
+                TwistDirection::CounterClockwise => "turn_ccw",
+            },
+        ),
+    })
+}
+
+/// The receiving ends of a device session's event channels (their senders live in the
+/// [`Session`], its runner and the tasks they spawn).
+struct SessionChannels {
+    /// Scene timer deliveries.
+    timer_rx: mpsc::Receiver<Vec<String>>,
+    /// Confirmed short presses.
+    click_rx: mpsc::Receiver<(Reference, ClickEvent)>,
+    /// `*_exec` results and completed `$(...)` assignments.
+    exec_rx: mpsc::Receiver<actions::ExecEvent>,
+    /// Refresh ticks of buttons with `refresh_seconds`.
+    refresh_rx: mpsc::Receiver<u8>,
+}
+
+/// One device's input-loop state, kept across its connections: the scene runner, the
+/// current and previous scene, the press-detection state and the scene timer.
+///
+/// [`run_device`] owns the connection side (connecting, reconnecting, the reader); every
+/// event is handed to one of the `on_*` methods, which is what the tests drive.
+struct Session<'r, D: ButtonDevice> {
+    /// The output filter.
+    log: Log,
+    /// The number the device's definition is keyed under.
+    device_number: u8,
+    /// The device's config definition (raw code to control translation, counts).
+    definition: Mapping,
+    /// Draws the scenes on the device.
+    runner: actions::SceneRunner<'r, D>,
+    /// The config's scenes.
+    scenes: Value,
+    /// The press-detection timing knobs.
+    defaults: Defaults,
+    /// The shared variable/default state.
+    variables: Arc<std::sync::Mutex<Variables>>,
+    /// The active scene.
+    current_scene: String,
+    /// The scene switched away from last; its actions are inherited (see
+    /// `actions::action_for_event`).
+    previous_scene: Option<String>,
+    /// Pressable controls currently held down, so repeated press reports of the same
+    /// widget are not re-dispatched and releases without a press are ignored.
+    down_controls: std::collections::HashSet<Reference>,
+    /// Decides which complex press event each press or release produces.
+    click_detector: ClickDetector,
+    /// Where delayed short-press confirmations are sent.
+    click_tx: mpsc::Sender<(Reference, ClickEvent)>,
+    /// Short presses waiting out the double-click gap.
+    pending_shorts: HashMap<Reference, PendingShortPress>,
+    /// The armed scene timer, if any.
+    timer_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Where the scene timer delivers its actions.
+    timer_tx: mpsc::Sender<Vec<String>>,
+}
+
+impl<'r, D: ButtonDevice> Session<'r, D> {
+    /// A session in the `on_start` scene (not yet drawn, see
+    /// [`Session::enter_on_start`]).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        device_number: u8,
+        definition: Mapping,
+        runner: actions::SceneRunner<'r, D>,
+        scenes: Value,
+        defaults: Defaults,
+        variables: Arc<std::sync::Mutex<Variables>>,
+        click_tx: mpsc::Sender<(Reference, ClickEvent)>,
+        timer_tx: mpsc::Sender<Vec<String>>,
+        log: Log,
+    ) -> Self {
+        let click_detector = ClickDetector::new(&defaults);
+        Self {
+            log,
+            device_number,
+            definition,
+            runner,
+            scenes,
+            defaults,
+            variables,
+            current_scene: String::from("on_start"),
+            previous_scene: None,
+            down_controls: std::collections::HashSet::new(),
+            click_detector,
+            click_tx,
+            pending_shorts: HashMap::new(),
+            timer_handle: None,
+            timer_tx,
+        }
+    }
+
+    /// Draws the `on_start` scene, flushes it to `device` and arms its timer. Draw
+    /// failures are not fatal: a device that already went away is noticed by the input
+    /// loop, which waits for it to come back.
+    async fn enter_on_start(&mut self, device: &impl ButtonDevice) {
+        let log = self.log;
+        if let Err(error) = self.runner.enter_scene("on_start", &self.scenes).await {
+            warn_unless_disconnected(
+                log,
+                &self.runner,
+                format!("failed to apply on_start scene: {error}"),
+            );
+        }
+        if let Err(error) = device.flush().await {
+            warn_unless_disconnected(
+                log,
+                &self.runner,
+                format!("failed to flush on_start scene: {error}"),
+            );
+        }
+        self.timer_handle = arm_scene_timer(
+            &self.current_scene,
+            &self.scenes,
+            &self.timer_tx,
+            log,
+            &self.variables,
+        )
+        .await;
+    }
+
+    /// Handles one raw input report: noise is skipped, a control's press/release goes
+    /// through the press detection, an encoder turn runs its `turn_cw`/`turn_ccw`
+    /// actions.
+    async fn on_report(&mut self, data: &[u8]) {
+        let Some((code, state)) = dak::input::decode_report(data) else {
+            return;
+        };
+        let pressed = state != 0;
+        let log = self.log;
+        log.debug(
+            Subsystem::Device,
+            format!(
+                "Key {code}, {}",
+                if pressed { "pressed" } else { "released" }
+            ),
+        );
+        match route(&self.definition, self.device_number, code, pressed, log) {
+            Some(Dispatch::Edge(reference)) => {
+                run_pressable_edge(
+                    log,
+                    &mut self.runner,
+                    &mut self.current_scene,
+                    &mut self.previous_scene,
+                    &self.scenes,
+                    &reference,
+                    pressed,
+                    &mut self.down_controls,
+                    &mut self.click_detector,
+                    &self.click_tx,
+                    &mut self.pending_shorts,
+                    &self.defaults,
+                    &mut self.timer_handle,
+                    &self.timer_tx,
+                    &self.variables,
+                )
+                .await;
+            }
+            Some(Dispatch::Turn(reference, event)) => {
+                self.run_bound(&reference, event).await;
+            }
+            None => {}
+        }
+    }
+
+    /// Runs the actions `reference` has bound to `event` in the current scene.
+    async fn run_bound(&mut self, reference: &Reference, event: &str) {
+        run_bound_action(
+            self.log,
+            &mut self.runner,
+            &mut self.current_scene,
+            &mut self.previous_scene,
+            &self.scenes,
+            reference,
+            event,
+            &mut self.timer_handle,
+            &self.timer_tx,
+            &self.variables,
+        )
+        .await;
+    }
+
+    /// Runs the actions a scene timer delivered.
+    async fn on_timer(&mut self, actions: Vec<String>) {
+        self.log.debug(
+            Subsystem::Actions,
+            format!("timer for scene \"{}\" -> {actions:?}", self.current_scene),
+        );
+        let actions: Vec<&str> = actions.iter().map(String::as_str).collect();
+        run_actions(
+            self.log,
+            &mut self.runner,
+            &mut self.current_scene,
+            &mut self.previous_scene,
+            &self.scenes,
+            &actions,
+            &mut self.timer_handle,
+            &self.timer_tx,
+            &self.variables,
+        )
+        .await;
+    }
+
+    /// A short press confirmed after the double-click gap: runs its `short_press`
+    /// actions.
+    async fn on_click(&mut self, reference: Reference, event: ClickEvent) {
+        // The confirmation task finished on its own; drop its handle.
+        self.pending_shorts.remove(&reference);
+        self.click_detector.confirm_single();
+        match event {
+            ClickEvent::ShortPress => {
+                self.log.debug(
+                    Subsystem::Device,
+                    format!("{reference} single press detected"),
+                );
+                self.run_bound(&reference, "short_press").await;
+            }
+        }
+    }
+
+    /// An `*_exec` result lands on its button; a finished `$(...)` assignment is
+    /// applied.
+    async fn on_exec(&mut self, event: actions::ExecEvent) {
+        match event {
+            actions::ExecEvent::Assignment(completed) => {
+                apply_completed_assignment(completed, &self.variables, &mut self.runner, self.log)
+                    .await;
+            }
+            event => self.runner.handle_exec_event(event).await,
+        }
+    }
+
+    /// A refresh tick: redraws that one button.
+    async fn on_refresh(&mut self, key: u8) {
+        self.log
+            .debug(Subsystem::Scene, format!("refresh tick for button {key}"));
+        if let Err(error) = self.runner.refresh_button(key).await {
+            warn_unless_disconnected(
+                self.log,
+                &self.runner,
+                format!("failed to refresh button {key}: {error}"),
+            );
+        }
+    }
+
+    /// Forgets the press state of a lost connection: a control held down when the
+    /// device vanished never reports its release, and pending short-press
+    /// confirmations belong to the old connection.
+    fn reset_after_disconnect(&mut self) {
+        self.down_controls.clear();
+        for (_, pending) in self.pending_shorts.drain() {
+            pending.alive.store(false, Ordering::SeqCst);
+            pending.handle.abort();
+        }
+        self.click_detector = ClickDetector::new(&self.defaults);
+    }
+
+    /// The input loop of one connection: hands every report from `reader` and every
+    /// channel event to its `on_*` handler until `stop` fires or a channel closes
+    /// ([`SessionEnd::Quit`]), or the connection is lost - the reader fails, or a draw
+    /// noticed `device` is gone ([`SessionEnd::Disconnected`]).
+    async fn run_connection<C: ButtonDevice>(
+        &mut self,
+        reader: &impl dak::input::InputSource,
+        channels: &mut SessionChannels,
+        stop: &StopSignal,
+        device: &SwappableDevice<C>,
+    ) -> SessionEnd {
+        loop {
+            tokio::select! {
+                report = reader.read_report() => match report {
+                    Ok(data) => self.on_report(&data).await,
+                    Err(error) => return SessionEnd::Disconnected(error.to_string()),
+                },
+                actions = channels.timer_rx.recv() => match actions {
+                    Some(actions) => self.on_timer(actions).await,
+                    None => return SessionEnd::Quit,
+                },
+                click = channels.click_rx.recv() => match click {
+                    Some((reference, event)) => self.on_click(reference, event).await,
+                    None => return SessionEnd::Quit,
+                },
+                event = channels.exec_rx.recv() => match event {
+                    Some(event) => self.on_exec(event).await,
+                    None => return SessionEnd::Quit,
+                },
+                key = channels.refresh_rx.recv() => match key {
+                    Some(key) => self.on_refresh(key).await,
+                    None => return SessionEnd::Quit,
+                },
+                // A stop signal (SIGINT/SIGTERM, see `control`): the cleanup and
+                // shutdown in `run_device` still run.
+                _ = stop.stopped() => return SessionEnd::Quit,
+                // A draw/flush noticed the device is gone before the reader did.
+                _ = device.disconnected() => {
+                    return SessionEnd::Disconnected("device stopped responding".to_string());
+                }
+            }
+        }
+    }
 }
 
 /// Warns about a failed device write, unless the device is known to be gone, in which
@@ -1583,13 +1724,12 @@ fn current_brightness(variables: &std::sync::Mutex<Variables>) -> (u8, u8) {
 /// printed. Scene, timer and variable state is untouched throughout, so input simply
 /// carries on where it left off.
 #[allow(clippy::too_many_arguments)]
-async fn await_reconnect(
+async fn await_reconnect<R: Reopen>(
     device_number: u8,
-    definition: &Mapping,
-    original_info: &HidDeviceInfo,
-    protocol_version: usize,
-    device: &SwappableDevice<Device>,
-    runner: &mut actions::SceneRunner<'_, SwappableDevice<Device>>,
+    reopen: &R,
+    original_name: &str,
+    device: &SwappableDevice<R::Connection>,
+    runner: &mut actions::SceneRunner<'_, SwappableDevice<R::Connection>>,
     variables: &std::sync::Mutex<Variables>,
     log: Log,
     reason: &str,
@@ -1605,43 +1745,24 @@ async fn await_reconnect(
         } else {
             format!("attempt {number}/{}", policy.max_attempts)
         };
-        let devices = match list_devices(&hardware::QUERIES).await {
-            Ok(devices) => devices,
-            Err(error) => {
+        let (button_brightness, encoder_brightness) = current_brightness(variables);
+        match reopen.reopen(button_brightness, encoder_brightness).await {
+            Ok(Some(reopened)) => Some(reopened),
+            Ok(None) => {
+                log.debug(
+                    Subsystem::Device,
+                    format!("device #{device_number}: not back yet ({of})"),
+                );
+                None
+            }
+            Err(ReopenError::Discovery(error)) => {
                 log.debug(
                     Subsystem::Device,
                     format!("device #{device_number}: discovery failed ({of}): {error}"),
                 );
-                return None;
+                None
             }
-        };
-        let info = devices.into_iter().find(|dev| {
-            actions::discovered_device_matches(
-                definition,
-                &dev.serial_number,
-                dev.vendor_id,
-                dev.product_id,
-            )
-        });
-        let Some(info) = info else {
-            log.debug(
-                Subsystem::Device,
-                format!("device #{device_number}: not back yet ({of})"),
-            );
-            return None;
-        };
-        let (button_brightness, encoder_brightness) = current_brightness(variables);
-        match connect_device(
-            &info,
-            definition,
-            protocol_version,
-            button_brightness,
-            encoder_brightness,
-        )
-        .await
-        {
-            Ok(connection) => Some((connection, info)),
-            Err(error) => {
+            Err(ReopenError::Connect(error)) => {
                 // Typically the device is enumerated but not ready to open yet.
                 log.debug(
                     Subsystem::Device,
@@ -1651,7 +1772,7 @@ async fn await_reconnect(
             }
         }
     };
-    let (connection, info) = loop {
+    let reopened = loop {
         match reconnect::wait_until(policy, attempt, stop.stopped()).await {
             reconnect::WaitOutcome::Found(found) => break found,
             reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
@@ -1668,13 +1789,13 @@ async fn await_reconnect(
             }
         }
     };
-    let name = if info.name.is_empty() {
-        original_info.name.clone()
+    let name = if reopened.name.is_empty() {
+        original_name
     } else {
-        info.name.clone()
+        &reopened.name
     };
-    let serial = connection.serial_number().clone();
-    device.replace(connection);
+    let (name, serial) = (name.to_string(), reopened.serial);
+    device.replace(reopened.connection);
     log.info(reconnect::reconnected_message(
         device_number,
         &name,
@@ -1686,6 +1807,90 @@ async fn await_reconnect(
         ));
     }
     Reconnect::Reconnected
+}
+
+/// A connection [`Reopen::reopen`] opened, with what the reconnect message names.
+struct Reopened<C> {
+    /// The fresh, initialized connection.
+    connection: C,
+    /// The device name the rediscovered device reports (may be empty).
+    name: String,
+    /// Its serial number, as the connection reports it.
+    serial: String,
+}
+
+/// Why one reopen attempt failed (both are retried; they only log differently).
+#[derive(Debug)]
+enum ReopenError {
+    /// Listing the attached devices failed.
+    Discovery(String),
+    /// The device is back but could not be opened (yet).
+    Connect(String),
+}
+
+/// One attempt at getting a lost device back, for [`await_reconnect`]: the real
+/// implementation ([`ReopenDevice`]) rediscovers the keypad and connects to it; tests
+/// script the outcomes.
+#[allow(async_fn_in_trait)]
+trait Reopen: Sync {
+    /// The connection type the device is driven through.
+    type Connection: ButtonDevice;
+
+    /// Looks for the device once and opens it with the given brightnesses: `Ok(None)`
+    /// when it is not back yet.
+    async fn reopen(
+        &self,
+        button_brightness: u8,
+        encoder_brightness: u8,
+    ) -> Result<Option<Reopened<Self::Connection>>, ReopenError>;
+}
+
+/// Reopens a real keypad: the first discovered device matching `definition`, connected
+/// like at startup (see [`connect_device`]).
+struct ReopenDevice<'a> {
+    /// The lost device's config definition.
+    definition: &'a Mapping,
+    /// The protocol version it was connected with.
+    protocol_version: usize,
+}
+
+impl Reopen for ReopenDevice<'_> {
+    type Connection = Device;
+
+    async fn reopen(
+        &self,
+        button_brightness: u8,
+        encoder_brightness: u8,
+    ) -> Result<Option<Reopened<Device>>, ReopenError> {
+        let devices = list_devices(&hardware::QUERIES)
+            .await
+            .map_err(|error| ReopenError::Discovery(error.to_string()))?;
+        let Some(info) = devices.into_iter().find(|dev| {
+            actions::discovered_device_matches(
+                self.definition,
+                &dev.serial_number,
+                dev.vendor_id,
+                dev.product_id,
+            )
+        }) else {
+            return Ok(None);
+        };
+        let connection = connect_device(
+            &info,
+            self.definition,
+            self.protocol_version,
+            button_brightness,
+            encoder_brightness,
+        )
+        .await
+        .map_err(|error| ReopenError::Connect(error.to_string()))?;
+        let serial = connection.serial_number().clone();
+        Ok(Some(Reopened {
+            connection,
+            name: info.name.clone(),
+            serial,
+        }))
+    }
 }
 
 /// Parks a device that gave up reconnecting: releases its lock, tells the supervisor,
@@ -2704,9 +2909,7 @@ mod tests {
             "the lock is free while parked"
         );
 
-        park.controller.handle(dak::control::SignalAction::Rescan);
-        assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
-        assert!(task.await.unwrap(), "resumed");
+        assert!(rescan_until_done(&park, &mut events, task).await, "resumed");
         assert!(park.locks.holds(&park.key), "the lock is ours again");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2725,7 +2928,7 @@ mod tests {
             })
         };
         assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
-        let other = dak::lock::try_lock(&dir, &park.key).unwrap();
+        let other = take_lock_eventually(&dir, &park.key);
         park.controller.handle(dak::control::SignalAction::Rescan);
         assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
         assert_eq!(
@@ -2734,10 +2937,45 @@ mod tests {
             "busy: parked again"
         );
         drop(other);
-        park.controller.handle(dak::control::SignalAction::Rescan);
-        assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
-        assert!(task.await.unwrap());
+        assert!(rescan_until_done(&park, &mut events, task).await);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Requests rescans of a parked task until it ends, returning its result. A lock
+    /// just released may look held for an instant (see [`lock_frees_up`]), making the
+    /// task's one attempt fail and park it again, so one rescan is not always enough.
+    async fn rescan_until_done(
+        park: &super::Park,
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<super::TaskEvent>,
+        mut task: tokio::task::JoinHandle<bool>,
+    ) -> bool {
+        for _ in 0..200 {
+            park.controller.handle(dak::control::SignalAction::Rescan);
+            assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
+            tokio::select! {
+                done = &mut task => return done.unwrap(),
+                event = events.recv() => {
+                    assert_eq!(event, Some(super::TaskEvent::Parked(1)));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        panic!("the parked task never got its lock back");
+    }
+
+    /// Takes the lock of `key` in `dir`, retrying for up to a second: a lock just
+    /// released may look held for an instant (see [`lock_frees_up`]).
+    fn take_lock_eventually(
+        dir: &std::path::Path,
+        key: &dak::lock::DeviceKey,
+    ) -> dak::lock::DeviceLock {
+        for _ in 0..200 {
+            if let Ok(lock) = dak::lock::try_lock(dir, key) {
+                return lock;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the lock never became free");
     }
 
     /// A stop ends the parking without taking the lock back.
@@ -4177,5 +4415,1561 @@ mod tests {
         assert_eq!(super::current_brightness(&variables), (35, 100));
         variables.lock().unwrap().set_button_brightness(-4);
         assert_eq!(super::current_brightness(&variables).0, 0);
+    }
+
+    /// A second press landing inside the double-click gap cancels the first click's
+    /// pending short-press confirmation, and the pair fires `double_click` on the
+    /// second release.
+    #[tokio::test]
+    async fn pressable_edge_double_click_cancels_pending_short() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert!(state.pending_shorts.contains_key(&reference));
+
+        // Second press arrives within the gap: it cancels the pending confirmation
+        // and its release is a double click instead of a short.
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert!(
+            state.pending_shorts.is_empty(),
+            "the pending short press must be cancelled by the second press"
+        );
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "D",
+            "the double click fired on the second release"
+        );
+        assert!(state.pending_shorts.is_empty());
+        state.assert_no_click(Duration::from_millis(120)).await;
+    }
+
+    /// Pushing an encoder knob flows through the same edge handler as a button: the
+    /// remembered push code resolves to an encoder reference that behaves like any
+    /// pressable control.
+    #[tokio::test]
+    async fn pressable_edge_handles_encoder_pushes_like_buttons() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1e01");
+        let reference = Reference::encoder(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+        assert!(state.pending_shorts.contains_key(&reference));
+
+        let (confirmed, event) = state.receive_click().await;
+        assert_eq!(confirmed, reference);
+        assert_eq!(event, ClickEvent::ShortPress);
+    }
+
+    /// Duplicate press reports while a control is already down, and releases of a
+    /// control that was never pressed, are ignored: each event runs at most once.
+    #[tokio::test]
+    async fn pressable_edge_ignores_duplicate_and_unmatched_edges() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "P",
+            "a repeated press while down must not re-fire"
+        );
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "R",
+            "a repeated release while up must not re-fire"
+        );
+
+        let never_pressed = Reference::button(1, 2);
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            never_pressed,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            current_scene, "R",
+            "a release without a press must be ignored"
+        );
+    }
+
+    /// A press held past the short-press threshold fires `long_press` on release, and
+    /// no short-press confirmation is scheduled afterwards.
+    #[tokio::test]
+    async fn pressable_edge_long_press_fires_on_release() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(long_press_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(current_scene, "L", "the long press fired on release");
+        assert!(state.pending_shorts.is_empty());
+        state.assert_no_click(Duration::from_millis(120)).await;
+    }
+
+    /// A full click of a button flows through the edge handler: `pressed` fires on the
+    /// down edge, `released` on the up edge, and a quick release schedules the
+    /// short-press confirmation that a test can drain like the input loop does.
+    #[tokio::test]
+    async fn pressable_edge_runs_press_release_then_confirms_short_press() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = pressable_scenes("1b01");
+        let reference = Reference::button(1, 1);
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(quickly_clicking_defaults());
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            true,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "P");
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+
+        press_edge(
+            &mut runner,
+            &scenes,
+            &mut current_scene,
+            &mut previous_scene,
+            reference,
+            false,
+            &mut state,
+        )
+        .await;
+        assert_eq!(current_scene, "R");
+        assert!(
+            state.pending_shorts.contains_key(&reference),
+            "a short press waits for the double-click gap"
+        );
+
+        let (confirmed, event) = state.receive_click().await;
+        assert_eq!(confirmed, reference);
+        assert_eq!(event, ClickEvent::ShortPress);
+
+        state.pending_shorts.remove(&reference);
+        state.click_detector.confirm_single();
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &reference,
+            "short_press",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "S");
+    }
+
+    /// the background task to completion so `run_action_command`'s success and
+    /// failure branches both run, not just the `tokio::spawn` call itself.
+    #[tokio::test]
+    async fn run_action_command_completion_runs_for_success_and_failure() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "true",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "false",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        // `run_action` spawns the command and returns immediately; yield long enough
+        // for both background tasks to run to completion (and hit their log lines)
+        // before the test ends and the runtime drops any task still in flight.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(current_scene, "on_start", "commands never change the scene");
+    }
+
+    /// An `@scene` action targeting a scene that is not defined at all fails
+    /// `enter_scene` itself, mirroring
+    /// `run_action_stay_logs_and_continues_when_scene_is_undefined` for `SwitchScene`
+    /// instead of `Stay`: the scene name and `previous_scene` still update (the switch
+    /// itself does not depend on the target existing), the failure is logged and
+    /// swallowed, and no device call is ever attempted.
+    #[tokio::test]
+    async fn run_action_switch_scene_logs_and_continues_when_target_is_undefined() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@Missing",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        assert_eq!(
+            current_scene, "Missing",
+            "the scene name updates even though the target scene does not exist"
+        );
+        assert_eq!(previous_scene.as_deref(), Some("on_start"));
+        assert!(
+            mock.calls().is_empty(),
+            "enter_scene must fail before touching the device: {:?}",
+            mock.calls()
+        );
+    }
+
+    /// `run_actions` with multiple scene-changing actions keeps the last one's scene,
+    /// since each `run_action` call updates `current_scene`.
+    #[tokio::test]
+    async fn run_actions_keeps_last_scene_in_list() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "A": { "actions": {} },
+            "B": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        let actions: Vec<&str> = vec!["@A", "@B"];
+
+        super::run_actions(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &actions,
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        assert_eq!(current_scene, "B");
+        assert_eq!(previous_scene.as_deref(), Some("A"));
+    }
+
+    /// `run_actions` runs multiple actions in sequence from the timer delivery path.
+    /// A slow command in the list does not block subsequent actions since each command
+    /// spawns on its own task.
+    #[tokio::test]
+    async fn run_actions_runs_sequence_from_timer_delivery() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "A": { "actions": {} },
+            "B": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        let actions: Vec<&str> = vec!["/bin/sh -c 'true'", "/bin/sh -c 'sleep 2'", "@A", "@B"];
+
+        super::run_actions(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &actions,
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        assert_eq!(current_scene, "B");
+        assert_eq!(
+            previous_scene.as_deref(),
+            Some("A"),
+            "intermediate scene switch stored as previous"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// When `run_actions` encounters an unbound reference in the action list, it
+    /// silently skips it; the sequence continues through remaining actions.
+    #[tokio::test]
+    async fn run_actions_skips_unbound_in_sequence() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": {} },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        let actions: Vec<&str> = vec!["@Test", "/bin/true", "/bin/false", "sleep 1"];
+
+        super::run_actions(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &actions,
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        assert_eq!(current_scene, "Test");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    /// `run_bound_action` dispatches the `released` event for a button reference.
+    #[tokio::test]
+    async fn run_bound_action_dispatches_released_event() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1b01": { "released": "@Test" } } },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::button(1, 1),
+            "released",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+
+        assert_eq!(current_scene, "Test");
+        assert_eq!(
+            previous_scene.as_deref(),
+            Some("on_start"),
+            "released event switches scene like other events"
+        );
+    }
+
+    /// `run_bound_action` dispatches the encoder turn events (`turn_cw` / `turn_ccw`)
+    /// exactly like any other bound event on the encoder reference.
+    #[tokio::test]
+    async fn run_bound_action_dispatching_turn_events() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1e01": { "turn_cw": "@CW", "turn_ccw": "@CCW" } } },
+            "CW": { "actions": {} },
+            "CCW": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::encoder(1, 1),
+            "turn_cw",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "CW");
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::encoder(1, 1),
+            "turn_ccw",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "CCW");
+    }
+
+    /// A list of actions runs every entry in order; a slow command in the list does not
+    /// block the scene-changing action that follows it. `Action::Command` spawns and
+    /// never awaits its own completion, so looping over a list (see `run_actions`) is
+    /// exactly as non-blocking as a single `run_action` call already is - "run without
+    /// waiting on each other" falls out of that for free, since validation caps a list
+    /// to at most one scene-changing entry, so there is never a second synchronous
+    /// `enter_scene` competing with this loop's own state mutation.
+    #[tokio::test]
+    async fn run_bound_action_runs_a_list_without_waiting_on_a_slow_command() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1b01": { "pressed": ["sleep 5", "@Test"] } } },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            super::run_bound_action(
+                Log::default(),
+                &mut runner,
+                &mut current_scene,
+                &mut previous_scene,
+                &scenes,
+                &Reference::button(1, 1),
+                "pressed",
+                &mut state.timer_handle,
+                &state.timer_tx,
+                &state.variables,
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "run_bound_action should not block on the slow command"
+        );
+        assert_eq!(
+            current_scene, "Test",
+            "the scene-changing action must still run"
+        );
+    }
+
+    /// `run_bound_action` runs the action a reference bound to an event, switching
+    /// scenes; a reference without a binding does nothing.
+    #[tokio::test]
+    async fn run_bound_action_runs_bound_and_ignores_unbound() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({
+            "on_start": { "actions": { "1b01": { "pressed": "@Test" } } },
+            "Test": { "actions": {} }
+        });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::button(1, 1),
+            "pressed",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "Test");
+
+        super::run_bound_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            &Reference::button(1, 9),
+            "pressed",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "Test", "an unbound reference must not act");
+    }
+
+    /// A minimal device definition for tests that only need one to exist.
+    fn test_mapping() -> super::Mapping {
+        serde_json::from_value(json!({
+            "device_id": "0300:3002",
+            "device_name": "keypad",
+            "serial": "NOWHERE",
+            "key_count": 9,
+            "encoder_count": 3,
+            "screens": 6,
+            "buttons": [],
+            "encoders": []
+        }))
+        .unwrap()
+    }
+
+    /// A defined device with no hardware found is left out (and warned about) rather
+    /// than paired with anything.
+    #[test]
+    fn match_devices_skips_definitions_without_hardware() {
+        let definitions = std::collections::BTreeMap::from([(1u8, test_mapping())]);
+        assert!(super::match_devices(&definitions, &[], Log::default(), true).is_empty());
+    }
+
+    /// A lock directory that does not exist is an I/O error, logged and returned
+    /// without waiting.
+    #[tokio::test]
+    async fn take_device_lock_reports_io_errors() {
+        let key = dak::lock::DeviceKey::new(0x0300, 0x3002, Some("IOERR"), "");
+        let stop = dak::control::StopSource::new();
+        let result = super::take_device_lock(
+            std::path::Path::new("/nonexistent/dak/locks"),
+            &key,
+            dak::lock::Conflict::Wait,
+            &stop.signal(),
+            Log::default(),
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(super::LockError::Io(_))), "{result:?}");
+    }
+
+    /// Device-write warnings are only worth a warning while the device is connected;
+    /// once it is gone they are expected and only logged as debug output.
+    #[test]
+    fn warn_unless_disconnected_follows_the_connection() {
+        let device = dak::reconnect::SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (exec_tx, _exec_rx) = mpsc::channel(1);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(1);
+        let runner = SceneRunner::new(
+            1,
+            &device,
+            hardware::Kind::Akp03ERev2.image_format(),
+            exec_tx,
+            refresh_tx,
+            Log::default(),
+            &HashSet::new(),
+            Defaults::default().background,
+            Defaults::default().text_color,
+        );
+        assert!(runner.is_connected());
+        super::warn_unless_disconnected(Log::default(), &runner, "connected".to_string());
+        device.mark_disconnected();
+        assert!(!runner.is_connected());
+        super::warn_unless_disconnected(Log::default(), &runner, "gone".to_string());
+    }
+
+    /// An action whose references do not resolve is reported and skipped: nothing is
+    /// drawn and the scene stays.
+    #[tokio::test]
+    async fn run_action_skips_an_unresolvable_action() {
+        let mock = MockButtonDevice::default();
+        let mut runner = make_runner(&mock);
+        let scenes = json!({ "on_start": { "actions": {} } });
+        let mut current_scene = String::from("on_start");
+        let mut previous_scene = None;
+        let mut state = EdgeState::new(Defaults::default());
+        super::run_action(
+            Log::default(),
+            &mut runner,
+            &mut current_scene,
+            &mut previous_scene,
+            &scenes,
+            "@$missing",
+            &mut state.timer_handle,
+            &state.timer_tx,
+            &state.variables,
+        )
+        .await;
+        assert_eq!(current_scene, "on_start");
+        assert!(previous_scene.is_none());
+        assert!(mock.calls().is_empty(), "{:?}", mock.calls());
+    }
+
+    /// A timer whose seconds come from a variable holding an invalid number of seconds
+    /// is reported and not armed.
+    #[tokio::test]
+    async fn arm_scene_timer_skips_invalid_variable_seconds() {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "period".to_string(),
+            dak::variables::VarDef::int(-10, 10, -1),
+        );
+        let variables = std::sync::Arc::new(std::sync::Mutex::new(Variables::new(
+            defs,
+            &Defaults::default(),
+        )));
+        let scenes = json!({ "S": { "actions": { "timer": { "$period": "@S" } } } });
+        let (timer_tx, _timer_rx) = mpsc::channel(1);
+        let handle =
+            super::arm_scene_timer("S", &scenes, &timer_tx, Log::default(), &variables).await;
+        assert!(handle.is_none());
+    }
+
+    // -- the supervisor, with fake device descriptions (no hardware is opened) --
+
+    use super::{actions, exit, lock, Arc, Conflict, Controller, HidDeviceInfo};
+
+    /// A device description as discovery reports it, for a node that does not exist:
+    /// anything trying to open it fails at once.
+    fn fake_info(vendor_id: u16, product_id: u16, serial: &str) -> HidDeviceInfo {
+        HidDeviceInfo {
+            id: async_hid::DeviceId::DevPath(PathBuf::from("/nonexistent/dak-test-hidraw")),
+            name: "fake".to_string(),
+            manufacturer: None,
+            product_id,
+            vendor_id,
+            usage_id: 0,
+            usage_page: 0,
+            serial_number: Some(serial.to_string()),
+        }
+    }
+
+    /// Distinguishes the supervisor tests' scratch directories.
+    static SUPERVISOR_COUNTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// A scratch directory (for lock files and the config) and a valid config file in
+    /// it, with no devices.
+    fn supervisor_scratch() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "dak_supervisor_{}_{}",
+            std::process::id(),
+            SUPERVISOR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"scenes": {"on_start": {}}, "devices": {}}"#).unwrap();
+        (dir, config)
+    }
+
+    /// The options a plain foreground run with `conflict` has.
+    fn serve_options<'a>(
+        cli: &'a dak::cli::Cli,
+        config_path: &'a std::path::Path,
+        conflict: Conflict,
+    ) -> super::ServeOptions<'a> {
+        super::ServeOptions {
+            cli,
+            config_path,
+            conflict,
+            detached: false,
+            readiness: None,
+        }
+    }
+
+    /// A supervisor over the config at `config_path`, keeping its locks in `dir`.
+    fn supervisor<'a>(
+        options: &'a super::ServeOptions<'a>,
+        dir: &std::path::Path,
+        service: bool,
+    ) -> super::Supervisor<'a> {
+        let config = actions::load_config_from_path(options.config_path.to_str().unwrap())
+            .expect("the test config loads");
+        let controller = Arc::new(Controller::new());
+        let mut supervisor =
+            super::Supervisor::new(config, Log::default(), options, controller, service);
+        supervisor.lock_dir = dir.to_path_buf();
+        supervisor
+    }
+
+    /// Starting refuses a device whose lock another holder has (counted busy) and one
+    /// whose lock cannot be taken at all (counted failed), starting no task for
+    /// either.
+    #[tokio::test]
+    async fn supervisor_start_counts_busy_and_failed_devices() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, false);
+        let definition = test_mapping();
+
+        let held_info = fake_info(0x0300, 0x3002, "HELD");
+        let _held = lock::try_lock(&dir, &super::device_key(&held_info)).unwrap();
+        let (started, busy, failed) = supervisor
+            .start(vec![(1, definition.clone(), held_info)])
+            .await;
+        assert_eq!((started.len(), busy, failed), (0, 1, 0));
+
+        supervisor.lock_dir = dir.join("missing");
+        let (started, busy, failed) = supervisor
+            .start(vec![(2, definition, fake_info(0x0300, 0x3002, "NOLOCK"))])
+            .await;
+        assert_eq!((started.len(), busy, failed), (0, 0, 1));
+        assert!(supervisor.tasks.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device task whose device cannot be driven (an unrecognized VID:PID) ends with
+    /// the no-device status and gives its lock back; while it is still live, starting
+    /// the same device again is skipped.
+    #[tokio::test]
+    async fn supervisor_task_for_an_undrivable_device_ends_with_no_device() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, false);
+        let info = fake_info(0x1234, 0x5678, "UNKNOWN");
+        let key = super::device_key(&info);
+
+        let (started, busy, failed) = supervisor
+            .start(vec![(1, test_mapping(), info.clone())])
+            .await;
+        assert_eq!((started.len(), busy, failed), (1, 0, 0));
+        let (again, _, _) = supervisor.start(vec![(1, test_mapping(), info)]).await;
+        assert!(again.is_empty(), "a live device is not started twice");
+
+        assert_eq!(
+            supervisor.wait_started(started).await,
+            super::startup_summary(0, 0)
+        );
+        let joined = supervisor.tasks.join_next().await.unwrap();
+        supervisor.finished(joined);
+        assert_eq!(supervisor.status, exit::NO_DEVICE);
+        assert!(supervisor.live.is_empty());
+        assert!(!supervisor.locks.holds(&key), "the lock was given back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With `--wait`, a held device's task waits for the lock (reporting that it is
+    /// waiting) and a stop ends the wait cleanly.
+    #[tokio::test]
+    async fn supervisor_waiting_task_reports_and_stops() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Wait);
+        let mut supervisor = supervisor(&options, &dir, false);
+        let info = fake_info(0x0300, 0x3002, "WAITING");
+        let _held = lock::try_lock(&dir, &super::device_key(&info)).unwrap();
+
+        let (started, _, _) = supervisor.start(vec![(1, test_mapping(), info)]).await;
+        assert_eq!(
+            supervisor.wait_started(started).await,
+            super::startup_summary(0, 1)
+        );
+        supervisor.stop_all(true).await;
+        assert_eq!(
+            supervisor.status,
+            exit::SUCCESS,
+            "a cancelled wait is no failure"
+        );
+        assert!(supervisor.idle());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recognized keypad whose device node cannot be opened fails its task on the
+    /// first connect (only a device lost *after* connecting is waited for), with the
+    /// generic failure status, and its lock is given back.
+    #[tokio::test]
+    async fn supervisor_task_for_an_unopenable_device_fails() {
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, false);
+        let info = fake_info(0x0300, 0x3002, "UNOPENABLE");
+        let key = super::device_key(&info);
+        let (started, _, _) = supervisor.start(vec![(1, test_mapping(), info)]).await;
+        assert_eq!(
+            supervisor.wait_started(started).await,
+            super::startup_summary(0, 0)
+        );
+        let joined = tokio::time::timeout(Duration::from_secs(10), supervisor.tasks.join_next())
+            .await
+            .expect("the connect fails promptly")
+            .unwrap();
+        supervisor.finished(joined);
+        assert_ne!(supervisor.status, exit::SUCCESS);
+        assert!(!supervisor.locks.holds(&key));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `finished` keeps the first failure: a reported status, then a panicking task
+    /// (which would be `FAILURE`) does not overwrite it.
+    #[tokio::test]
+    async fn supervisor_finished_keeps_the_first_failure() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, false);
+
+        supervisor
+            .tasks
+            .spawn(async { (1, Err(super::TaskError::Reported(exit::CONFIG))) });
+        let joined = supervisor.tasks.join_next().await.unwrap();
+        supervisor.finished(joined);
+        supervisor.tasks.spawn(async { panic!("task bug") });
+        let joined = supervisor.tasks.join_next().await.unwrap();
+        assert!(joined.is_err());
+        supervisor.finished(joined);
+        assert_eq!(supervisor.status, exit::CONFIG);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In the foreground, a supervisor whose every device gave up (parked) has nothing
+    /// left to drive: it stops and exits with the no-device status.
+    #[tokio::test]
+    async fn supervisor_foreground_with_only_parked_devices_exits() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, false);
+        supervisor.live.insert(1, "parked.lock".to_string());
+        supervisor.parked.insert(1);
+        assert_eq!(supervisor.run().await, exit::NO_DEVICE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As a service, the supervisor tracks parking and resuming from task events and
+    /// ends on a quit request with the status so far.
+    #[tokio::test]
+    async fn supervisor_service_tracks_parking_until_quit() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, true);
+        supervisor.live.insert(1, "one.lock".to_string());
+        let events = supervisor.events.0.clone();
+        let controller = supervisor.controller.clone();
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        events.send(super::TaskEvent::Parked(1)).unwrap();
+        let driver = tokio::spawn(async move {
+            // Give the loop time to handle the parking before resuming and quitting.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = parked_tx.send(());
+            events.send(super::TaskEvent::Resumed(1)).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            controller.handle(dak::control::SignalAction::Quit);
+        });
+        let status = tokio::time::timeout(Duration::from_secs(5), supervisor.run())
+            .await
+            .expect("the quit ends the loop");
+        assert_eq!(status, exit::SUCCESS);
+        parked_rx.await.unwrap();
+        driver.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rescan or reload requested before the supervisor loop runs - e.g. a SIGUSR1
+    /// arriving right after `READY=1`, while startup is still finishing - is acted on
+    /// once the loop starts, not lost. (The counts used to be sampled only when the
+    /// loop started, silently swallowing such a request.)
+    #[tokio::test]
+    async fn supervisor_acts_on_requests_made_during_startup() {
+        use clap::Parser;
+        let (dir, config) = supervisor_scratch();
+        let cli = dak::cli::Cli::parse_from(["dak"]);
+        let options = serve_options(&cli, &config, Conflict::Refuse);
+        let mut supervisor = supervisor(&options, &dir, true);
+        // The reload must pick up this edit, which is how it is seen to have happened.
+        std::fs::write(
+            &config,
+            r#"{"scenes": {"on_start": {}, "reloaded": {}}, "devices": {}}"#,
+        )
+        .unwrap();
+        let controller = supervisor.controller.clone();
+        controller.handle(dak::control::SignalAction::Rescan);
+        controller.handle(dak::control::SignalAction::Reload);
+        let quitter = {
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                // Quit only once both requests were handled.
+                let mut state = controller.subscribe();
+                let _ = state.wait_for(|state| state.rescan > 0).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                controller.handle(dak::control::SignalAction::Quit);
+            })
+        };
+        let status = tokio::time::timeout(Duration::from_secs(10), supervisor.run())
+            .await
+            .expect("the quit ends the loop");
+        quitter.await.unwrap();
+        assert_eq!(status, exit::SUCCESS);
+        assert_eq!(supervisor.rescan_seen, 1, "the early rescan was handled");
+        assert!(
+            supervisor.config.scenes.get("reloaded").is_some(),
+            "the early reload was acted on"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- the device session: routing, the event handlers and the input loop --
+
+    use super::{Dispatch, Session, SessionChannels, SessionEnd};
+    use dak::input::{encode_report, ScriptedInput, ScriptedReport};
+    use dak::reconnect::SwappableDevice;
+
+    /// A two-button, one-encoder device definition: button 1 reports code 1, button 2
+    /// code 2 (outside the declared key count of 1), encoder 1 turns 81/80 and pushes 79;
+    /// encoder 2's codes (91..89) are beyond the encoder count.
+    fn session_mapping() -> super::Mapping {
+        serde_json::from_value(json!({
+            "device_id": "0300:3002", "device_name": "keypad", "serial": "S",
+            "key_count": 1, "encoder_count": 1, "screens": 1,
+            "buttons": [
+                {"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1},
+                {"number": 2, "press": 2, "release": 2, "screen": false, "draw_id": -1}
+            ],
+            "encoders": [
+                {"number": 1, "cw": 81, "ccw": 80, "press": 79, "release": 79},
+                {"number": 2, "cw": 91, "ccw": 90, "press": 89, "release": 89}
+            ]
+        }))
+        .unwrap()
+    }
+
+    /// A raw code resolves to the control it names (buttons and pushed encoders as
+    /// press edges, turns with their event name); unknown codes and controls beyond the
+    /// definition's counts resolve to nothing.
+    #[test]
+    fn route_resolves_codes_to_controls() {
+        let definition = session_mapping();
+        let route =
+            |code: u8, pressed: bool| super::route(&definition, 1, code, pressed, Log::default());
+        assert_eq!(
+            route(1, true),
+            Some(Dispatch::Edge(Reference::button(1, 1)))
+        );
+        assert_eq!(
+            route(1, false),
+            Some(Dispatch::Edge(Reference::button(1, 1)))
+        );
+        assert_eq!(
+            route(79, true),
+            Some(Dispatch::Edge(Reference::encoder(1, 1)))
+        );
+        assert_eq!(
+            route(81, false),
+            Some(Dispatch::Turn(Reference::encoder(1, 1), "turn_cw"))
+        );
+        assert_eq!(
+            route(80, false),
+            Some(Dispatch::Turn(Reference::encoder(1, 1), "turn_ccw"))
+        );
+        assert_eq!(route(2, true), None, "button 2 is beyond key_count");
+        assert_eq!(route(91, false), None, "encoder 2 is beyond encoder_count");
+        assert_eq!(route(89, true), None, "encoder 2 is beyond encoder_count");
+        assert_eq!(route(200, true), None, "no control uses code 200");
+    }
+
+    /// Scenes for the session tests: in `on_start`, pressing button 1 switches to `P`,
+    /// turning encoder 1 to `CW`/`CCW` and pushing it to `E`; the timer fires `@T`
+    /// after an hour (never, in a test). Every scene clears button 1 on entry, so each
+    /// switch is visible on the device.
+    fn session_scenes() -> Value {
+        let setup = json!({ "1b01": { "type": "clear" } });
+        json!({
+            "on_start": {
+                "setup": setup,
+                "actions": {
+                    "1b01": { "pressed": "@P" },
+                    "1e01": { "turn_cw": "@CW", "turn_ccw": "@CCW", "pressed": "@E" },
+                    "timer": { "3600": "@T" }
+                }
+            },
+            "P": { "setup": setup, "actions": {} },
+            "CW": { "setup": setup, "actions": {} },
+            "CCW": { "setup": setup, "actions": {} },
+            "E": { "setup": setup, "actions": {} },
+            "T": { "setup": setup, "actions": {} }
+        })
+    }
+
+    /// Builds a session over `device` with fresh channels, returning the receiving
+    /// ends too.
+    fn new_session<'r, D: ButtonDevice>(
+        device: &'r D,
+        defaults: Defaults,
+    ) -> (Session<'r, D>, SessionChannels) {
+        let (exec_tx, exec_rx) = mpsc::channel(8);
+        let (refresh_tx, refresh_rx) = mpsc::channel(8);
+        let (click_tx, click_rx) = mpsc::channel(8);
+        let (timer_tx, timer_rx) = mpsc::channel(1);
+        let runner = SceneRunner::new(
+            1,
+            device,
+            hardware::Kind::Akp03ERev2.image_format(),
+            exec_tx,
+            refresh_tx,
+            Log::default(),
+            &HashSet::new(),
+            defaults.background.clone(),
+            defaults.text_color.clone(),
+        );
+        let variables = std::sync::Arc::new(Mutex::new(Variables::new(
+            std::collections::BTreeMap::new(),
+            &defaults,
+        )));
+        let session = Session::new(
+            1,
+            session_mapping(),
+            runner,
+            session_scenes(),
+            defaults,
+            variables,
+            click_tx,
+            timer_tx,
+            Log::default(),
+        );
+        let channels = SessionChannels {
+            timer_rx,
+            click_rx,
+            exec_rx,
+            refresh_rx,
+        };
+        (session, channels)
+    }
+
+    /// Entering `on_start` draws and flushes it and arms its timer.
+    #[tokio::test]
+    async fn session_enters_on_start_and_arms_its_timer() {
+        let mock = MockButtonDevice::default();
+        let (mut session, _channels) = new_session(&mock, Defaults::default());
+        session.enter_on_start(&mock).await;
+        assert_eq!(mock.calls(), vec!["clear", "flush", "flush"]);
+        assert!(
+            session.timer_handle.is_some(),
+            "the on_start timer is armed"
+        );
+        assert_eq!(session.current_scene, "on_start");
+    }
+
+    /// Reports are decoded and routed: noise and unknown codes do nothing, a button
+    /// press runs its `pressed` action (and a repeated press report is not
+    /// re-dispatched), an encoder turn runs `turn_cw`.
+    #[tokio::test]
+    async fn session_dispatches_reports() {
+        let mock = MockButtonDevice::default();
+        let (mut session, _channels) = new_session(&mock, Defaults::default());
+        let mut noise = encode_report(1, 1);
+        noise[1] = 0;
+        session.on_report(&noise).await;
+        session.on_report(&encode_report(200, 1)).await;
+        assert_eq!(session.current_scene, "on_start");
+        assert!(mock.calls().is_empty());
+
+        session.on_report(&encode_report(1, 1)).await;
+        assert_eq!(session.current_scene, "P");
+        assert_eq!(session.previous_scene.as_deref(), Some("on_start"));
+        session.on_report(&encode_report(1, 1)).await;
+        assert_eq!(
+            mock.calls(),
+            vec!["clear", "flush"],
+            "a repeated press is ignored"
+        );
+
+        // `P` inherits on_start's bindings, so the encoder still works there.
+        session.on_report(&encode_report(81, 0)).await;
+        assert_eq!(session.current_scene, "CW");
+    }
+
+    /// The timer, click, exec and refresh events each reach their handler: timer
+    /// actions run, a confirmed short press runs `short_press` (none bound here, so
+    /// nothing changes), an exec result for a button without a running program is
+    /// dropped, and a refresh of an empty button does nothing.
+    #[tokio::test]
+    async fn session_handles_channel_events() {
+        let mock = MockButtonDevice::default();
+        let (mut session, _channels) = new_session(&mock, Defaults::default());
+        session.on_timer(vec!["@T".to_string()]).await;
+        assert_eq!(session.current_scene, "T");
+
+        session
+            .on_click(Reference::button(1, 1), ClickEvent::ShortPress)
+            .await;
+        assert_eq!(session.current_scene, "T");
+
+        session
+            .on_exec(dak::actions::ExecEvent::Error {
+                key: 5,
+                generation: 99,
+                error: "stale".to_string(),
+            })
+            .await;
+        session.on_refresh(7).await;
+        assert_eq!(
+            mock.calls(),
+            vec!["clear", "flush"],
+            "only the timer's scene drew"
+        );
+    }
+
+    /// After a disconnect the press state of the lost connection is forgotten: a
+    /// control held down is up again, and a pending short press is cancelled.
+    #[tokio::test]
+    async fn session_reset_forgets_the_lost_connection() {
+        let mock = MockButtonDevice::default();
+        let (mut session, mut channels) = new_session(&mock, quickly_clicking_defaults());
+        // Bind button 1 so its release starts a short-press confirmation.
+        session.scenes = pressable_scenes("1b01");
+        session.on_report(&encode_report(1, 1)).await;
+        session.on_report(&encode_report(1, 0)).await;
+        assert_eq!(session.pending_shorts.len(), 1);
+        session.on_report(&encode_report(1, 1)).await;
+        assert!(!session.down_controls.is_empty());
+
+        session.reset_after_disconnect();
+        assert!(session.down_controls.is_empty());
+        assert!(session.pending_shorts.is_empty());
+        let late = tokio::time::timeout(Duration::from_millis(300), channels.click_rx.recv()).await;
+        assert!(
+            !matches!(late, Ok(Some(_))),
+            "the cancelled short press never arrives: {late:?}"
+        );
+    }
+
+    /// The input loop hands reports to the session until the reader fails, which ends
+    /// the connection as a disconnect with the reader's error.
+    #[tokio::test]
+    async fn run_connection_ends_when_the_reader_fails() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, mut channels) = new_session(&device, Defaults::default());
+        let (input, reports) = ScriptedInput::new();
+        reports
+            .send(ScriptedReport::Data(encode_report(80, 0)))
+            .unwrap();
+        reports.send(ScriptedReport::Disconnect).unwrap();
+        let stop = dak::control::StopSource::new();
+        let end = tokio::time::timeout(
+            Duration::from_secs(5),
+            session.run_connection(&input, &mut channels, &stop.signal(), &device),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(end, SessionEnd::Disconnected(_)));
+        assert_eq!(
+            session.current_scene, "CCW",
+            "the report before it was handled"
+        );
+    }
+
+    /// A stop signal ends the input loop as a quit, and so does a closed event
+    /// channel.
+    #[tokio::test]
+    async fn run_connection_quits_on_stop_and_closed_channels() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, mut channels) = new_session(&device, Defaults::default());
+        let input = ScriptedInput::with_events(&[]);
+        let stop = dak::control::StopSource::new();
+        stop.stop();
+        let end = session
+            .run_connection(&input, &mut channels, &stop.signal(), &device)
+            .await;
+        assert!(matches!(end, SessionEnd::Quit));
+
+        let (mut session, mut channels) = new_session(&device, Defaults::default());
+        // Replace the timer channel with one whose every sender is gone.
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_tx);
+        channels.timer_rx = closed_rx;
+        let running = dak::control::StopSource::new();
+        let end = session
+            .run_connection(&input, &mut channels, &running.signal(), &device)
+            .await;
+        assert!(matches!(end, SessionEnd::Quit));
+    }
+
+    /// A draw that noticed the device is gone ends the input loop as a disconnect even
+    /// while the reader has nothing to say.
+    #[tokio::test]
+    async fn run_connection_notices_a_lost_device() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, mut channels) = new_session(&device, Defaults::default());
+        let input = ScriptedInput::with_events(&[]);
+        let stop = dak::control::StopSource::new();
+        device.mark_disconnected();
+        let end = session
+            .run_connection(&input, &mut channels, &stop.signal(), &device)
+            .await;
+        match end {
+            SessionEnd::Disconnected(reason) => assert!(reason.contains("stopped responding")),
+            SessionEnd::Quit => panic!("expected a disconnect"),
+        }
+    }
+
+    /// Events arriving on the channels while the loop runs are handled in it: a timer
+    /// delivery switches the scene, a refresh tick redraws.
+    #[tokio::test]
+    async fn run_connection_handles_channel_events() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, mut channels) = new_session(&device, Defaults::default());
+        let input = ScriptedInput::with_events(&[]);
+        let stop = dak::control::StopSource::new();
+        session.timer_tx.send(vec!["@T".to_string()]).await.unwrap();
+        let signal = stop.signal();
+        let stopper = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            stop.stop();
+        };
+        let (end, ()) = tokio::join!(
+            session.run_connection(&input, &mut channels, &signal, &device),
+            stopper
+        );
+        assert!(matches!(end, SessionEnd::Quit));
+        assert_eq!(session.current_scene, "T");
+    }
+
+    // -- reconnecting, with scripted reopen outcomes --
+
+    use super::{Reconnect, Reopen, ReopenError, Reopened};
+
+    /// One scripted reopen attempt: an error, not back yet (`None`), or the device
+    /// back under this name.
+    type Outcome = Result<Option<&'static str>, ReopenError>;
+
+    /// Plays back scripted reopen outcomes (then "not back yet" forever), recording
+    /// the brightnesses each attempt was asked to apply.
+    struct ScriptedReopen {
+        /// The outcomes still to come.
+        outcomes: Mutex<std::collections::VecDeque<Outcome>>,
+        /// `(button, encoder)` brightness of every attempt.
+        brightness: Mutex<Vec<(u8, u8)>>,
+    }
+
+    impl ScriptedReopen {
+        /// A script of `outcomes`.
+        fn new(outcomes: Vec<Outcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                brightness: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Reopen for ScriptedReopen {
+        type Connection = MockButtonDevice;
+
+        async fn reopen(
+            &self,
+            button_brightness: u8,
+            encoder_brightness: u8,
+        ) -> Result<Option<Reopened<MockButtonDevice>>, ReopenError> {
+            self.brightness
+                .lock()
+                .unwrap()
+                .push((button_brightness, encoder_brightness));
+            let next = self.outcomes.lock().unwrap().pop_front();
+            match next {
+                None | Some(Ok(None)) => Ok(None),
+                Some(Err(error)) => Err(error),
+                Some(Ok(Some(name))) => Ok(Some(Reopened {
+                    connection: MockButtonDevice::default(),
+                    name: name.to_string(),
+                    serial: "S2".to_string(),
+                })),
+            }
+        }
+    }
+
+    /// A policy retrying quickly, at most `max_attempts` times (0 = forever).
+    fn quick_policy(max_attempts: u64) -> dak::reconnect::ReconnectPolicy {
+        dak::reconnect::ReconnectPolicy {
+            interval: Duration::from_millis(5),
+            max_attempts,
+        }
+    }
+
+    /// A lost device is retried through discovery failures, "not back yet" and
+    /// connect failures until it opens; the fresh connection gets the current
+    /// brightness, is swapped in and repainted with what was on screen.
+    #[tokio::test]
+    async fn await_reconnect_retries_until_the_device_is_back() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, _channels) = new_session(&device, Defaults::default());
+        session.enter_on_start(&device).await;
+        session.variables.lock().unwrap().set_button_brightness(30);
+        let reopen = ScriptedReopen::new(vec![
+            Err(ReopenError::Discovery("enumeration failed".to_string())),
+            Ok(None),
+            Err(ReopenError::Connect("not ready".to_string())),
+            Ok(Some("")),
+        ]);
+        let (park, _events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let stop = dak::control::StopSource::new();
+        let variables = session.variables.clone();
+        let outcome = super::await_reconnect(
+            1,
+            &reopen,
+            "original name",
+            &device,
+            &mut session.runner,
+            &variables,
+            Log::default(),
+            "unplugged",
+            quick_policy(0),
+            &stop.signal(),
+            &park,
+        )
+        .await;
+        assert_eq!(outcome, Reconnect::Reconnected);
+        assert!(device.is_connected());
+        let brightness = reopen.brightness.lock().unwrap().clone();
+        assert_eq!(brightness.len(), 4);
+        assert!(
+            brightness.iter().all(|&(button, _)| button == 30),
+            "{brightness:?}"
+        );
+        assert_eq!(
+            device.current().unwrap().calls(),
+            vec!["clear", "flush"],
+            "the new connection is repainted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After its last allowed attempt the device task gives up and parks; a stop while
+    /// parked ends it as cancelled.
+    #[tokio::test]
+    async fn await_reconnect_gives_up_parks_and_stops() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, _channels) = new_session(&device, Defaults::default());
+        let reopen = ScriptedReopen::new(Vec::new());
+        let (park, mut events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let stop = dak::control::StopSource::new();
+        let variables = session.variables.clone();
+        let signal = stop.signal();
+        let waiting = super::await_reconnect(
+            1,
+            &reopen,
+            "keypad",
+            &device,
+            &mut session.runner,
+            &variables,
+            Log::default(),
+            "unplugged",
+            quick_policy(2),
+            &signal,
+            &park,
+        );
+        let stopper = async {
+            assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
+            stop.stop();
+        };
+        let (outcome, ()) = tokio::join!(waiting, stopper);
+        assert_eq!(outcome, Reconnect::Cancelled);
+        assert_eq!(reopen.brightness.lock().unwrap().len(), 2, "two attempts");
+        assert!(!device.is_connected());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop while waiting for the device ends the wait as cancelled.
+    #[tokio::test]
+    async fn await_reconnect_is_cancelled_by_a_stop() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, _channels) = new_session(&device, Defaults::default());
+        let reopen = ScriptedReopen::new(Vec::new());
+        let (park, _events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let stop = dak::control::StopSource::new();
+        stop.stop();
+        let variables = session.variables.clone();
+        let outcome = super::await_reconnect(
+            1,
+            &reopen,
+            "keypad",
+            &device,
+            &mut session.runner,
+            &variables,
+            Log::default(),
+            "unplugged",
+            quick_policy(0),
+            &stop.signal(),
+            &park,
+        )
+        .await;
+        assert_eq!(outcome, Reconnect::Cancelled);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -21,6 +21,9 @@ pub enum Glyph {
     Empty,
     /// No outline; a CBDT colour bitmap holding these PNG bytes, declared `size` px square.
     Png(Vec<u8>, u8),
+    /// No outline; a CBDT raw premultiplied-BGRA bitmap (image format 1, 32 bits per
+    /// pixel) of `size` x `size` pixels given row by row.
+    Bgra(Vec<u8>, u8),
 }
 
 /// Extra colour tables to add to a built font.
@@ -220,11 +223,13 @@ pub fn build_font_with_metrics(
 
     // CBDT + CBLC: one index subtable per bitmap glyph, so glyphs without a bitmap are
     // not covered by any subtable (a reader then finds no image for them).
-    let bitmaps: Vec<(u16, &[u8], u8)> = glyphs
+    // (glyph id, image data, size, whether the data is PNG rather than raw BGRA)
+    let bitmaps: Vec<(u16, &[u8], u8, bool)> = glyphs
         .iter()
         .enumerate()
         .filter_map(|(index, (_, glyph))| match glyph {
-            Glyph::Png(png, size) => Some((index as u16 + 1, png.as_slice(), *size)),
+            Glyph::Png(png, size) => Some((index as u16 + 1, png.as_slice(), *size, true)),
+            Glyph::Bgra(bgra, size) => Some((index as u16 + 1, bgra.as_slice(), *size, false)),
             _ => None,
         })
         .collect();
@@ -232,24 +237,29 @@ pub fn build_font_with_metrics(
         let mut cbdt = Vec::new();
         u16be(&mut cbdt, 3);
         u16be(&mut cbdt, 0);
-        let mut records = Vec::new(); // (glyph id, offset in CBDT, record length)
-        for (id, png, size) in &bitmaps {
+        // (glyph id, offset in CBDT, record length, image format)
+        let mut records = Vec::new();
+        for (id, data, size, is_png) in &bitmaps {
             let start = cbdt.len() as u32;
             cbdt.extend_from_slice(&[*size, *size, 0, *size, *size]); // smallGlyphMetrics
-            u32be(&mut cbdt, png.len() as u32);
-            cbdt.extend_from_slice(png);
-            records.push((*id, start, cbdt.len() as u32 - start));
+            if *is_png {
+                u32be(&mut cbdt, data.len() as u32);
+            }
+            cbdt.extend_from_slice(data);
+            // 17: small metrics + PNG; 1: small metrics + byte-aligned bitmap data.
+            let format = if *is_png { 17 } else { 1 };
+            records.push((*id, start, cbdt.len() as u32 - start, format));
         }
         let count = records.len() as u32;
         let array_offset = 8 + 48;
         let mut array = Vec::new();
         let mut subtables = Vec::new();
-        for (id, offset, length) in &records {
+        for (id, offset, length, format) in &records {
             u16be(&mut array, *id);
             u16be(&mut array, *id);
             u32be(&mut array, count * 8 + subtables.len() as u32);
             u16be(&mut subtables, 1); // indexFormat
-            u16be(&mut subtables, 17); // imageFormat: small metrics + PNG
+            u16be(&mut subtables, *format); // imageFormat
             u32be(&mut subtables, *offset); // imageDataOffset
             u32be(&mut subtables, 0);
             u32be(&mut subtables, *length);

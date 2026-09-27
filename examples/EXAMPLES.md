@@ -40,10 +40,11 @@ helper tools it mentions.
 
 - [`counter-and-modes.json`](counter-and-modes.json) - variables. An `int` counter is
   bumped by an encoder (strict `=` on the way up, silently clamping `~=` on the way
-  down, both via a `$(/usr/bin/expr ...)` substitution since the language has no inline
+  down, both via a `$(expr ...)` substitution since the language has no inline
   arithmetic) and reset by a button; a `str` "mode" is set by buttons with `:=` and from
   a command's output. Both are shown live on buttons through `text_value` + `refresh`.
-  Needs `expr` (coreutils) and `hostname`.
+  Needs `expr` and `hostname` (both in the base system on Linux and FreeBSD; bare
+  program names are looked up in `PATH`, so the example works on both).
 
 - [`press-scene-preview.json`](press-scene-preview.json) - a "flash" trick: `pressed` on
   `1b01` switches to a scene that repaints the keypad, and the inherited `released`
