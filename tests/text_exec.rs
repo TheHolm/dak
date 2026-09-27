@@ -247,3 +247,75 @@ async fn aborting_spawned_task_kills_the_process() {
     assert!(gone, "process {pid} still alive after abort");
     let _ = std::fs::remove_file(&pid_file);
 }
+
+/// A `sh -c` command spec running `script`.
+fn shell(script: &str) -> CommandSpec {
+    CommandSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), script.to_string()],
+    }
+}
+
+/// stdin is `/dev/null`, never the terminal: a program reading input sees EOF at once
+/// instead of waiting for the timeout.
+#[tokio::test]
+async fn run_command_with_timeout_gives_eof_on_stdin() {
+    let output = run_command_with_timeout(&shell("cat; echo done"), Duration::from_secs(5))
+        .await
+        .expect("cat ends on EOF");
+    assert_eq!(output, b"done\n");
+}
+
+/// A program writing far more than a pipe buffer to stderr does not block on it: stderr
+/// is drained while it runs.
+#[tokio::test]
+async fn run_command_with_timeout_drains_a_flood_of_stderr() {
+    let started = std::time::Instant::now();
+    let output = run_command_with_timeout(
+        &shell("head -c 1000000 /dev/zero | tr '\\0' x >&2; echo ok"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("a noisy program still finishes");
+    assert_eq!(output, b"ok\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "it did not wait for the timeout"
+    );
+}
+
+/// A failing program's stderr is quoted (trimmed, lines joined, bounded) in the error.
+#[tokio::test]
+async fn run_command_with_timeout_quotes_stderr_on_failure() {
+    let error = run_command_with_timeout(
+        &shell("echo 'no such printer' >&2; echo 'try again' >&2; exit 3"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("exit 3 is a failure");
+    assert!(error.contains("exited with"), "{error}");
+    assert!(error.ends_with(": no such printer / try again"), "{error}");
+
+    let error = run_command_with_timeout(
+        &shell("head -c 5000 /dev/zero | tr '\\0' y >&2; exit 1"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect_err("exit 1 is a failure");
+    let quoted = error.rsplit(": ").next().unwrap();
+    assert_eq!(quoted.len(), dak::actions::STDERR_EXCERPT_BYTES, "{error}");
+}
+
+/// Without stderr output the error is just the exit status.
+#[test]
+fn with_stderr_leaves_quiet_failures_alone() {
+    assert_eq!(dak::actions::with_stderr("failed".into(), b""), "failed");
+    assert_eq!(
+        dak::actions::with_stderr("failed".into(), b" \n\n"),
+        "failed"
+    );
+    assert_eq!(
+        dak::actions::with_stderr("failed".into(), b"a\n b \n"),
+        "failed: a / b"
+    );
+}

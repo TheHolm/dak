@@ -120,3 +120,33 @@ pub fn temp_dir() -> PathBuf {
     fs::create_dir_all(&dir).unwrap();
     PathBuf::from(dir)
 }
+
+/// A config driving the first attached (enumerable) keypad, plus that keypad's lock
+/// key; `None` without one (enumeration only reads sysfs, so this finds a keypad even
+/// where its device node cannot be opened, which is all the lock tests need: the lock
+/// is taken before the device is opened).
+pub fn config_for_attached_device() -> Option<(std::path::PathBuf, dak::lock::DeviceKey)> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let devices = runtime.block_on(dak::hardware::discover()).ok()?;
+    let device = devices.into_iter().next()?;
+    let serial = device
+        .serial_number
+        .clone()
+        .filter(|s| !s.trim().is_empty())?;
+    let key = dak::lock::DeviceKey::new(
+        device.vendor_id,
+        device.product_id,
+        Some(&serial),
+        &format!("{:?}", device.id),
+    );
+    let config = format!(
+        r#"{{"scenes": {{"on_start": {{}}}}, "devices": {{"1": {{
+            "device_id": "{:04X}:{:04X}", "device_name": "test", "serial": "{serial}",
+            "key_count": 9, "encoder_count": 3, "screens": 6,
+            "buttons": [{{"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1}}],
+            "encoders": []
+        }}}}}}"#,
+        device.vendor_id, device.product_id
+    );
+    Some((write_temp_config(&config), key))
+}

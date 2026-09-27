@@ -22,6 +22,7 @@ use dak::baseplane::Reference;
 use dak::cli::Cli;
 use dak::color::Color;
 use dak::control::{self, Controller, StopSignal, StopSource};
+use dak::daemon;
 use dak::exit;
 use dak::hardware;
 use dak::lock::{self, Conflict, DeviceKey, DeviceLock, LockError};
@@ -89,28 +90,7 @@ fn run(cli: Cli, log: Log) -> u8 {
     let config_path = absolute_config_path(&actions::resolve_config_path(cli.config.as_deref()));
     log.info(format!("Using config: {}", config_path.display()));
     let config = match actions::load_config_from_path(&config_path.to_string_lossy()) {
-        Ok(config) => {
-            // From here on every line goes to the configured outputs.
-            let log = match apply_logging(&config, &cli, false) {
-                Ok(log) => log,
-                Err(error) => {
-                    log.error(error);
-                    return exit::CONFIG;
-                }
-            };
-            log.info(format!(
-                "Loaded config version {} from {}",
-                config.version,
-                config_path.display()
-            ));
-            for warning in &config.warnings {
-                log.warn(warning);
-            }
-            for detail in &config.font_details {
-                log.debug(Subsystem::Fonts, detail);
-            }
-            (config, log)
-        }
+        Ok(config) => config,
         Err(errors) => {
             for error in &errors {
                 log.error(error);
@@ -118,28 +98,100 @@ fn run(cli: Cli, log: Log) -> u8 {
             return exit::CONFIG;
         }
     };
-    let (config, log) = config;
-
-    let Some(runtime) = build_runtime(log) else {
-        return exit::FAILURE;
+    // The configured outputs are opened while still attached to the terminal, so a log
+    // file that cannot be opened is reported there.
+    let (settings, sinks) = match open_logging(&config, &cli, cli.detach) {
+        Ok(opened) => opened,
+        Err(error) => {
+            log.error(error);
+            return exit::CONFIG;
+        }
     };
-    let conflict = Conflict::from_flags(cli.wait, cli.replace);
-    runtime.block_on(serve(config, log, conflict))
+    let pid_file = cli.pid_file.as_deref().map(absolute_config_path);
+
+    let readiness = if cli.detach {
+        // SAFETY: no runtime (and no other thread) exists yet.
+        match unsafe { daemon::detach(pid_file.as_deref()) } {
+            Ok(daemon::Detached::Daemon(readiness)) => Some(readiness),
+            Ok(daemon::Detached::Parent(status, message)) => {
+                report_detached_start(log, status, &message);
+                return status;
+            }
+            Err(error) => {
+                log.error(error);
+                return exit::FAILURE;
+            }
+        }
+    } else {
+        if let Some(path) = &pid_file {
+            if let Err(error) = daemon::write_pid_file(path, std::process::id()) {
+                log.error(error);
+                return exit::FAILURE;
+            }
+        }
+        None
+    };
+
+    // From here on every line goes to the configured outputs.
+    dak::log::install(sinks);
+    let log = settings.log;
+    log.info(format!(
+        "Loaded config version {} from {}",
+        config.version,
+        config_path.display()
+    ));
+    for warning in &config.warnings {
+        log.warn(warning);
+    }
+    for detail in &config.font_details {
+        log.debug(Subsystem::Fonts, detail);
+    }
+
+    let status = match build_runtime(log) {
+        Some(runtime) => {
+            let conflict = Conflict::from_flags(cli.wait, cli.replace);
+            runtime.block_on(serve(config, log, conflict, readiness.as_ref()))
+        }
+        None => exit::FAILURE,
+    };
+    if let Some(readiness) = &readiness {
+        // Ended before startup completed: tell the waiting terminal why.
+        let message = dak::log::last_error().unwrap_or_else(|| "stopped during startup".into());
+        readiness.report(daemon::StartupReport::Failed(status, message));
+    }
+    if let Some(path) = &pid_file {
+        daemon::remove_pid_file(path);
+    }
+    status
+}
+
+/// In the terminal `dak --detach` was started from, once the daemon reported: what
+/// happened, with the daemon's own message.
+fn report_detached_start(log: Log, status: u8, message: &str) {
+    if status == exit::SUCCESS {
+        log.info(format!("dak is running in the background: {message}"));
+    } else {
+        log.error(format!(
+            "dak failed to start in the background (exit status {status}): {message}"
+        ));
+    }
 }
 
 /// Resolves the logging setup from the config's `logging` section and the command-line
-/// overrides, opens its outputs and installs them for every later line. Returns the
-/// filter to log through, or why the outputs could not be opened (in which case the
-/// previous outputs stay in use).
-fn apply_logging(config: &actions::LoadedConfig, cli: &Cli, detached: bool) -> Result<Log, String> {
+/// overrides (with `auto` resolved as `detached` says) and opens its outputs, ready to
+/// be installed. Fails when an output cannot be opened.
+fn open_logging(
+    config: &actions::LoadedConfig,
+    cli: &Cli,
+    detached: bool,
+) -> Result<(LogSettings, dak::log::Sinks), String> {
     let settings = LogSettings::resolve(
         &config.logging,
         &CliLogging::from_cli(cli),
         &Environment::probe(detached),
     )?;
     let sinks = settings.open()?;
-    dak::log::install(sinks);
-    Ok(settings.log)
+    Ok((settings, sinks))
 }
 
 /// Makes `path` absolute against the current directory, so it keeps naming the same
@@ -174,7 +226,12 @@ fn build_runtime(log: Log) -> Option<tokio::runtime::Runtime> {
 /// no matching hardware and discovered devices without a config definition are reported
 /// and skipped; when no configured device is found the program exits with
 /// [`exit::NO_DEVICE`].
-async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u8 {
+async fn serve(
+    config: actions::LoadedConfig,
+    log: Log,
+    conflict: Conflict,
+    readiness: Option<&daemon::Readiness>,
+) -> u8 {
     // Signal listeners go in first, so a SIGTERM during discovery already ends the
     // program cleanly instead of killing it.
     let controller = Arc::new(Controller::new());
@@ -188,6 +245,7 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
         let (controller, stop) = (controller.clone(), stop.clone());
         tokio::spawn(async move {
             controller.quit_requested().await;
+            daemon::notify("STOPPING=1");
             stop.stop();
         });
     }
@@ -220,6 +278,7 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
     )));
     let lock_dir = lock::lock_dir();
     let (mut busy, mut failed) = (0usize, 0usize);
+    let mut started = Vec::new();
     for (device_number, definition, device_info) in assignments {
         let key = device_key(&device_info);
         // Refusing and replacing settle the lock before the device task starts (so a
@@ -228,7 +287,7 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
         let lock = if conflict == Conflict::Wait {
             None
         } else {
-            match take_device_lock(&lock_dir, &key, conflict, &stop.signal(), log).await {
+            match take_device_lock(&lock_dir, &key, conflict, &stop.signal(), log, None).await {
                 Ok(lock) => Some(lock),
                 Err(LockError::Busy(_)) => {
                     busy += 1;
@@ -247,14 +306,21 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
         let fonts = config.fonts.clone();
         let signal = stop.signal();
         let lock_dir = lock_dir.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        started.push(start_rx);
+        let start = Arc::new(StartSignal::new(start_tx));
         handles.push(tokio::spawn(async move {
             let _lock = match lock {
                 Some(lock) => lock,
-                None => match take_device_lock(&lock_dir, &key, conflict, &signal, log).await {
-                    Ok(lock) => lock,
-                    Err(LockError::Cancelled) => return Ok(()),
-                    Err(_) => return Err(TaskError::Reported(exit::FAILURE)),
-                },
+                None => {
+                    match take_device_lock(&lock_dir, &key, conflict, &signal, log, Some(&start))
+                        .await
+                    {
+                        Ok(lock) => lock,
+                        Err(LockError::Cancelled) => return Ok(()),
+                        Err(_) => return Err(TaskError::Reported(exit::FAILURE)),
+                    }
+                }
             };
             run_device(
                 device_number,
@@ -266,6 +332,7 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
                 variables,
                 fonts,
                 signal,
+                start,
             )
             .await
             .map_err(TaskError::Device)
@@ -280,6 +347,27 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
             return exit::DEVICE_BUSY;
         }
         return exit::FAILURE;
+    }
+
+    // Startup is complete once every device task has either painted its first scene,
+    // started waiting for its lock, or ended. When at least one got that far, the
+    // program is up: systemd and a waiting `--detach` terminal are told so.
+    let mut connected = 0usize;
+    let mut waiting = 0usize;
+    for start in started {
+        match start.await {
+            Ok(Started::Connected) => connected += 1,
+            Ok(Started::Waiting) => waiting += 1,
+            Err(_) => {}
+        }
+    }
+    if connected + waiting > 0 && !stop.signal().is_stopped() {
+        let summary = startup_summary(connected, waiting);
+        log.debug(Subsystem::Device, format!("startup complete: {summary}"));
+        daemon::notify(&format!("READY=1\n{}", daemon::status_line(&summary)));
+        if let Some(readiness) = readiness {
+            readiness.report(daemon::StartupReport::Ready(summary));
+        }
     }
 
     // Wait for every device task, so one device failing (e.g. its first connection
@@ -304,6 +392,49 @@ async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u
         }
     }
     status
+}
+
+/// How far a device task got by the end of startup (see [`StartSignal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Started {
+    /// Connected and painted its `on_start` scene.
+    Connected,
+    /// Waiting (`--wait`) for another dak to release it.
+    Waiting,
+}
+
+/// A device task's one-shot "startup done" report to [`serve`]; only the first report
+/// counts, and a task ending without one reports nothing (the receiver sees it dropped).
+struct StartSignal(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Started>>>);
+
+impl StartSignal {
+    /// Wraps the sending half of the report channel.
+    fn new(sender: tokio::sync::oneshot::Sender<Started>) -> Self {
+        Self(std::sync::Mutex::new(Some(sender)))
+    }
+
+    /// Sends `state` unless something was already reported.
+    fn report(&self, state: Started) {
+        if let Some(sender) = self.0.lock().expect("start signal poisoned").take() {
+            let _ = sender.send(state);
+        }
+    }
+}
+
+/// The one-line startup summary, e.g. "2 devices connected, 1 waiting for another dak".
+fn startup_summary(connected: usize, waiting: usize) -> String {
+    let devices = |n: usize| {
+        if n == 1 {
+            "1 device".to_string()
+        } else {
+            format!("{n} devices")
+        }
+    };
+    match (connected, waiting) {
+        (c, 0) => format!("{} connected", devices(c)),
+        (0, w) => format!("{} waiting for another dak to release it", devices(w)),
+        (c, w) => format!("{} connected, {w} waiting for another dak", devices(c)),
+    }
 }
 
 /// Why a device task in [`serve`] ended early.
@@ -333,8 +464,12 @@ async fn take_device_lock(
     conflict: Conflict,
     stop: &StopSignal,
     log: Log,
+    start: Option<&StartSignal>,
 ) -> Result<DeviceLock, LockError> {
     let result = lock::acquire(dir, key, conflict, stop, |holder| {
+        if let Some(start) = start {
+            start.report(Started::Waiting);
+        }
         let holder = holder
             .map(|holder| holder.describe())
             .unwrap_or_else(|| "another dak".to_string());
@@ -446,6 +581,7 @@ async fn run_device(
     variables: Arc<std::sync::Mutex<Variables>>,
     fonts: Arc<dak::text::FontSet>,
     stop: StopSignal,
+    start: Arc<StartSignal>,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -607,6 +743,8 @@ async fn run_device(
             format!("failed to flush on_start scene: {error}"),
         );
     }
+
+    start.report(Started::Connected);
 
     let mut current_scene = String::from("on_start");
     // Button and pushed-encoder controls currently held down, so repeated press
@@ -2031,6 +2169,31 @@ mod tests {
             double_click_gap: Duration::from_millis(600),
             ..Defaults::default()
         }
+    }
+
+    /// The startup summary names connected and waiting devices, singular or plural.
+    #[test]
+    fn startup_summary_wording() {
+        assert_eq!(super::startup_summary(1, 0), "1 device connected");
+        assert_eq!(super::startup_summary(2, 0), "2 devices connected");
+        assert_eq!(
+            super::startup_summary(0, 1),
+            "1 device waiting for another dak to release it"
+        );
+        assert_eq!(
+            super::startup_summary(2, 1),
+            "2 devices connected, 1 waiting for another dak"
+        );
+    }
+
+    /// Only the first startup report is delivered.
+    #[test]
+    fn start_signal_reports_once() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let start = super::StartSignal::new(tx);
+        start.report(super::Started::Waiting);
+        start.report(super::Started::Connected);
+        assert_eq!(rx.try_recv().unwrap(), super::Started::Waiting);
     }
 
     /// A device that was never found (or was given up on) maps to the "no device"

@@ -4,7 +4,7 @@
 .SH NAME
 dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
 .SH SYNOPSIS
-\fBdak\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-d\fR|\fB\-\-debug\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-syslog\fR] [\fB\-\-wait\fR] [\fB\-\-replace\fR] [\fB\-\-map\fR] [\fB\-h\fR|\fB\-\-help\fR]
+\fBdak\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-d\fR|\fB\-\-debug\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-syslog\fR] [\fB\-\-wait\fR] [\fB\-\-replace\fR] [\fB\-\-detach\fR] [\fB\-\-pid\-file\fR] [\fB\-\-map\fR] [\fB\-h\fR|\fB\-\-help\fR]
 .SH DESCRIPTION
 DAK (Dynamic Ajazz Keyboard) controls an Ajazz AKP03E or AKP03R USB macro keypad, part of the family of "stream controller" keypads that Ajazz and Mirabox sell under different names. It connects to the device, paints the configured images and text labels onto the button LCDs, sets the button and encoder brightness, and reacts to button presses, encoder turns and scene timers described by a JSON configuration file.
 .PP
@@ -47,6 +47,12 @@ When another dak (of any user) holds a configured device, wait until it releases
 .TP
 \fB\-\-replace\fR
 When another dak holds a configured device, send it SIGTERM, wait up to 10 seconds for it to clean up and release the device, then take it. Only allowed for your own instances, or for any as root
+.TP
+\fB\-\-detach\fR
+Detach from the terminal and run in the background as a daemon: fork, start a new session, change to /, and point stdin, stdout and stderr at /dev/null. The configuration is checked first, and the command only returns once the daemon has connected its devices (exit status 0) or failed to start (its exit status and last error). Log lines go to syslog unless the logging section or \-\-log\-file says otherwise. Not needed under systemd
+.TP
+\fB\-\-pid\-file\fR \fI<PATH>\fR
+Write the process id (of the daemon, with \-\-detach) to PATH, and remove the file again on exit
 .TP
 \fB\-\-map\fR
 Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits
@@ -95,6 +101,19 @@ log output writes journal lines (see
 in
 .BR dak\-config (5)).
 .TP
+.B NOTIFY_SOCKET
+Set by systemd for a
+.B Type=notify
+service. When present,
+.B dak
+reports
+.B READY=1
+once its devices are connected (or waiting for another instance),
+.B STOPPING=1
+when it is told to stop, and a
+.B STATUS=
+line.
+.TP
 .B DAK_LOCK_DIR
 The directory device lock files are kept in, instead of
 .I /run/lock
@@ -122,6 +141,13 @@ The default log file, when the
 .B file
 log output is used.
 .TP
+.I PATH
+of
+.B \-\-pid\-file
+Holds the process id while
+.B dak
+runs; removed on exit.
+.TP
 .I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
 One lock file per keypad (in
 .I /tmp
@@ -130,6 +156,32 @@ where
 does not exist), holding the process id, user and start time of the
 .B dak
 using it.
+.SH "RUNNING IN THE BACKGROUND"
+With
+.B \-\-detach
+.B dak
+forks into the background, starts a new session, changes to
+.I /
+and points its standard input, output and error at
+.IR /dev/null .
+The configuration and the log outputs are checked before forking, so their
+errors appear in the terminal; the command then waits until the daemon has
+connected its devices (or is waiting for a device held by another instance)
+and exits with status 0, or exits with the daemon's own status and last error
+when it failed to start. The
+.B auto
+log output goes to syslog once detached. Programs run by actions get
+.I /dev/null
+as standard input in every mode.
+.PP
+Under systemd do not use
+.BR \-\-detach :
+run
+.B dak
+in the foreground as a
+.B Type=notify
+service instead; it reports readiness through
+.BR NOTIFY_SOCKET .
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -184,6 +236,10 @@ Write only warnings and errors, to the console and to a log file.
 .TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
+.TP
+.B dak \-\-detach \-\-pid\-file /tmp/dak.pid
+Run in the background, logging to syslog; returns once the devices are
+connected.
 .TP
 .B dak \-\-replace
 Take the keypad over from a

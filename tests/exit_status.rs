@@ -86,41 +86,11 @@ fn relative_config_path_is_made_absolute() {
     assert!(stdout.contains(&expected), "stdout: {stdout}");
 }
 
-/// A config driving the first attached (enumerable) keypad, plus that keypad's lock
-/// key; `None` without one (enumeration only reads sysfs, so this finds a keypad even
-/// where its device node cannot be opened, which is all the lock tests need: the lock
-/// is taken before the device is opened).
-fn config_for_attached_device() -> Option<(std::path::PathBuf, dak::lock::DeviceKey)> {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let devices = runtime.block_on(dak::hardware::discover()).ok()?;
-    let device = devices.into_iter().next()?;
-    let serial = device
-        .serial_number
-        .clone()
-        .filter(|s| !s.trim().is_empty())?;
-    let key = dak::lock::DeviceKey::new(
-        device.vendor_id,
-        device.product_id,
-        Some(&serial),
-        &format!("{:?}", device.id),
-    );
-    let config = format!(
-        r#"{{"scenes": {{"on_start": {{}}}}, "devices": {{"1": {{
-            "device_id": "{:04X}:{:04X}", "device_name": "test", "serial": "{serial}",
-            "key_count": 9, "encoder_count": 3, "screens": 6,
-            "buttons": [{{"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1}}],
-            "encoders": []
-        }}}}}}"#,
-        device.vendor_id, device.product_id
-    );
-    Some((common::write_temp_config(&config), key))
-}
-
 /// A configured keypad held by another dak is skipped with a message naming the
 /// holder, and with nothing left to drive the program exits with status 5.
 #[test]
 fn device_held_by_another_instance_exits_with_busy_status() {
-    let Some((config, key)) = config_for_attached_device() else {
+    let Some((config, key)) = common::config_for_attached_device() else {
         eprintln!("skipping: no keypad attached");
         return;
     };
@@ -143,7 +113,7 @@ fn device_held_by_another_instance_exits_with_busy_status() {
 /// that wait cleanly (status 0).
 #[test]
 fn waiting_for_a_held_device_stops_cleanly_on_sigterm() {
-    let Some((config, key)) = config_for_attached_device() else {
+    let Some((config, key)) = common::config_for_attached_device() else {
         eprintln!("skipping: no keypad attached");
         return;
     };

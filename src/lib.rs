@@ -21,6 +21,7 @@ pub mod baseplane;
 pub mod cli;
 pub mod color;
 pub mod control;
+pub mod daemon;
 pub mod exit;
 pub mod hardware;
 pub mod lock;

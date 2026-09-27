@@ -55,3 +55,17 @@ async fn run_action_command_allows_slow_program() {
     let result = tokio::time::timeout(Duration::from_secs(5), run_action_command(command)).await;
     assert!(result.is_ok(), "expected the slow command to complete");
 }
+
+/// An action command's stdin is `/dev/null`, never the terminal: a program reading it
+/// sees EOF at once instead of hanging (or stealing a terminal user's input).
+#[tokio::test]
+async fn run_action_command_gives_eof_on_stdin() {
+    let command = CommandSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "cat >/dev/null".to_string()],
+    };
+    tokio::time::timeout(Duration::from_secs(5), run_action_command(command))
+        .await
+        .expect("cat ends on EOF instead of waiting for input")
+        .expect("cat succeeds");
+}

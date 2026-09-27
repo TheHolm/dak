@@ -99,6 +99,29 @@ with the facility from logging.syslog_facility (default user)"
     )]
     pub replace: bool,
 
+    /// Detach from the terminal and run in the background.
+    #[arg(
+        long,
+        conflicts_with = "map",
+        help = "Detach from the terminal and run in the background",
+        long_help = "Detach from the terminal and run in the background as a daemon: fork, start \
+a new session, change to /, and point stdin, stdout and stderr at /dev/null. The configuration \
+is checked first, and the command only returns once the daemon has connected its devices (exit \
+status 0) or failed to start (its exit status and last error). Log lines go to syslog unless \
+the logging section or --log-file says otherwise. Not needed under systemd"
+    )]
+    pub detach: bool,
+
+    /// Write the process id to this file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the process id to PATH",
+        long_help = "Write the process id (of the daemon, with --detach) to PATH, and remove the \
+file again on exit"
+    )]
+    pub pid_file: Option<PathBuf>,
+
     /// Run the interactive device-mapping wizard instead of normal operation.
     #[arg(
         long,

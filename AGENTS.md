@@ -92,6 +92,14 @@ under other platforms.
 - `src/exit.rs` — the exit statuses (0 ok, 1 failure, 2 usage, 3 config, 4 no
   device, 5 all devices busy); `EXIT_CODES` is checked against `dak(1)`'s EXIT STATUS
   by `tests/man_pages.rs`, and `tests/exit_status.rs` runs the binary for them
+- `src/daemon.rs` — background service support: `detach` (pipe, fork, setsid,
+  fork, chdir `/`, stdio to `/dev/null`, pid file; `unsafe`, must run before the
+  tokio runtime exists) with a `Readiness` pipe over which the daemon sends one
+  `StartupReport` so `dak --detach` returns the daemon's real startup status and last
+  error (`log::last_error`); `write_pid_file`/`remove_pid_file`; `notify`/`notify_to`,
+  a hand-written `sd_notify` client (path or Linux `@abstract` `NOTIFY_SOCKET`). `serve`
+  in `main.rs` counts each device task's `StartSignal` (connected / waiting for a lock)
+  and reports READY once all have reported or ended. `tests/daemon.rs` runs the binary
 - `src/control.rs` — signal handling: one task (`spawn_signal_handler`) owns the
   SIGINT/SIGTERM/SIGHUP listeners for the program's whole life and records requests
   in a `Controller` (a second quit exits at once); device tasks get a level-triggered

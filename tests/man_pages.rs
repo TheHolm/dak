@@ -82,6 +82,19 @@ log output writes journal lines (see
 in
 .BR dak\-config (5)).
 .TP
+.B NOTIFY_SOCKET
+Set by systemd for a
+.B Type=notify
+service. When present,
+.B dak
+reports
+.B READY=1
+once its devices are connected (or waiting for another instance),
+.B STOPPING=1
+when it is told to stop, and a
+.B STATUS=
+line.
+.TP
 .B DAK_LOCK_DIR
 The directory device lock files are kept in, instead of
 .I /run/lock
@@ -109,6 +122,13 @@ The default log file, when the
 .B file
 log output is used.
 .TP
+.I PATH
+of
+.B \-\-pid\-file
+Holds the process id while
+.B dak
+runs; removed on exit.
+.TP
 .I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
 One lock file per keypad (in
 .I /tmp
@@ -117,6 +137,32 @@ where
 does not exist), holding the process id, user and start time of the
 .B dak
 using it.
+.SH "RUNNING IN THE BACKGROUND"
+With
+.B \-\-detach
+.B dak
+forks into the background, starts a new session, changes to
+.I /
+and points its standard input, output and error at
+.IR /dev/null .
+The configuration and the log outputs are checked before forking, so their
+errors appear in the terminal; the command then waits until the daemon has
+connected its devices (or is waiting for a device held by another instance)
+and exits with status 0, or exits with the daemon's own status and last error
+when it failed to start. The
+.B auto
+log output goes to syslog once detached. Programs run by actions get
+.I /dev/null
+as standard input in every mode.
+.PP
+Under systemd do not use
+.BR \-\-detach :
+run
+.B dak
+in the foreground as a
+.B Type=notify
+service instead; it reports readiness through
+.BR NOTIFY_SOCKET .
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -171,6 +217,10 @@ Write only warnings and errors, to the console and to a log file.
 .TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
+.TP
+.B dak \-\-detach \-\-pid\-file /tmp/dak.pid
+Run in the background, logging to syslog; returns once the devices are
+connected.
 .TP
 .B dak \-\-replace
 Take the keypad over from a

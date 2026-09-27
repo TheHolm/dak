@@ -33,6 +33,8 @@ Options:
       --log-level <LEVEL> Log level: error, warning, info or debug
       --log-file <PATH>   Also append log lines (timestamped) to PATH
       --syslog            Also send log lines to syslog
+      --detach            Run in the background (returns once the keypads are connected)
+      --pid-file <PATH>   Write the process id to PATH (removed on exit)
       --wait              Wait for keypads held by another dak to be released
       --replace           Stop the dak holding a keypad (same user, or root) and take it over
       --map               Run the interactive device-mapping wizard instead of
@@ -633,6 +635,24 @@ subsystems and (unless `--log-level` is given) raises the level to `debug`, and
 cannot be opened stops dak at startup with exit status 3. Lines from before the config
 is read (banner, config location, config errors) always go to the console, or the
 journal under systemd.
+
+### Running in the background
+
+`dak --detach` runs dak as a classic daemon: it forks into the background, starts a new
+session, changes to `/` and points stdin/stdout/stderr at `/dev/null`. The config and
+the log outputs are checked first, so their errors still show in the terminal, and the
+command only returns once the daemon is up - with status 0 and e.g.
+`dak is running in the background: 1 device connected` - or with the daemon's own exit
+status and last error when it could not start (e.g. status 4 when no configured keypad
+is attached). Once detached, `auto` logging goes to syslog; set `logging` or pass
+`--log-file` for a file instead. `--pid-file PATH` records the process id (also without
+`--detach`) and removes the file on exit.
+
+Under systemd don't detach: run dak in the foreground as a `Type=notify` service; it
+tells systemd when it is ready (`READY=1`, with a `STATUS=` line) and when it is
+stopping. Commands started by actions and `text_exec`/`image_exec` always get
+`/dev/null` as stdin, so a program waiting for input can never hang on the terminal,
+and a failing `text_exec`/`image_exec` program's stderr is quoted in the error.
 
 ### One dak per keypad
 

@@ -222,8 +222,11 @@ impl Log {
         format!("error: {message}")
     }
 
-    /// Writes an error; errors are always written.
+    /// Writes an error; errors are always written. The message is also remembered as
+    /// [`last_error`].
     pub fn error(&self, message: impl fmt::Display) {
+        let message = message.to_string();
+        *LAST_ERROR.lock().expect("last error lock poisoned") = Some(message.clone());
         emit(Level::Error, &self.error_line(message));
     }
 }
@@ -913,6 +916,15 @@ fn send_syslog(facility: Facility, level: Level, text: &str) {
     };
 }
 
+/// The most recent [`Log::error`] message.
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// The most recent error message written (without the `error:` prefix), e.g. to tell
+/// the user in the terminal why a detached daemon failed to start.
+pub fn last_error() -> Option<String> {
+    LAST_ERROR.lock().expect("last error lock poisoned").clone()
+}
+
 /// The installed outputs; `None` means plain console output.
 static SINKS: RwLock<Option<Arc<Sinks>>> = RwLock::new(None);
 
@@ -1069,6 +1081,13 @@ mod tests {
         assert_eq!(Level::Warning.syslog_priority(), 4);
         assert_eq!(Level::Info.syslog_priority(), 6);
         assert_eq!(Level::Debug.syslog_priority(), 7);
+    }
+
+    /// The last error written is remembered, without its prefix.
+    #[test]
+    fn last_error_is_remembered() {
+        Log::default().error("unit test failure marker");
+        assert!(last_error().is_some());
     }
 
     /// Warning and error lines always carry their prefix, without any filtering.

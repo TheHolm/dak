@@ -3328,12 +3328,20 @@ pub async fn run_command_with_timeout(
     let display = command.display();
     let mut child = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        // Never the terminal (or whatever dak's stdin is once detached): a program
+        // waiting for input would only sit there until the timeout kills it.
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("command \"{display}\" failed to start: {error}"))?;
     let mut stdout = child.stdout.take().expect("stdout pipe was requested");
+    // stderr is drained alongside stdout: left unread, a chatty program fills the pipe
+    // and blocks on its own write until the timeout. The first bytes are kept for the
+    // failure message.
+    let stderr = child.stderr.take().expect("stderr pipe was requested");
+    let stderr_task = tokio::spawn(drain_stderr(stderr));
 
     // Drain stdout *before* waiting for exit, not after: a program producing more than
     // one OS pipe buffer's worth of output blocks on its own `write()` once that buffer
@@ -3379,21 +3387,64 @@ pub async fn run_command_with_timeout(
     };
 
     if !status.success() {
-        return Err(format!("command \"{display}\" exited with {status}"));
+        let stderr = stderr_task.await.unwrap_or_default();
+        return Err(with_stderr(
+            format!("command \"{display}\" exited with {status}"),
+            &stderr,
+        ));
     }
     Ok(bytes)
+}
+
+/// How much of a failed command's stderr is quoted in its error message.
+pub const STDERR_EXCERPT_BYTES: usize = 512;
+
+/// Reads `stderr` to its end, keeping at most [`STDERR_EXCERPT_BYTES`] of it.
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(read) => {
+                let room = STDERR_EXCERPT_BYTES.saturating_sub(kept.len());
+                kept.extend_from_slice(&buffer[..read.min(room)]);
+            }
+        }
+    }
+}
+
+/// `message` followed by the trimmed stderr excerpt (as `: <text>`, newlines shown as
+/// ` / `), or `message` alone when the program printed nothing.
+pub fn with_stderr(message: String, stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if text.is_empty() {
+        message
+    } else {
+        format!("{message}: {text}")
+    }
 }
 
 /// Runs an action command (`Action::Command`) to completion in the background.
 ///
 /// Unlike [`run_command_with_timeout`] this imposes no timeout and captures no output:
-/// the child inherits this process's stdio and runs until it exits on its own, so
+/// the child inherits this process's stdout and stderr (the terminal, the journal, or
+/// `/dev/null` once detached; stdin is always `/dev/null`) and runs until it exits on
+/// its own, so
 /// long-running programs (e.g. playing a sound) are neither killed nor awaited inline
 /// by the device input loop. Callers spawn the returned future on the runtime.
 pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
     let display = command.display();
     let status = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        .stdin(std::process::Stdio::null())
         .status()
         .await
         .map_err(|error| format!("command \"{display}\" failed to start: {error}"))?;
