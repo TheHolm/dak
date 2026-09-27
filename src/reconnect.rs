@@ -297,7 +297,7 @@ pub fn reconnected_message(device_number: u8, name: &str, serial: &str) -> Strin
 ///
 /// This is the "wait for the device to come back" loop: `attempt` receives the 1-based
 /// attempt number, rediscovers and reconnects, returning `None` while the device is
-/// still absent (or not yet ready to be opened); `cancel` is Ctrl-C, so the program can
+/// still absent (or not yet ready to be opened); `cancel` is the stop signal, so the program can
 /// still be stopped while it waits. `cancel` is also checked during an attempt, not
 /// only between attempts.
 pub async fn wait_until<T, A, Fut, C>(

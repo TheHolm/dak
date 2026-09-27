@@ -78,14 +78,40 @@ The preferred per\-user configuration location.
 .TP
 .I ./config.json
 Configuration in the current directory.
+.SH SIGNALS
+.TP
+.BR SIGINT ", " SIGTERM
+Stop cleanly: clear the button images this session changed, shut every
+device down and exit with status 0. A second one while that cleanup is
+still running exits at once with status 1.
+.TP
+.B SIGHUP
+Stops cleanly, like
+.BR SIGTERM .
 .SH "EXIT STATUS"
 .TP
 .B 0
-Normal termination, including termination by Ctrl\-C.
+Normal termination, including termination by Ctrl\-C or
+.BR SIGTERM .
 .TP
-.B non\-zero
-No configured device was found, a device could not be connected, or the
-configuration could not be loaded.
+.B 1
+Unspecified failure, for example a device that could not be opened, or a
+repeated stop signal that ended the program before its cleanup finished.
+.TP
+.B 2
+Invalid command line.
+.TP
+.B 3
+Configuration error: the configuration file could not be read or failed
+validation. Restarting will not help until it is fixed.
+.TP
+.B 4
+No configured device found: no device defined in the configuration is
+attached, or every one was lost and given up on.
+.TP
+.B 5
+Every configured device that was found is held by another running
+.BR dak .
 .SH EXAMPLES
 .TP
 .B dak
@@ -148,7 +174,7 @@ fn render_dak_1() -> Vec<u8> {
     let man = clap_mangen::Man::new(Cli::command())
         .title("DAK")
         .section("1")
-        .date("2026-09-20")
+        .date("2026-09-27")
         .source(format!("dak {}", env!("CARGO_PKG_VERSION")))
         .manual("User Commands");
     let mut page = Vec::new();
@@ -403,6 +429,26 @@ fn dak_config_5_documents_the_config_vocabulary() {
                 "man/dak-config.5 does not document the {label} {name:?}"
             );
         }
+    }
+}
+
+/// The EXIT STATUS section of `dak(1)` lists every status the program can exit with,
+/// taken straight from `dak::exit::EXIT_CODES`, so a new status cannot go undocumented.
+#[test]
+fn dak_1_documents_every_exit_status() {
+    let page = std::fs::read_to_string(DAK_1.path).expect("man/dak.1 readable");
+    let section = page
+        .split(".SH \"EXIT STATUS\"")
+        .nth(1)
+        .expect("man/dak.1 has an EXIT STATUS section")
+        .split("\n.SH ")
+        .next()
+        .unwrap();
+    for (code, meaning) in dak::exit::EXIT_CODES {
+        assert!(
+            section.contains(&format!(".B {code}\n")),
+            "man/dak.1 EXIT STATUS does not document status {code} ({meaning})"
+        );
     }
 }
 

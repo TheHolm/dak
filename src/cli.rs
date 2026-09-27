@@ -23,8 +23,8 @@ bindings distinguish short presses, long presses and double clicks, encoders bin
 per rotation notch, and each scene may run a timer. See dak-config(5) for the configuration \
 file format.\n\n\
 dak is a command-line-only tool: a config file plus a binary, with no GUI. It runs until it \
-is interrupted (Ctrl-C) or the device disconnects, then restores the button images it changed \
-and shuts the device down."
+is told to stop (Ctrl-C, SIGTERM or SIGHUP) or its devices are gone, then restores the button \
+images it changed and shuts the devices down."
 )]
 pub struct Cli {
     /// Path to the config file.

@@ -21,6 +21,8 @@ use dak::actions::{self, Action, ButtonDevice};
 use dak::baseplane::Reference;
 use dak::cli::Cli;
 use dak::color::Color;
+use dak::control::{self, Controller, StopSignal, StopSource};
+use dak::exit;
 use dak::hardware;
 use dak::log::{Log, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
@@ -28,32 +30,41 @@ use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDeci
 use dak::reconnect::{self, SwappableDevice};
 use dak::variables::{VarValue, Variables};
 
-/// Loads the config, matches the config's `devices` definitions against the discovered
-/// hardware, and drives every present device: each connects with its own key/encoder
-/// counts, applies the `on_start` scene, and reacts to keys, encoder events and scene
-/// timers.
+/// Parses the command line, loads the config and drives every configured device until
+/// the program is told to stop, returning one of the [`dak::exit`] statuses.
 ///
-/// A device definition is matched to a discovered device by its serial number, falling
-/// back to the VID:PID string when the definition's serial is "unknown". Definitions with
-/// no matching hardware and discovered devices without a config definition are reported
-/// and skipped; when no configured device is found the program exits with
-/// `DeviceNotFoundError`.
-#[tokio::main]
-async fn main() -> Result<(), MirajazzError> {
+/// The config is loaded (and validated) before the async runtime even starts, so a
+/// configuration error is reported, with its own exit status, before anything touches
+/// a device or forks into the background.
+fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let log = Log::from_debug_values(&cli.debug);
     log.info(format!(
         "DAK (Dynamic Ajazz Keyboard) v{}",
         env!("CARGO_PKG_VERSION")
     ));
+    std::process::ExitCode::from(run(cli, log))
+}
 
+/// The whole program after argument parsing; returns the exit status.
+fn run(cli: Cli, log: Log) -> u8 {
     // The mapping wizard runs standalone: it must not read the config nor
     // execute any actions, and it exits on its own when done.
     if cli.map {
-        return dak::map::run_map_wizard(log).await;
+        return match build_runtime(log) {
+            Some(runtime) => match runtime.block_on(dak::map::run_map_wizard(log)) {
+                Ok(()) => exit::SUCCESS,
+                Err(MirajazzError::DeviceNotFoundError) => exit::NO_DEVICE,
+                Err(error) => {
+                    log.error(error);
+                    exit::FAILURE
+                }
+            },
+            None => exit::FAILURE,
+        };
     }
 
-    let config_path = actions::resolve_config_path(cli.config.as_deref());
+    let config_path = absolute_config_path(&actions::resolve_config_path(cli.config.as_deref()));
     log.info(format!("Using config: {}", config_path.display()));
     let config = match actions::load_config_from_path(&config_path.to_string_lossy()) {
         Ok(config) => {
@@ -74,17 +85,153 @@ async fn main() -> Result<(), MirajazzError> {
             for error in &errors {
                 log.error(error);
             }
-            return Err(MirajazzError::BadData);
+            return exit::CONFIG;
         }
     };
+
+    let Some(runtime) = build_runtime(log) else {
+        return exit::FAILURE;
+    };
+    runtime.block_on(serve(config, log))
+}
+
+/// Makes `path` absolute against the current directory, so it keeps naming the same
+/// file after a later change of directory (e.g. when detaching into the background).
+/// A path that cannot be made absolute is returned unchanged.
+fn absolute_config_path(path: &std::path::Path) -> std::path::PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Builds the multi-threaded tokio runtime the device tasks run on, logging (and
+/// returning `None`) if the OS refuses to provide one.
+fn build_runtime(log: Log) -> Option<tokio::runtime::Runtime> {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => Some(runtime),
+        Err(error) => {
+            log.error(format!("failed to start the async runtime: {error}"));
+            None
+        }
+    }
+}
+
+/// Matches the config's `devices` definitions against the discovered hardware and
+/// drives every present device: each connects with its own key/encoder counts, applies
+/// the `on_start` scene, and reacts to keys, encoder events and scene timers, until a
+/// stop signal arrives or every device has ended. Returns the exit status.
+///
+/// A device definition is matched to a discovered device by its serial number, falling
+/// back to the VID:PID string when the definition's serial is "unknown". Definitions with
+/// no matching hardware and discovered devices without a config definition are reported
+/// and skipped; when no configured device is found the program exits with
+/// [`exit::NO_DEVICE`].
+async fn serve(config: actions::LoadedConfig, log: Log) -> u8 {
+    // Signal listeners go in first, so a SIGTERM during discovery already ends the
+    // program cleanly instead of killing it.
+    let controller = Arc::new(Controller::new());
+    if let Err(error) = control::spawn_signal_handler(controller.clone(), log) {
+        log.error(format!("failed to install signal handlers: {error}"));
+        return exit::FAILURE;
+    }
+    let stop = StopSource::new();
 
     // Discovered devices come back from an unordered set. Each config device definition
     // (keyed by a logical device id) is matched against this set: serial numbers tell
     // identical devices apart, a VID:PID fallback covers devices without serials.
-    let devices: Vec<HidDevice> = list_devices(&hardware::QUERIES)
-        .await?
-        .into_iter()
-        .collect();
+    let devices: Vec<HidDevice> = match list_devices(&hardware::QUERIES).await {
+        Ok(devices) => devices.into_iter().collect(),
+        Err(error) => {
+            log.error(format!("device discovery failed: {error}"));
+            return exit::FAILURE;
+        }
+    };
+    let assignments = match_devices(&config, &devices, log);
+    if assignments.is_empty() {
+        log.error("no device defined in config was found");
+        return exit::NO_DEVICE;
+    }
+
+    // Drive every present device, each on its own task with its own input loop, scene
+    // state and timer. The stop signal reaches every loop, so every device runs its
+    // cleanup.
+    let mut handles = Vec::new();
+    // One variable/default state shared by every device: the declarations are global, so
+    // an assignment from one device's input is visible to all of them.
+    let variables = Arc::new(std::sync::Mutex::new(Variables::new(
+        config.variables.clone(),
+        &config.defaults,
+    )));
+    for (device_number, definition, device_info) in assignments {
+        let scenes = config.scenes.clone();
+        handles.push(tokio::spawn(run_device(
+            device_number,
+            definition,
+            device_info,
+            scenes,
+            log,
+            config.defaults.clone(),
+            variables.clone(),
+            config.fonts.clone(),
+            stop.signal(),
+        )));
+    }
+
+    // Wait for every device task, so one device failing (e.g. its first connection
+    // could not be opened) does not take the other, working devices down with it; the
+    // first failure is still reported as the program's exit status once all are done.
+    let mut all_done = Box::pin(async {
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.await);
+        }
+        outcomes
+    });
+    let outcomes = tokio::select! {
+        outcomes = &mut all_done => outcomes,
+        _ = controller.quit_requested() => {
+            stop.stop();
+            all_done.await
+        }
+    };
+
+    let mut status = exit::SUCCESS;
+    for outcome in outcomes {
+        let failure = match outcome {
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => {
+                log.error(format!("device task ended with an error: {error}"));
+                device_error_status(&error)
+            }
+            Err(error) => {
+                log.error(format!("device task failed unexpectedly: {error}"));
+                exit::FAILURE
+            }
+        };
+        if status == exit::SUCCESS {
+            status = failure;
+        }
+    }
+    status
+}
+
+/// The exit status a device task's error maps to: a device that could not be found (or
+/// was given up on) is [`exit::NO_DEVICE`]; anything else is [`exit::FAILURE`].
+fn device_error_status(error: &MirajazzError) -> u8 {
+    match error {
+        MirajazzError::DeviceNotFoundError => exit::NO_DEVICE,
+        _ => exit::FAILURE,
+    }
+}
+
+/// Pairs each config device definition with the discovered device it describes,
+/// warning about definitions without hardware and hardware without a definition.
+fn match_devices(
+    config: &actions::LoadedConfig,
+    devices: &[HidDevice],
+    log: Log,
+) -> Vec<(u8, Mapping, HidDeviceInfo)> {
     let mut assignments: Vec<(u8, Mapping, HidDeviceInfo)> = Vec::new();
     for (device_id, definition) in &config.devices.by_id {
         match devices.iter().position(|dev| {
@@ -109,7 +256,7 @@ async fn main() -> Result<(), MirajazzError> {
         }
     }
 
-    for dev in &devices {
+    for dev in devices {
         if !assignments.iter().any(|(_, _, info)| info.id == dev.id) {
             log.warn(format!(
                 "device found but not defined in config; ignoring: {}",
@@ -123,61 +270,12 @@ async fn main() -> Result<(), MirajazzError> {
             ));
         }
     }
-
-    if assignments.is_empty() {
-        log.error("no device defined in config was found");
-        return Err(MirajazzError::DeviceNotFoundError);
-    }
-
-    // Drive every present device, each on its own task with its own input loop, scene
-    // state and timer. Ctrl-C reaches every loop, so every device runs its cleanup.
-    let mut handles = Vec::new();
-    // One variable/default state shared by every device: the declarations are global, so
-    // an assignment from one device's input is visible to all of them.
-    let variables = Arc::new(std::sync::Mutex::new(Variables::new(
-        config.variables.clone(),
-        &config.defaults,
-    )));
-    for (device_number, definition, device_info) in assignments {
-        let scenes = config.scenes.clone();
-        handles.push(tokio::spawn(run_device(
-            device_number,
-            definition,
-            device_info,
-            scenes,
-            log,
-            config.defaults.clone(),
-            variables.clone(),
-            config.fonts.clone(),
-        )));
-    }
-    // Wait for every device task, so one device failing (e.g. its first connection
-    // could not be opened) does not take the other, working devices down with it; the
-    // first failure is still reported as the program's exit status once all are done.
-    let mut first_error: Option<MirajazzError> = None;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                log.error(format!("device task ended with an error: {error}"));
-                first_error.get_or_insert(error);
-            }
-            Err(error) => {
-                log.error(format!("device task failed unexpectedly: {error}"));
-                first_error.get_or_insert(MirajazzError::BadData);
-            }
-        }
-    }
-
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    assignments
 }
 
 /// Runs one present device: connects with the key/encoder counts from its config
 /// definition, applies the `on_start` scene, and reacts to keys, encoder events, scene
-/// timers and complex press events until the reader closes or Ctrl-C is pressed, then
+/// timers and complex press events until the reader closes or `stop` fires, then
 /// restores the buttons this session changed and shuts the device down.
 ///
 /// `device_number` is the id the definition is keyed under in the config; the runner
@@ -195,6 +293,7 @@ async fn run_device(
     defaults: Defaults,
     variables: Arc<std::sync::Mutex<Variables>>,
     fonts: Arc<dak::text::FontSet>,
+    stop: StopSignal,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -374,7 +473,7 @@ async fn run_device(
     let mut previous_scene: Option<String> = None;
 
     // One pass per connection: the input loop runs until the program is told to stop
-    // (Ctrl-C, a closed channel) or the device goes away; then this waits for the
+    // (a stop signal, a closed channel) or the device goes away; then this waits for the
     // device to come back, swaps the new connection in, repaints and loops again.
     'connection: loop {
         let Some(reader) = device
@@ -393,6 +492,7 @@ async fn run_device(
                 log,
                 "device lost while reconnecting",
                 reconnect_policy,
+                &stop,
             )
             .await
             {
@@ -594,9 +694,9 @@ async fn run_device(
                         );
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    // Ctrl-C (SIGINT) normally kills the process instantly; route it
-                    // through the same break so the cleanup + shutdown below run.
+                _ = stop.stopped() => {
+                    // A stop signal (SIGINT/SIGTERM, see `control`): route it through
+                    // the same break so the cleanup + shutdown below run.
                     break SessionEnd::Quit;
                 }
                 _ = device.disconnected() => {
@@ -630,11 +730,12 @@ async fn run_device(
                     log,
                     &reason,
                     reconnect_policy,
+                    &stop,
                 )
                 .await
                 {
                     Reconnect::Reconnected => continue 'connection,
-                    // Ctrl-C while waiting: nothing left to restore on a missing device.
+                    // Stopped while waiting: nothing left to restore on a missing device.
                     Reconnect::Cancelled => return Ok(()),
                     // Only this device's task ends; the others keep running, and the
                     // program's exit status reports the failure once they are done.
@@ -693,7 +794,7 @@ fn warn_unless_disconnected<D: ButtonDevice>(
 
 /// How one connection's input loop in [`run_device`] ended.
 enum SessionEnd {
-    /// Stop the program: Ctrl-C, or one of the event channels closed.
+    /// Stop the program: a stop signal, or one of the event channels closed.
     Quit,
     /// The device went away; carries how that was noticed, for the warning.
     Disconnected(String),
@@ -704,7 +805,7 @@ enum SessionEnd {
 enum Reconnect {
     /// A new connection is attached and the screen was repainted.
     Reconnected,
-    /// Ctrl-C arrived while waiting; the program should end.
+    /// A stop signal arrived while waiting; the program should end.
     Cancelled,
     /// The allowed attempts ran out; this device is no longer driven.
     GaveUp,
@@ -753,7 +854,7 @@ fn current_brightness(variables: &std::sync::Mutex<Variables>) -> (u8, u8) {
 
 /// Handles a lost device: detaches the old connection, warns once (always shown),
 /// then tries to rediscover and reopen the device matching `definition` right away and
-/// every `policy.interval` after that, until it opens, Ctrl-C arrives, or
+/// every `policy.interval` after that, until it opens, `stop` fires, or
 /// `policy.max_attempts` (when nonzero) attempts have failed - in which case an
 /// always-shown error says so and the caller stops driving this device.
 ///
@@ -774,6 +875,7 @@ async fn await_reconnect(
     log: Log,
     reason: &str,
     policy: reconnect::ReconnectPolicy,
+    stop: &StopSignal,
 ) -> Reconnect {
     device.mark_disconnected();
     log.warn(reconnect::disconnected_message(device_number, reason));
@@ -829,18 +931,17 @@ async fn await_reconnect(
             }
         }
     };
-    let (connection, info) =
-        match reconnect::wait_until(policy, attempt, tokio::signal::ctrl_c()).await {
-            reconnect::WaitOutcome::Found(found) => found,
-            reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
-            reconnect::WaitOutcome::GaveUp => {
-                log.error(reconnect::gave_up_message(
-                    device_number,
-                    policy.max_attempts,
-                ));
-                return Reconnect::GaveUp;
-            }
-        };
+    let (connection, info) = match reconnect::wait_until(policy, attempt, stop.stopped()).await {
+        reconnect::WaitOutcome::Found(found) => found,
+        reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
+        reconnect::WaitOutcome::GaveUp => {
+            log.error(reconnect::gave_up_message(
+                device_number,
+                policy.max_attempts,
+            ));
+            return Reconnect::GaveUp;
+        }
+    };
     let name = if info.name.is_empty() {
         original_info.name.clone()
     } else {
@@ -1778,6 +1879,34 @@ mod tests {
             double_click_gap: Duration::from_millis(600),
             ..Defaults::default()
         }
+    }
+
+    /// A device that was never found (or was given up on) maps to the "no device"
+    /// status; every other device error is a generic failure.
+    #[test]
+    fn device_error_status_distinguishes_missing_devices() {
+        use mirajazz::error::MirajazzError;
+        assert_eq!(
+            super::device_error_status(&MirajazzError::DeviceNotFoundError),
+            dak::exit::NO_DEVICE
+        );
+        assert_eq!(
+            super::device_error_status(&MirajazzError::BadData),
+            dak::exit::FAILURE
+        );
+    }
+
+    /// A relative config path becomes absolute (rooted in the current directory), and
+    /// an absolute one is kept as it is.
+    #[test]
+    fn absolute_config_path_roots_relative_paths() {
+        let relative = super::absolute_config_path(Path::new("dir/config.json"));
+        assert!(relative.is_absolute());
+        assert!(relative.ends_with("dir/config.json"));
+        assert_eq!(
+            super::absolute_config_path(Path::new("/etc/dak/config.json")),
+            PathBuf::from("/etc/dak/config.json")
+        );
     }
 
     /// With no arguments the config path is left unset (so the search order applies)

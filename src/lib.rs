@@ -20,6 +20,8 @@ pub mod actions;
 pub mod baseplane;
 pub mod cli;
 pub mod color;
+pub mod control;
+pub mod exit;
 pub mod hardware;
 pub mod log;
 pub mod map;

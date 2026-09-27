@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.13.0 (declared as `0.13.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.14.0 (declared as `0.14.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -89,6 +89,15 @@ under other platforms.
   section 9. `render_lines` draws `markup::Line`s; `render_text`/`render_text_colored`/
   `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant.
   `tests/colour_fonts.rs` uses in-memory fonts from `tests/common/font_builder.rs`
+- `src/exit.rs` — the exit statuses (0 ok, 1 failure, 2 usage, 3 config, 4 no
+  device, 5 all devices busy); `EXIT_CODES` is checked against `dak(1)`'s EXIT STATUS
+  by `tests/man_pages.rs`, and `tests/exit_status.rs` runs the binary for them
+- `src/control.rs` — signal handling: one task (`spawn_signal_handler`) owns the
+  SIGINT/SIGTERM/SIGHUP listeners for the program's whole life and records requests
+  in a `Controller` (a second quit exits at once); device tasks get a level-triggered
+  `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
+  themselves, so a signal arriving mid-event is never lost. `main` is a plain
+  function that loads the config before building the tokio runtime by hand
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
   (`device`/`scene`/`action`/`fonts`) by `-d`/`--debug`; `fonts` prints the font
   lookup order and undrawable-character ranges built by `FontSet::load`, and only
@@ -148,7 +157,6 @@ under other platforms.
 
 Work in progress. Current known issues:
 
-- `main.rs` config errors are printed, but the program still exits with `MirajazzError::BadData` regardless of the specific failure
 - `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop) is
   only unit-tested through its pieces (`SwappableDevice`, `wait_until`,
   `SceneRunner::redraw_all`, `current_brightness`); the end-to-end
