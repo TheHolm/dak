@@ -82,6 +82,15 @@ log output writes journal lines (see
 in
 .BR dak\-config (5)).
 .TP
+.B DAK_LOCK_DIR
+The directory device lock files are kept in, instead of
+.I /run/lock
+(or
+.I /tmp
+where that does not exist). Every
+.B dak
+that may compete for a keypad must use the same directory.
+.TP
 .BR XDG_STATE_HOME
 Where the default log file lives:
 .IR $XDG_STATE_HOME/dak/dak.log ,
@@ -99,6 +108,15 @@ Configuration in the current directory.
 The default log file, when the
 .B file
 log output is used.
+.TP
+.I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
+One lock file per keypad (in
+.I /tmp
+where
+.I /run/lock
+does not exist), holding the process id, user and start time of the
+.B dak
+using it.
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -132,7 +150,10 @@ attached, or every one was lost and given up on.
 .TP
 .B 5
 Every configured device that was found is held by another running
-.BR dak .
+.B dak
+(or, with
+.BR \-\-map ,
+the chosen device is).
 .SH EXAMPLES
 .TP
 .B dak
@@ -150,11 +171,31 @@ Write only warnings and errors, to the console and to a log file.
 .TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
-.SH NOTES
-Only one process may hold the device open at a time; stop any other instance
-of
+.TP
+.B dak \-\-replace
+Take the keypad over from a
 .B dak
-(or other program using the keypad) before starting a new one.
+already running as the same user.
+.SH NOTES
+Only one
+.B dak
+drives a keypad at a time, whichever user runs it. Before opening a device,
+.B dak
+takes an exclusive lock on its lock file (see
+.BR FILES );
+the kernel drops the lock when the process ends, even if it crashes. When
+another instance holds it, the device is skipped with a message naming that
+instance's user and process id; with
+.B \-\-wait
+.B dak
+waits for it to be released, and with
+.B \-\-replace
+it asks the holder to stop and takes the device over. When every configured
+device is held elsewhere the program exits with status 5. The lock is kept
+while a lost device is being waited for, so no other instance takes it over
+meanwhile. The
+.B \-\-map
+wizard also takes the lock and refuses a device in use.
 .PP
 The device definition printed by
 .B \-\-map

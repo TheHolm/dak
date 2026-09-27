@@ -231,10 +231,29 @@ impl Mapping {
     }
 }
 
+/// Why the `dak --map` wizard ended without a mapping.
+#[derive(Debug)]
+pub enum MapError {
+    /// The device could not be found or talked to.
+    Device(MirajazzError),
+    /// The chosen device is held by a running `dak` (already reported).
+    Busy,
+}
+
+impl From<MirajazzError> for MapError {
+    /// Device errors pass through `?` unchanged.
+    fn from(error: MirajazzError) -> Self {
+        MapError::Device(error)
+    }
+}
+
 /// Runs the whole `dak --map` wizard: device selection, count confirmation,
 /// screen count, button and encoder capture, display sanity check, JSON output,
 /// and screen clearing/shutdown.
-pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
+///
+/// The chosen device is locked like a normal run would (see [`crate::lock`]), so the
+/// wizard never captures input from a keypad a running `dak` is driving.
+pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
     log.info("DAK device-mapping wizard (config is not read, no actions run)");
 
     // Step 1: numbered list of detected devices, user picks one by number.
@@ -244,7 +263,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
         .collect();
     if devices.is_empty() {
         log.error("no compatible devices found");
-        return Err(MirajazzError::DeviceNotFoundError);
+        return Err(MirajazzError::DeviceNotFoundError.into());
     }
     println!("Detected devices:");
     for (index, dev) in devices.iter().enumerate() {
@@ -267,6 +286,30 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
     let dev = &devices[pick];
     println!();
 
+    let key = crate::lock::DeviceKey::new(
+        dev.vendor_id,
+        dev.product_id,
+        dev.serial_number.as_deref(),
+        &format!("{:?}", dev.id),
+    );
+    let _lock = match crate::lock::try_lock(&crate::lock::lock_dir(), &key) {
+        Ok(lock) => lock,
+        Err(crate::lock::LockError::Busy(holder)) => {
+            let holder = holder
+                .map(|holder| holder.describe())
+                .unwrap_or_else(|| "another dak".to_string());
+            log.error(format!(
+                "device {} is in use by {holder}; stop it before mapping the device",
+                key.describe()
+            ));
+            return Err(MapError::Busy);
+        }
+        Err(error) => {
+            log.error(error.describe(&key));
+            return Err(MapError::Busy);
+        }
+    };
+
     // Every dev reaching this point already matched hardware::QUERIES above, so this
     // should always resolve; treated as a hard error rather than assumed, in case
     // that invariant is ever broken.
@@ -277,7 +320,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
                 "unrecognized vendor/product ID {:04x}:{:04x}",
                 dev.vendor_id, dev.product_id
             ));
-            return Err(MirajazzError::DeviceNotFoundError);
+            return Err(MirajazzError::DeviceNotFoundError.into());
         }
     };
     println!("Recognized as: {}", kind.human_name());
@@ -407,7 +450,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MirajazzError> {
             Ok(image) => image,
             Err(error) => {
                 log.error(format!("failed to render test label: {error}"));
-                return Err(MirajazzError::BadData);
+                return Err(MirajazzError::BadData.into());
             }
         };
         device

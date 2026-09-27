@@ -33,6 +33,8 @@ Options:
       --log-level <LEVEL> Log level: error, warning, info or debug
       --log-file <PATH>   Also append log lines (timestamped) to PATH
       --syslog            Also send log lines to syslog
+      --wait              Wait for keypads held by another dak to be released
+      --replace           Stop the dak holding a keypad (same user, or root) and take it over
       --map               Run the interactive device-mapping wizard instead of
                           normal operation (see Devices below) and exit
   -h, --help              Print usage help and exit
@@ -631,6 +633,25 @@ subsystems and (unless `--log-level` is given) raises the level to `debug`, and
 cannot be opened stops dak at startup with exit status 3. Lines from before the config
 is read (banner, config location, config errors) always go to the console, or the
 journal under systemd.
+
+### One dak per keypad
+
+Only one `dak` drives a keypad at a time, whichever user started it: two would both
+paint the buttons and both react to every press. Before opening a keypad dak locks a
+file named after it (`/run/lock/dak-<vid>-<pid>-<serial>.lock`, or under `/tmp` where
+`/run/lock` does not exist, or `$DAK_LOCK_DIR`) and writes who holds it; the kernel
+releases the lock whenever that dak ends, even after a crash. When another dak has it:
+
+- by default the keypad is skipped with a warning such as
+  `device 0300:3002 s/n ABCD1234EF56 is in use by dak (user alice, pid 1234, since ...)`,
+  and if no configured keypad is left dak exits with status 5;
+- with `--wait` dak waits until it is released and then takes it - handy when switching
+  users: the next user's dak picks the keypad up as soon as the previous one stops;
+- with `--replace` dak sends the holder `SIGTERM`, waits up to 10 s for it to clean up,
+  and takes over. Only for your own instances, or anyone's as root.
+
+The lock is kept while a lost keypad is being waited for, so nobody takes it over in
+the meantime. `dak --map` locks the keypad too, and refuses one in use.
 
 ## Device install
 

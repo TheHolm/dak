@@ -82,6 +82,23 @@ with the facility from logging.syslog_facility (default user)"
     )]
     pub syslog: bool,
 
+    /// Wait for devices held by another dak instead of skipping them.
+    #[arg(
+        long,
+        conflicts_with = "replace",
+        help = "Wait for devices held by another dak to be released",
+        long_help = "When another dak (of any user) holds a configured device, wait until it releases it and then take it, instead of skipping it. Useful when switching between users: the next user's dak picks the keypad up as soon as the previous one stops"
+    )]
+    pub wait: bool,
+
+    /// Stop the dak holding a device and take it over.
+    #[arg(
+        long,
+        help = "Stop the dak holding a device and take it over",
+        long_help = "When another dak holds a configured device, send it SIGTERM, wait up to 10 seconds for it to clean up and release the device, then take it. Only allowed for your own instances, or for any as root"
+    )]
+    pub replace: bool,
+
     /// Run the interactive device-mapping wizard instead of normal operation.
     #[arg(
         long,

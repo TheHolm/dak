@@ -24,8 +24,9 @@ use dak::color::Color;
 use dak::control::{self, Controller, StopSignal, StopSource};
 use dak::exit;
 use dak::hardware;
+use dak::lock::{self, Conflict, DeviceKey, DeviceLock, LockError};
 use dak::log::{CliLogging, Environment, Log, LogSettings, LoggingConfig, Subsystem};
-use dak::map::{ControlEvent, Mapping, TwistDirection};
+use dak::map::{ControlEvent, MapError, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
 use dak::reconnect::{self, SwappableDevice};
 use dak::variables::{VarValue, Variables};
@@ -74,8 +75,9 @@ fn run(cli: Cli, log: Log) -> u8 {
         return match build_runtime(log) {
             Some(runtime) => match runtime.block_on(dak::map::run_map_wizard(log)) {
                 Ok(()) => exit::SUCCESS,
-                Err(MirajazzError::DeviceNotFoundError) => exit::NO_DEVICE,
-                Err(error) => {
+                Err(MapError::Device(MirajazzError::DeviceNotFoundError)) => exit::NO_DEVICE,
+                Err(MapError::Busy) => exit::DEVICE_BUSY,
+                Err(MapError::Device(error)) => {
                     log.error(error);
                     exit::FAILURE
                 }
@@ -121,7 +123,8 @@ fn run(cli: Cli, log: Log) -> u8 {
     let Some(runtime) = build_runtime(log) else {
         return exit::FAILURE;
     };
-    runtime.block_on(serve(config, log))
+    let conflict = Conflict::from_flags(cli.wait, cli.replace);
+    runtime.block_on(serve(config, log, conflict))
 }
 
 /// Resolves the logging setup from the config's `logging` section and the command-line
@@ -171,7 +174,7 @@ fn build_runtime(log: Log) -> Option<tokio::runtime::Runtime> {
 /// no matching hardware and discovered devices without a config definition are reported
 /// and skipped; when no configured device is found the program exits with
 /// [`exit::NO_DEVICE`].
-async fn serve(config: actions::LoadedConfig, log: Log) -> u8 {
+async fn serve(config: actions::LoadedConfig, log: Log, conflict: Conflict) -> u8 {
     // Signal listeners go in first, so a SIGTERM during discovery already ends the
     // program cleanly instead of killing it.
     let controller = Arc::new(Controller::new());
@@ -179,7 +182,15 @@ async fn serve(config: actions::LoadedConfig, log: Log) -> u8 {
         log.error(format!("failed to install signal handlers: {error}"));
         return exit::FAILURE;
     }
-    let stop = StopSource::new();
+    // A quit request stops every device task (and any lock wait) from here on.
+    let stop = Arc::new(StopSource::new());
+    {
+        let (controller, stop) = (controller.clone(), stop.clone());
+        tokio::spawn(async move {
+            controller.quit_requested().await;
+            stop.stop();
+        });
+    }
 
     // Discovered devices come back from an unordered set. Each config device definition
     // (keyed by a logical device id) is matched against this set: serial numbers tell
@@ -207,47 +218,82 @@ async fn serve(config: actions::LoadedConfig, log: Log) -> u8 {
         config.variables.clone(),
         &config.defaults,
     )));
+    let lock_dir = lock::lock_dir();
+    let (mut busy, mut failed) = (0usize, 0usize);
     for (device_number, definition, device_info) in assignments {
+        let key = device_key(&device_info);
+        // Refusing and replacing settle the lock before the device task starts (so a
+        // device held elsewhere is merely skipped); waiting happens inside the task, so
+        // the other devices start meanwhile.
+        let lock = if conflict == Conflict::Wait {
+            None
+        } else {
+            match take_device_lock(&lock_dir, &key, conflict, &stop.signal(), log).await {
+                Ok(lock) => Some(lock),
+                Err(LockError::Busy(_)) => {
+                    busy += 1;
+                    continue;
+                }
+                Err(LockError::Cancelled) => break,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            }
+        };
         let scenes = config.scenes.clone();
-        handles.push(tokio::spawn(run_device(
-            device_number,
-            definition,
-            device_info,
-            scenes,
-            log,
-            config.defaults.clone(),
-            variables.clone(),
-            config.fonts.clone(),
-            stop.signal(),
-        )));
+        let defaults = config.defaults.clone();
+        let variables = variables.clone();
+        let fonts = config.fonts.clone();
+        let signal = stop.signal();
+        let lock_dir = lock_dir.clone();
+        handles.push(tokio::spawn(async move {
+            let _lock = match lock {
+                Some(lock) => lock,
+                None => match take_device_lock(&lock_dir, &key, conflict, &signal, log).await {
+                    Ok(lock) => lock,
+                    Err(LockError::Cancelled) => return Ok(()),
+                    Err(_) => return Err(TaskError::Reported(exit::FAILURE)),
+                },
+            };
+            run_device(
+                device_number,
+                definition,
+                device_info,
+                scenes,
+                log,
+                defaults,
+                variables,
+                fonts,
+                signal,
+            )
+            .await
+            .map_err(TaskError::Device)
+        }));
+    }
+    if handles.is_empty() {
+        if stop.signal().is_stopped() {
+            return exit::SUCCESS;
+        }
+        if busy > 0 && failed == 0 {
+            log.error("every configured device found is in use by another dak");
+            return exit::DEVICE_BUSY;
+        }
+        return exit::FAILURE;
     }
 
     // Wait for every device task, so one device failing (e.g. its first connection
     // could not be opened) does not take the other, working devices down with it; the
     // first failure is still reported as the program's exit status once all are done.
-    let mut all_done = Box::pin(async {
-        let mut outcomes = Vec::new();
-        for handle in handles {
-            outcomes.push(handle.await);
-        }
-        outcomes
-    });
-    let outcomes = tokio::select! {
-        outcomes = &mut all_done => outcomes,
-        _ = controller.quit_requested() => {
-            stop.stop();
-            all_done.await
-        }
-    };
-
     let mut status = exit::SUCCESS;
-    for outcome in outcomes {
-        let failure = match outcome {
+    for handle in handles {
+        let failure = match handle.await {
             Ok(Ok(())) => continue,
-            Ok(Err(error)) => {
+            Ok(Err(TaskError::Device(error))) => {
                 log.error(format!("device task ended with an error: {error}"));
                 device_error_status(&error)
             }
+            Ok(Err(TaskError::Reported(status))) => status,
             Err(error) => {
                 log.error(format!("device task failed unexpectedly: {error}"));
                 exit::FAILURE
@@ -258,6 +304,68 @@ async fn serve(config: actions::LoadedConfig, log: Log) -> u8 {
         }
     }
     status
+}
+
+/// Why a device task in [`serve`] ended early.
+enum TaskError {
+    /// Driving the device failed.
+    Device(MirajazzError),
+    /// Something already logged went wrong; exit with this status.
+    Reported(u8),
+}
+
+/// The lock identity of a discovered device (see [`DeviceKey`]).
+fn device_key(info: &HidDeviceInfo) -> DeviceKey {
+    DeviceKey::new(
+        info.vendor_id,
+        info.product_id,
+        info.serial_number.as_deref(),
+        &format!("{:?}", info.id),
+    )
+}
+
+/// Takes the lock of one device per `conflict`, logging what happens: a skipped busy
+/// device is a warning, a failure to lock (or to take over) an error, and waiting for
+/// another instance an info line.
+async fn take_device_lock(
+    dir: &std::path::Path,
+    key: &DeviceKey,
+    conflict: Conflict,
+    stop: &StopSignal,
+    log: Log,
+) -> Result<DeviceLock, LockError> {
+    let result = lock::acquire(dir, key, conflict, stop, |holder| {
+        let holder = holder
+            .map(|holder| holder.describe())
+            .unwrap_or_else(|| "another dak".to_string());
+        match conflict {
+            Conflict::Replace => log.info(format!(
+                "device {}: asked {holder} to stop; waiting for it to release the device",
+                key.describe()
+            )),
+            _ => log.info(format!(
+                "device {} is in use by {holder}; waiting for it to be released",
+                key.describe()
+            )),
+        }
+    })
+    .await;
+    match &result {
+        Ok(lock) => log.debug(
+            Subsystem::Device,
+            format!(
+                "device {}: locked {}",
+                key.describe(),
+                lock.path().display()
+            ),
+        ),
+        Err(error @ LockError::Busy(_)) => log.warn(error.describe(key)),
+        Err(LockError::Cancelled) => {
+            log.debug(Subsystem::Device, LockError::Cancelled.describe(key))
+        }
+        Err(error) => log.error(error.describe(key)),
+    }
+    result
 }
 
 /// The exit status a device task's error maps to: a device that could not be found (or

@@ -4,7 +4,7 @@
 .SH NAME
 dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
 .SH SYNOPSIS
-\fBdak\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-d\fR|\fB\-\-debug\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-syslog\fR] [\fB\-\-map\fR] [\fB\-h\fR|\fB\-\-help\fR]
+\fBdak\fR [\fB\-c\fR|\fB\-\-config\fR] [\fB\-d\fR|\fB\-\-debug\fR] [\fB\-\-log\-level\fR] [\fB\-\-log\-file\fR] [\fB\-\-syslog\fR] [\fB\-\-wait\fR] [\fB\-\-replace\fR] [\fB\-\-map\fR] [\fB\-h\fR|\fB\-\-help\fR]
 .SH DESCRIPTION
 DAK (Dynamic Ajazz Keyboard) controls an Ajazz AKP03E or AKP03R USB macro keypad, part of the family of "stream controller" keypads that Ajazz and Mirabox sell under different names. It connects to the device, paints the configured images and text labels onto the button LCDs, sets the button and encoder brightness, and reacts to button presses, encoder turns and scene timers described by a JSON configuration file.
 .PP
@@ -41,6 +41,12 @@ Also append log lines, each with a timestamp, to PATH (created with its director
 .TP
 \fB\-\-syslog\fR
 Also send log lines to syslog(3), in addition to the configured outputs, with the facility from logging.syslog_facility (default user)
+.TP
+\fB\-\-wait\fR
+When another dak (of any user) holds a configured device, wait until it releases it and then take it, instead of skipping it. Useful when switching between users: the next user\*(Aqs dak picks the keypad up as soon as the previous one stops
+.TP
+\fB\-\-replace\fR
+When another dak holds a configured device, send it SIGTERM, wait up to 10 seconds for it to clean up and release the device, then take it. Only allowed for your own instances, or for any as root
 .TP
 \fB\-\-map\fR
 Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits
@@ -89,6 +95,15 @@ log output writes journal lines (see
 in
 .BR dak\-config (5)).
 .TP
+.B DAK_LOCK_DIR
+The directory device lock files are kept in, instead of
+.I /run/lock
+(or
+.I /tmp
+where that does not exist). Every
+.B dak
+that may compete for a keypad must use the same directory.
+.TP
 .BR XDG_STATE_HOME
 Where the default log file lives:
 .IR $XDG_STATE_HOME/dak/dak.log ,
@@ -106,6 +121,15 @@ Configuration in the current directory.
 The default log file, when the
 .B file
 log output is used.
+.TP
+.I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
+One lock file per keypad (in
+.I /tmp
+where
+.I /run/lock
+does not exist), holding the process id, user and start time of the
+.B dak
+using it.
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -139,7 +163,10 @@ attached, or every one was lost and given up on.
 .TP
 .B 5
 Every configured device that was found is held by another running
-.BR dak .
+.B dak
+(or, with
+.BR \-\-map ,
+the chosen device is).
 .SH EXAMPLES
 .TP
 .B dak
@@ -157,11 +184,31 @@ Write only warnings and errors, to the console and to a log file.
 .TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
-.SH NOTES
-Only one process may hold the device open at a time; stop any other instance
-of
+.TP
+.B dak \-\-replace
+Take the keypad over from a
 .B dak
-(or other program using the keypad) before starting a new one.
+already running as the same user.
+.SH NOTES
+Only one
+.B dak
+drives a keypad at a time, whichever user runs it. Before opening a device,
+.B dak
+takes an exclusive lock on its lock file (see
+.BR FILES );
+the kernel drops the lock when the process ends, even if it crashes. When
+another instance holds it, the device is skipped with a message naming that
+instance's user and process id; with
+.B \-\-wait
+.B dak
+waits for it to be released, and with
+.B \-\-replace
+it asks the holder to stop and takes the device over. When every configured
+device is held elsewhere the program exits with status 5. The lock is kept
+while a lost device is being waited for, so no other instance takes it over
+meanwhile. The
+.B \-\-map
+wizard also takes the lock and refuses a device in use.
 .PP
 The device definition printed by
 .B \-\-map

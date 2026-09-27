@@ -23,6 +23,7 @@ pub mod color;
 pub mod control;
 pub mod exit;
 pub mod hardware;
+pub mod lock;
 pub mod log;
 pub mod map;
 pub mod markup;

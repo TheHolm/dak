@@ -85,3 +85,91 @@ fn relative_config_path_is_made_absolute() {
     let expected = format!("Using config: {}", dir.join("rel.json").display());
     assert!(stdout.contains(&expected), "stdout: {stdout}");
 }
+
+/// A config driving the first attached (enumerable) keypad, plus that keypad's lock
+/// key; `None` without one (enumeration only reads sysfs, so this finds a keypad even
+/// where its device node cannot be opened, which is all the lock tests need: the lock
+/// is taken before the device is opened).
+fn config_for_attached_device() -> Option<(std::path::PathBuf, dak::lock::DeviceKey)> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let devices = runtime.block_on(dak::hardware::discover()).ok()?;
+    let device = devices.into_iter().next()?;
+    let serial = device
+        .serial_number
+        .clone()
+        .filter(|s| !s.trim().is_empty())?;
+    let key = dak::lock::DeviceKey::new(
+        device.vendor_id,
+        device.product_id,
+        Some(&serial),
+        &format!("{:?}", device.id),
+    );
+    let config = format!(
+        r#"{{"scenes": {{"on_start": {{}}}}, "devices": {{"1": {{
+            "device_id": "{:04X}:{:04X}", "device_name": "test", "serial": "{serial}",
+            "key_count": 9, "encoder_count": 3, "screens": 6,
+            "buttons": [{{"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1}}],
+            "encoders": []
+        }}}}}}"#,
+        device.vendor_id, device.product_id
+    );
+    Some((common::write_temp_config(&config), key))
+}
+
+/// A configured keypad held by another dak is skipped with a message naming the
+/// holder, and with nothing left to drive the program exits with status 5.
+#[test]
+fn device_held_by_another_instance_exits_with_busy_status() {
+    let Some((config, key)) = config_for_attached_device() else {
+        eprintln!("skipping: no keypad attached");
+        return;
+    };
+    let dir = common::temp_dir();
+    let _held = dak::lock::try_lock(&dir, &key).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .args(["-c", config.to_str().unwrap()])
+        .env(dak::lock::LOCK_DIR_ENV, &dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status_of(&output), exit::DEVICE_BUSY, "{stderr}");
+    assert!(stderr.contains("is in use by dak (user"), "{stderr}");
+    assert!(stderr.contains("--wait"), "{stderr}");
+}
+
+/// With `--wait` the program waits for the held keypad instead, and `SIGTERM` ends
+/// that wait cleanly (status 0).
+#[test]
+fn waiting_for_a_held_device_stops_cleanly_on_sigterm() {
+    let Some((config, key)) = config_for_attached_device() else {
+        eprintln!("skipping: no keypad attached");
+        return;
+    };
+    let dir = common::temp_dir();
+    let _held = dak::lock::try_lock(&dir, &key).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .args(["-c", config.to_str().unwrap(), "--wait"])
+        .env(dak::lock::LOCK_DIR_ENV, &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&config);
+    let _ = std::fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(status_of(&output), exit::SUCCESS, "{stdout}");
+    assert!(stdout.contains("waiting for it to be released"), "{stdout}");
+    assert!(stdout.contains("received SIGTERM"), "{stdout}");
+}
+
+/// `--wait` and `--replace` exclude each other (a usage error).
+#[test]
+fn wait_and_replace_conflict() {
+    let output = run_dak(&["--wait", "--replace"]);
+    assert_eq!(status_of(&output), exit::USAGE);
+}

@@ -98,6 +98,15 @@ under other platforms.
   `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
   themselves, so a signal arriving mid-event is never lost. `main` is a plain
   function that loads the config before building the tokio runtime by hand
+- `src/lock.rs` — one dak per keypad: an `flock(2)` lock file per device
+  (`DeviceKey::file_name`, `dak-<vid>-<pid>-<serial>.lock`) in `lock_dir()`
+  (`$DAK_LOCK_DIR`, else `/run/lock`, else `/tmp`), holding a `Holder` record (pid,
+  uid, user, since). `try_lock`/`acquire` with `Conflict::{Refuse, Wait, Replace}`
+  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s). Opened
+  `O_NOFOLLOW|O_NONBLOCK`, without `O_CREAT` first (protected_regular), created 0666
+  - see `NOTES.md` section 10. `main.rs` locks each device before connecting and keeps
+  the lock through reconnects; `--map` locks too. `tests/device_lock.rs` re-runs its
+  own test binary as a second lock-holding process for the `--replace` tests
 - `src/log.rs` — centralized, filterable output. `Log` (still `Copy`) filters by
   `Level` (error/warning/info/debug; errors always pass) and, for debug lines, per
   `Subsystem` (`device`/`scene`/`action`/`fonts`) from `-d`/`logging.debug`; `fonts`
