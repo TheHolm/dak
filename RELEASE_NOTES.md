@@ -26,7 +26,7 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   text button. **Behaviour change:** text that happens to contain `#[` or `##`
   now renders differently; set `"markup": "none"` to keep the old output.
 - New `defaults.fonts` lets you draw text with your own font files
-  (`regular`, `bold`, `italic`, `bold_italic`, `emoji`; `~`, `$variables` and
+  (`regular`, `bold`, `italic`, `bold_italic`, `emoji`, `extra`; `~`, `$variables` and
   `.ttc#N` faces supported, up to 256 MiB). Characters a font lacks fall back
   to the embedded fonts. A missing or broken font file stops dak from
   starting. Fonts are loaded once; `$defaults.markup` is readable,
@@ -46,11 +46,12 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   - at most 20 lines per font.
 - Chinese/Japanese/Korean work through a new `defaults.fonts.extra` font
   (e.g. Noto Sans CJK), tried after the emoji fonts; Latin stays in DejaVu
-  and CJK characters take two of the six columns, sized to fill them (Noto
-  Sans CJK's tall line box would otherwise leave wide gaps beside each one). Bold/italic text now falls
-  back to your configured `regular` font before giving up, so a CJK
-  `regular` font no longer shows boxes in bold. Right-to-left scripts (Hebrew, Arabic) are not
-  supported yet; formatting tags past the visible 6x3 area still apply.
+  and CJK characters take two of the six columns, sized to fill them.
+  Bold/italic text now falls back to your configured `regular` font before
+  giving up, so a CJK `regular` font no longer shows boxes in bold.
+- Not supported yet: right-to-left scripts (Hebrew, Arabic), emoji
+  sequences (skin tones, joined emoji, flags) and COLR/SVG colour fonts.
+  Formatting tags past the visible 6x3 area still take effect.
 - The `.deb` packages now ship a complete `/usr/share/doc/dak/copyright`
   with the full AGPL text (before, it only named the licence) plus the
   embedded fonts' licences; the FreeBSD package installs the same file.
