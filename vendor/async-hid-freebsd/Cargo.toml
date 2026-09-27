@@ -39,7 +39,7 @@ async-io = { version = "2", optional = true }
 tokio = { version = "1", features = ["net"], optional = true }
 
 [target.'cfg(target_os = "freebsd")'.dependencies]
-nix = { version = "0.29.0", features = ["fs", "ioctl"] }
+nix = { version = "0.29.0", features = ["fs", "ioctl", "poll"] }
 async-io = { version = "2", optional = true }
 tokio = { version = "1", features = ["net"], optional = true }
 

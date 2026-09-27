@@ -790,6 +790,43 @@ USB passthrough, or FreeBSD's xhci. One suspect: the device was passed through
 on a USB3 port (`usb3=1`) although it is a USB 2.0 high-speed device; retry
 with USB3 off, and on bare metal, before blaming dak.
 
+### v0.14.1 hardware run (FreeBSD 15.1 VM, keypad passed through)
+
+Unplug/re-plug through the hypervisor reconnected and repainted fine this time;
+the "not re-enumerated" problem above did not recur. Everything else passed
+too: `cargo test` with the keypad (hardware tests really ran), `dak --map`,
+presses, turns and scene switches. Two things were found and fixed:
+
+- **SIGHUP lost the keypad.** The `hidraw_bsd` reader thread sat in a blocking
+  `read(2)` that nothing ended on an idle keypad, so after a reload the old
+  session's thread still held `/dev/hidraw0` open (`fstat` showed it, `procstat
+  -kk` showed the thread in `hidraw_read`). `hidraw(4)` allows one open, so
+  rediscovery skipped the device as busy ("defined in config was not found"),
+  and SIGUSR1 did not help. The thread now waits in `poll(2)` for 200 ms at a
+  time (`hidraw_poll` exists and times out properly), stops once its channel's
+  receiver is gone, and `HidrawDevice`'s `Drop` joins it. Joining matters: a
+  version without the join still failed the first reload, because the
+  reconnect happened before the thread noticed. Checked with three SIGHUPs in a
+  row (one `hidraw` fd, steady thread count) and by
+  `tests/hardware_read_loop.rs`'s `reader_releases_the_device_when_dropped`,
+  which fails against the old backend.
+- **Encoder turns "did nothing".** They arrived and ran their actions, but the
+  test config used `$(/usr/bin/expr ...)`, and FreeBSD has `expr` in `/bin`.
+  Validation skipped the missing-program check whenever the command held a
+  `$var`. It now checks the program word unless the program itself is a
+  reference. The shipped examples use bare names found in `PATH`.
+
+Probing `/dev/hidraw0` with a plain C `read`/`poll` loop got no reports at
+all: the keypad only sends input after mirajazz's initialization (brightness,
+clear), so test input paths through dak, not raw.
+
+`dak --map` in a VM: turning an encoder exactly one notch is hard, and a missed
+notch followed by a push used to record the push's release as the second
+direction. The capture now ignores pushes and extra notches; only a change of
+code separates the directions. A timing-based variant (quiet period per
+direction) was tried and dropped: reports of the next step arrived during the
+previous one's window and shifted the whole capture.
+
 ---
 
 ## 8. Package licence files (`debian/copyright`)

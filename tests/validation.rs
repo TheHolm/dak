@@ -1879,6 +1879,36 @@ fn warns_on_missing_command_substitution_program() {
     );
 }
 
+/// A missing program is warned about also when only its arguments hold references
+/// (`$(/usr/bin/expr $count + 1)` on a system whose `expr` lives in `/bin`, as on
+/// FreeBSD - found on real hardware, where every encoder turn then failed silently),
+/// while a program that itself comes from a variable is left to action time.
+#[test]
+fn warns_on_missing_command_substitution_program_with_references() {
+    let load = |action: &str| {
+        let path = write_variables_config(
+            r#"{"count": {"type": "int", "min": 0, "max": 10, "value": 1},
+                "tool": {"type": "str", "max_length": 32, "value": "/bin/echo"}}"#,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{action}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        config.unwrap().warnings
+    };
+    let warnings = load("$count := $(/definitely/not/expr $count + 1)");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("program not found: \"/definitely/not/expr\"")),
+        "{warnings:?}"
+    );
+    let warnings = load("$count := $($tool 1)");
+    assert!(
+        !warnings.iter().any(|warning| warning.contains("program")),
+        "{warnings:?}"
+    );
+}
+
 /// A malformed `$`-assignment (no assignment operator at all) is rejected with its own
 /// distinct error.
 #[test]

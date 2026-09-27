@@ -1445,8 +1445,10 @@ fn check_variable_assignment(
 }
 
 /// Validates a `$(command)` right-hand side: every reference inside it must resolve, and
-/// a literal program that needs no shell is checked for existence. The output's type is
-/// only known at action time, so no range/type check happens here.
+/// a program that needs no shell is checked for existence - also when only its
+/// *arguments* hold references (`/bin/expr $count + 1`), since the program word itself
+/// is then still literal. The output's type is only known at action time, so no
+/// range/type check happens here.
 fn validate_command_rhs(
     scene_name: &str,
     path: &str,
@@ -1456,11 +1458,21 @@ fn validate_command_rhs(
     warnings: &mut Vec<String>,
 ) {
     let refs = check_references(scene_name, path, inner, variables, errors);
-    if refs.is_empty() && !command_needs_shell(inner) {
-        match parse_command_line(inner) {
-            Ok(command) => check_executable(scene_name, path, &command.program, warnings),
-            Err(error) => errors.push(format!("scene \"{scene_name}\": {path}: {error}")),
+    if command_needs_shell(inner) {
+        return;
+    }
+    match parse_command_line(inner) {
+        Ok(command) if !command.program.contains('$') => {
+            check_executable(scene_name, path, &command.program, warnings)
         }
+        // The program itself comes from a reference: only known at action time.
+        Ok(_) => {}
+        // With references the text is only final once expanded; the action reports
+        // a bad command line then.
+        Err(error) if refs.is_empty() => {
+            errors.push(format!("scene \"{scene_name}\": {path}: {error}"))
+        }
+        Err(_) => {}
     }
 }
 

@@ -96,7 +96,7 @@ pub struct Mapping {
     pub device_reconnect_max_attempts: Option<u64>,
     /// Raw codes per physical button, in the order the user pressed them.
     pub buttons: Vec<ButtonMapping>,
-    /// Raw twist codes per encoder, in the order the user turned them.
+    /// Raw turn and push codes per encoder, in the order the user mapped them.
     pub encoders: Vec<EncoderMapping>,
 }
 
@@ -709,15 +709,24 @@ mod capture {
         }
     }
 
-    /// Pure state machine capturing the two twist codes of one encoder.
+    /// Pure state machine capturing the two turn codes of one encoder.
     ///
-    /// Twist events arrive as `(code, 0)` reports (nothing pressed). The first
-    /// fresh code in `exclude`-complement is taken as the clockwise turn, the
-    /// next distinct fresh code as the counter-clockwise turn. Repeated codes
-    /// (extra notches of the same direction) are ignored.
+    /// Turn events arrive as `(code, 0)` reports (nothing pressed). The first
+    /// fresh code is taken as the clockwise turn; repeats of it (the extra notches
+    /// of a turn that went further than one) are ignored, and the first *different*
+    /// fresh code is the counter-clockwise turn. So the user may turn each way by
+    /// as many notches as they like, with no timing involved: only the change of
+    /// code separates the directions.
+    ///
+    /// A knob push also ends in a `(code, 0)` report - its release - so any code
+    /// seen pressed (`state != 0`) is a push code and never taken as a turn.
+    /// (Pushing during the turn step, after a notch the device did not report,
+    /// once recorded the push's release as the second direction.)
     pub struct TwistCapture {
         exclude: HashSet<u8>,
         first: Option<u8>,
+        /// Codes seen with a pressed state: push codes, not turns.
+        pressed: HashSet<u8>,
     }
 
     impl TwistCapture {
@@ -726,13 +735,18 @@ mod capture {
             Self {
                 exclude,
                 first: None,
+                pressed: HashSet::new(),
             }
         }
 
         /// Feeds one observed `(code, state)` event and returns `Some((cw, ccw))`
-        /// once two distinct fresh twist codes have been seen.
+        /// once two distinct fresh turn codes have been seen.
         pub fn feed(&mut self, code: u8, state: u8) -> Option<(u8, u8)> {
-            if state != 0 || self.exclude.contains(&code) {
+            if state != 0 {
+                self.pressed.insert(code);
+                return None;
+            }
+            if self.exclude.contains(&code) || self.pressed.contains(&code) {
                 return None;
             }
             match self.first {
@@ -877,17 +891,17 @@ where
     }
     console.say("");
 
-    // Step 5: capture one encoder at a time, one notch per direction. Encoder knobs
-    // are pushed as buttons too, so the push/release codes are captured for each
-    // encoder after its two twist codes.
+    // Step 5: capture one encoder at a time: its two turn codes (separated by the
+    // change of code, see `capture::TwistCapture`), then its push/release codes -
+    // encoder knobs are pushed like buttons.
     let mut encoders = Vec::new();
     for number in 1..=encoder_count {
         console.say(format!(
-            "turn encoder {number}: one notch clockwise, then one notch counter-clockwise"
+            "turn encoder {number}: clockwise (one or more notches), then counter-clockwise"
         ));
         let (cw, ccw) = capture_encoder_twists(console, reader, &used).await?;
         console.say(format!(
-            "encoder {number} -> first turn code {cw}, second turn code {ccw}"
+            "encoder {number} -> clockwise code {cw}, counter-clockwise code {ccw}"
         ));
         used.insert(cw);
         used.insert(ccw);
@@ -1012,7 +1026,7 @@ async fn capture_press_release<R: io::BufRead, O: Write, E: Write>(
 }
 
 /// Reads raw device reports until the `TwistCapture` records two distinct
-/// twist codes for one encoder.
+/// turn codes for one encoder.
 async fn capture_encoder_twists<R: io::BufRead, O: Write, E: Write>(
     console: &mut Console<R, O, E>,
     reader: &impl InputSource,
@@ -1208,18 +1222,33 @@ mod tests {
         assert_eq!(capture.feed(1, 0), Some((1, 1)));
     }
 
-    /// Twist capture takes the first two distinct fresh state-0 codes as the
-    /// two directions and ignores repeats and pressed-state events.
+    /// Twist capture takes the first two distinct fresh state-0 codes as the two
+    /// directions: extra notches of the first direction are ignored, pushes too.
     #[test]
     fn twist_capture_records_two_directions() {
         let mut capture = TwistCapture::new(HashSet::new());
-        assert_eq!(capture.feed(0x90, 1), None); // a pressed-state event
+        assert_eq!(capture.feed(0x33, 1), None); // a pressed-state event (a push)
         assert_eq!(capture.feed(0x90, 0), None); // first notch
-        assert_eq!(capture.feed(0x90, 0), None); // second notch, same direction
+        assert_eq!(capture.feed(0x90, 0), None); // more notches, same direction
+        assert_eq!(capture.feed(0x90, 0), None);
         assert_eq!(capture.feed(0x91, 0), Some((0x90, 0x91)));
     }
 
-    /// Twist capture never accepts codes that belong to buttons already mapped.
+    /// A knob push during the turn step (press then release of one code) is not
+    /// taken as a turn: its release is a `(code, 0)` report like a turn, but the
+    /// code was seen pressed. This happened on real hardware when a clockwise
+    /// notch went unreported and the user went on to push the knob.
+    #[test]
+    fn twist_capture_ignores_a_knob_push() {
+        let mut capture = TwistCapture::new(HashSet::new());
+        assert_eq!(capture.feed(144, 0), None);
+        assert_eq!(capture.feed(144, 0), None);
+        assert_eq!(capture.feed(51, 1), None, "push");
+        assert_eq!(capture.feed(51, 0), None, "its release is no turn");
+        assert_eq!(capture.feed(145, 0), Some((144, 145)));
+    }
+
+    /// Twist capture never accepts codes that belong to controls already mapped.
     #[test]
     fn twist_capture_skips_button_codes() {
         let mut capture = TwistCapture::new(HashSet::from([0x61]));
@@ -1959,9 +1988,9 @@ mod tests {
     }
 
     /// The wizard's steps 2-6 against a scripted keypad: counts confirmed, one screen,
-    /// both buttons and the encoder captured from the reports (noise and repeated or
-    /// already-used codes skipped), every button painted and flushed, the layout
-    /// confirmed.
+    /// both buttons and the encoder captured from the reports (noise, already-used
+    /// codes and extra notches skipped), every button painted
+    /// and flushed, the layout confirmed.
     #[tokio::test]
     async fn map_connected_captures_every_control() {
         use crate::input::{encode_report, ScriptedInput, ScriptedReport};
@@ -1978,15 +2007,23 @@ mod tests {
             encode_report(1, 1),
             encode_report(2, 1),
             encode_report(2, 0),
-            // Encoder 1: clockwise 81 (twice), then counter-clockwise 80.
-            encode_report(81, 0),
-            encode_report(81, 0),
-            encode_report(80, 0),
-            // Its push: 79.
-            encode_report(79, 1),
-            encode_report(79, 0),
         ] {
             reports.send(ScriptedReport::Data(report)).unwrap();
+        }
+        // Encoder 1: clockwise 81 (several notches), counter-clockwise 80, then its
+        // push 79, all without pausing - the change of code separates them.
+        for (code, state) in [
+            (81, 0),
+            (81, 0),
+            (81, 0),
+            (80, 0),
+            (80, 0),
+            (79, 1),
+            (79, 0),
+        ] {
+            reports
+                .send(ScriptedReport::Data(encode_report(code, state)))
+                .unwrap();
         }
         let format = crate::hardware::Kind::Akp03ERev2.image_format();
         let mut c = console("y\ny\n1\ny\n");
@@ -2032,6 +2069,10 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("  observed key  81, state 0"), "{out}");
+        assert!(
+            out.contains("encoder 1 -> clockwise code 81, counter-clockwise code 80"),
+            "{out}"
+        );
     }
 
     /// Corrected counts are used instead of the reported ones, and a keypad that goes

@@ -50,7 +50,7 @@ mod ioctl;
 use std::fs::{read_dir, OpenOptions};
 use std::io::ErrorKind;
 use std::mem::MaybeUninit;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +58,7 @@ use std::sync::Arc;
 use futures_lite::stream::{iter, Boxed};
 use futures_lite::StreamExt;
 use nix::fcntl::OFlag;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{read, write};
 use tokio::sync::mpsc;
 
@@ -132,8 +133,8 @@ impl Backend for HidrawBsdBackend {
         // (`open_feature_handle` below opens read+write but never reads) - the fd
         // would then never truly close when the handle is dropped, and FreeBSD's
         // hidraw(4) refuses a second concurrent open of the same node with EBUSY.
-        let reader = read.then(|| HidrawDevice { fd: fd.clone(), reader: None, can_read: true });
-        let writer = write.then(|| HidrawDevice { fd: fd.clone(), reader: None, can_read: false });
+        let reader = read.then(|| HidrawDevice { fd: fd.clone(), reader: None, reader_thread: None, can_read: true });
+        let writer = write.then(|| HidrawDevice { fd: fd.clone(), reader: None, reader_thread: None, can_read: false });
 
         Ok((reader, writer))
     }
@@ -149,18 +150,43 @@ impl Backend for HidrawBsdBackend {
     }
 }
 
+/// How long the background reader waits in `poll(2)` before checking whether its
+/// handle is still wanted (see [`spawn_background_reader`]).
+const READER_POLL_INTERVAL_MS: u16 = 200;
+
 /// Starts the dedicated background reader thread for one opened-for-reading
 /// `HidrawDevice` (see the module doc comment for why this exists instead of a
 /// `spawn_blocking` call per read) and returns the receiving end of the channel it
-/// forwards reports through. The thread runs until a `read(2)` call fails (including
-/// when the channel's last receiver is dropped and `blocking_send` starts failing -
-/// though in practice dak/mirajazz keep a reader alive for the device's whole
-/// session, so this normally only happens when the device disconnects or the fd is
-/// closed) or the channel fills and its send fails for any other reason.
-fn spawn_background_reader(fd: Arc<OwnedFd>) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+/// forwards reports through, plus the thread's handle.
+///
+/// The thread never sits in a bare blocking `read(2)`: it waits in `poll(2)` for at
+/// most [`READER_POLL_INTERVAL_MS`], and between waits checks whether the channel's
+/// receiver - owned by the `HidrawDevice` - still exists. Once the handle is dropped
+/// the thread ends within one interval and drops its `Arc` of the fd, so the node is
+/// really closed; `HidrawDevice`'s `Drop` joins the thread, so that has happened by
+/// the time the drop returns and an immediate reopen succeeds. (A thread parked in `read(2)` on an idle keypad used to keep the fd
+/// open for the rest of the process's life; since `hidraw(4)` allows one open at a
+/// time, the same process could then never open the device again - dak's SIGHUP
+/// reload found "no device", confirmed against real hardware.) The thread also ends
+/// when a `poll`/`read` fails (the device went away) or a send fails.
+fn spawn_background_reader(fd: Arc<OwnedFd>) -> (ReportReceiver, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(REPORT_CHANNEL_CAPACITY);
-    std::thread::spawn(move || {
-        loop {
+    let thread = std::thread::spawn(move || {
+        while !tx.is_closed() {
+            let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+            let ready = match poll(&mut fds, PollTimeout::from(READER_POLL_INTERVAL_MS)) {
+                Ok(0) | Err(nix::Error::EINTR) => continue,
+                Ok(_) => fds[0].revents().unwrap_or(PollFlags::empty()),
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::from(err)));
+                    break;
+                }
+            };
+            // POLLHUP/POLLERR (a detached device) fall through to the read, which
+            // reports the actual error.
+            if ready.is_empty() {
+                continue;
+            }
             let mut buf = vec![0u8; 512];
             let outcome = read(fd.as_raw_fd(), &mut buf).map(|n| {
                 buf.truncate(n);
@@ -172,8 +198,11 @@ fn spawn_background_reader(fd: Arc<OwnedFd>) -> mpsc::Receiver<std::io::Result<V
             }
         }
     });
-    rx
+    (rx, thread)
 }
+
+/// The receiving end of a background reader's report channel.
+type ReportReceiver = mpsc::Receiver<std::io::Result<Vec<u8>>>;
 
 /// Whether `path` looks like a `hidraw(4)` device node (`/dev/hidraw0`,
 /// `/dev/hidraw12`, ...).
@@ -294,7 +323,9 @@ pub struct HidrawDevice {
     /// it must not be started eagerly in `Backend::open` either): `None` both for a
     /// handle not opened for reading at all, and for one that is but hasn't had its
     /// first read yet.
-    reader: Option<mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    reader: Option<ReportReceiver>,
+    /// The background reader thread, joined on drop (see [`spawn_background_reader`]).
+    reader_thread: Option<std::thread::JoinHandle<()>>,
     /// Whether this handle was opened with read permission at all, so a caller
     /// mistake (calling `read_input_report` on a write/feature-only handle) panics
     /// with a clear message instead of silently starting a reader thread on a fd
@@ -302,11 +333,27 @@ pub struct HidrawDevice {
     can_read: bool
 }
 
+impl Drop for HidrawDevice {
+    /// Closes the report channel and waits (at most one [`READER_POLL_INTERVAL_MS`])
+    /// for the background reader to notice and end, so the fd is really closed once
+    /// the last handle is gone and the node can be opened again at once.
+    fn drop(&mut self) {
+        self.reader.take();
+        if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl AsyncHidRead for HidrawDevice {
     async fn read_input_report<'a>(&'a mut self, buf: &'a mut [u8]) -> HidResult<usize> {
         assert!(self.can_read, "read_input_report called on a handle that wasn't opened for reading");
-        let fd = self.fd.clone();
-        let reader = self.reader.get_or_insert_with(|| spawn_background_reader(fd));
+        if self.reader.is_none() {
+            let (reader, thread) = spawn_background_reader(self.fd.clone());
+            self.reader = Some(reader);
+            self.reader_thread = Some(thread);
+        }
+        let reader = self.reader.as_mut().expect("reader started above");
         let data = reader
             .recv()
             .await

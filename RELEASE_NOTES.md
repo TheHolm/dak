@@ -5,7 +5,7 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
-## v0.14.1 — Bug fixes found while raising test coverage
+## v0.14.1 — Bug fixes found while raising test coverage and testing on hardware
 
 ### User-facing changes
 - **`dak --map` no longer hangs when its input ends.** With standard input
@@ -17,6 +17,18 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   rescan or reload requested just after dak reported that it was ready (for
   example by a udev/devd hook that fires as the service starts) could be
   silently ignored until the next signal. It is now always acted on.
+- **FreeBSD: reloading with `SIGHUP` no longer loses the keypad.** After a
+  reload dak reported the keypad "not found" (and, in the foreground,
+  exited), because the old connection kept the device open. Found while
+  testing on real hardware.
+- **`dak --map` encoder capture is more forgiving.** Turn each way by any
+  number of notches; extra notches and a knob push during the turn step are
+  ignored instead of being recorded as the second direction.
+- **Missing programs in `$(...)` are reported at startup** also when the
+  command uses variables (`$(/usr/bin/expr $count + 1)`), instead of every
+  action failing silently. The examples now use plain program names (`expr`,
+  `date`, ...), so they also work on FreeBSD, where some of these live in
+  `/bin`.
 
 ### Details
 - Coverage went from 87.4% to 95.6% of lines (`main.rs` 70.9% → 93.4%,
@@ -86,7 +98,23 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
     leaving it running.
 - **Small cleanup.** `text::format_ranges` lost a `(cont.)` branch that could
   never run.
-- Verified on FreeBSD 15.1 (build, test suite, coverage) in a throwaway VM.
+- **FreeBSD reader thread (`vendor/async-hid-freebsd`).** The `hidraw_bsd`
+  background reader waited in a bare `read(2)`, which never ended on an idle
+  keypad, so a dropped connection kept `/dev/hidrawN` open. `hidraw(4)` allows
+  one open, so a SIGHUP reload could not reopen it. The thread now polls
+  (`poll(2)`, 200 ms), stops when its channel's receiver is dropped, and
+  `HidrawDevice::drop` joins it (needs nix's `poll` feature). New hardware
+  test `reader_releases_the_device_when_dropped` (fails on the old backend).
+- **`--map` turn capture.** `TwistCapture` ignores codes seen pressed, so a
+  push's release is never a turn. The prompt asks for any number of notches
+  each way.
+- **Validation.** `validate_command_rhs` checks the program word of a
+  `$(...)` command that has references in its arguments. Examples use bare
+  program names; the `scene-navigation.json` clock fits 6 columns.
+- Verified on real hardware on Debian 13 and FreeBSD 15.1 (VMs with the
+  keypad passed through): `cargo test` with the hardware tests running,
+  `dak --map`, every press kind, turns, scene switches, SIGHUP, unplug and
+  re-plug. See `NOTES.md` section 7.
 
 ## v0.14.0 — Runs as a proper daemon: background mode, logging, reload, one dak per keypad
 

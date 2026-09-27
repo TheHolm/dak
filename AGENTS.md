@@ -236,19 +236,25 @@ Work in progress. Current known issues:
   when attached (skipping themselves otherwise): enumeration,
   connect/identify/shutdown, `set_brightness`, the
   `set_button_image`/`flush`/`clear_button_image` image path, and opening the raw
-  input reader without erroring. The raw-input-reader
-  test lives in its own `tests/hardware_read_loop.rs` binary rather than
-  alongside the others in `tests/hardware.rs`: on FreeBSD it starts a background
-  reader thread that (deliberately, to avoid a worse shutdown-hang bug) never
-  releases the device's `hidraw` node for the rest of the process's life once
-  nothing more ever reads from it, which would otherwise make every hardware
-  test that ran afterwards *in the same process* falsely report "no device
-  attached" instead of a real pass. Both files also serialize their own tests
+  input reader without erroring, and (`reader_releases_the_device_when_dropped`)
+  that a dropped reader releases the device so the same process can reopen it.
+  The raw-input-reader tests live in their own `tests/hardware_read_loop.rs` binary
+  rather than alongside the others in `tests/hardware.rs`: on FreeBSD the backend's
+  reader thread used to keep the `hidraw` node open for the rest of the process's
+  life once started, which made every later hardware test *in the same process*
+  falsely report "no device attached" (and broke SIGHUP reload until v0.14.1; see
+  `NOTES.md` section 7). Keeping them separate means a regression cannot spoil
+  `tests/hardware.rs`. Both files also serialize their own tests
   against each other via `tests/hardware_common`'s `lock_hardware()` (see its
   doc comment): the real device only allows one open handle at a time, and
   `cargo test`'s default parallelism otherwise races multiple tests against it,
   intermittently causing that same false "no device" skip or, worse, genuine
   test failures
+- Hardware-verified in v0.14.1 on both Debian 13 and FreeBSD 15.1 (VMs with the
+  keypad passed through): full `cargo test`, `dak --map`, every press kind on all
+  buttons and encoders, encoder turns, scene switches, SIGHUP reload, and unplug/
+  re-plug with repaint. Config actions should use bare program names (`expr`,
+  `date`), not `/usr/bin/...`: FreeBSD keeps several of them in `/bin`
 - A keypad that is enumerable but cannot be opened (e.g. a container that sees
   the host's sysfs but has no `/dev/hidraw*` node) makes the hardware tests skip,
   but `dak --map` still lists it; `tests/exit_status.rs`'s `--map` test accepts

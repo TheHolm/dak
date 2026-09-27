@@ -25,10 +25,10 @@
         "1b01": { "short_press": "$count = 0" },
         "1b02": { "short_press": "$mode := \"MUSIC\"" },
         "1b03": { "short_press": "$mode := \"VIDEO\"" },
-        "1b04": { "short_press": "$mode := $(/usr/bin/hostname)" },
+        "1b04": { "short_press": "$mode := $(hostname)" },
         "1e01": {
-          "turn_cw": "$count = $(/usr/bin/expr $count + 1)",
-          "turn_ccw": "$count ~= $(/usr/bin/expr $count - 1)"
+          "turn_cw": "$count = $(expr $count + 1)",
+          "turn_ccw": "$count ~= $(expr $count - 1)"
         }
       }
     }
