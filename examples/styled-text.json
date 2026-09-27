@@ -12,7 +12,9 @@
     // "fonts": {
     //   "regular": "~/.local/share/fonts/Iosevka-Regular.ttf",
     //   "bold": "~/.local/share/fonts/Iosevka-Bold.ttf",
-    //   "emoji": "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"
+    //   "emoji": "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    //   // Chinese/Japanese/Korean (Debian/Ubuntu: fonts-noto-cjk); #0 = Japanese.
+    //   "extra": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0"
     // }
   },
   "scenes": {

@@ -211,19 +211,31 @@ Button text is drawn with fonts embedded in the binary: DejaVu Sans Mono in regu
     "bold":        "~/.local/share/fonts/Iosevka-Bold.ttf",
     "italic":      "~/.local/share/fonts/Iosevka-Italic.ttf",
     "bold_italic": "~/.local/share/fonts/Iosevka-BoldItalic.ttf",
-    "emoji":       "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"
+    "emoji":       "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "extra":       "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0"
   }
 }
 ```
 
 - `regular`, `bold`, `italic`, `bold_italic` — the font for text in that style.
-- `emoji` — the fallback for characters none of the text fonts have.
+- `emoji` — the fallback for characters none of the text fonts have (emoji, symbols).
+- `extra` — a last-resort font tried after the emoji fonts, meant for a script the others lack, typically Chinese/Japanese/Korean.
 
 Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
 
-Each character is looked up in the configured font of its style, then the embedded font of that style, then the configured `emoji` font, then the embedded Noto Emoji; if none has it, a box is drawn. So a Latin-only font still shows Cyrillic and emoji from the embedded fonts. A proportional font works too, but since lines are limited by character count, a line of wide letters is then drawn smaller than one of narrow letters.
+Each character is drawn from the first of these fonts that has it:
 
-**Chinese, Japanese and Korean.** The embedded fonts have no CJK characters, so name a CJK font such as Noto Sans CJK. Either as `emoji`: Latin text stays in DejaVu and CJK comes from your font, but always in its regular weight (the emoji slot has no bold/italic), and the slot is then not available for an emoji font. Or as `regular` (plus `bold` etc.): all text uses that proportional font. In `NotoSansCJK-Regular.ttc` the face picks the regional glyph style: `#0` Japanese, `#1` Korean, `#2` Simplified Chinese, `#3` Traditional Chinese, `#4` Hong Kong. CJK characters are two columns wide, so a line holds three of them.
+1. the configured font of its style (`regular`, `bold`, `italic` or `bold_italic`);
+2. the embedded DejaVu Sans Mono of that style;
+3. for bold/italic text, the configured `regular` font (so a script only your regular font covers is shown in regular weight rather than as a box);
+4. the configured `emoji` font;
+5. the embedded Noto Emoji;
+6. the configured `extra` font;
+7. otherwise a missing-glyph box.
+
+So a Latin-only font still shows Cyrillic and emoji from the embedded fonts, and a character both an emoji font and `extra` have (such as the squared 🈚 or 🆘) is drawn as an emoji. Characters from `emoji`, Noto Emoji and `extra` are fitted into their columns (two for wide characters), keeping the grid. A proportional font works too, but since lines are limited by character count, a line of wide letters is then drawn smaller than one of narrow letters.
+
+**Chinese, Japanese and Korean.** The embedded fonts have no CJK characters at all — no ideographs, kana, Korean Hangul, half-width katakana or full-width forms — so name a CJK font such as Noto Sans CJK (Debian/Ubuntu package `fonts-noto-cjk`) as `extra`. Latin text stays in DejaVu, emoji keep coming from the emoji fonts, and CJK characters are drawn from `extra`, always in its one weight: `#[bold]` does not make them bold. For bold CJK, set `bold` to a CJK Bold font as well; alternatively set the CJK font as `regular` (plus `bold` etc.), which draws *all* text, Latin too, in that proportional font. In `NotoSansCJK-Regular.ttc` the face picks the regional glyph style: `#0` Japanese, `#1` Korean, `#2` Simplified Chinese, `#3` Traditional Chinese, `#4` Hong Kong. CJK characters are two columns wide, so a line holds three of them (half-width katakana takes one).
 
 **Which font files work.** A glyph can be drawn when the font has an outline for it (ordinary TrueType/OpenType fonts, monochrome emoji fonts) or a colour *bitmap* (CBDT or sbix tables with PNG or BGRA pictures, e.g. the `fonts-noto-color-emoji` package of Debian/Ubuntu). Bitmap emoji are drawn as scaled pictures in their own colours, so `fg=` does not affect them. Colour glyphs stored as COLR layers or SVG documents (the "Noto Color Emoji" download from Google Fonts, Twemoji Mozilla) cannot be drawn. Every configured font is scanned when dak starts (a few milliseconds for a normal font, about 0.15 s for a 65,000-glyph CJK face):
 

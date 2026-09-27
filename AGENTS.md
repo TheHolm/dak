@@ -79,8 +79,9 @@ under other platforms.
   vocabulary constant `tests/man_pages.rs` checks
 - `src/text.rs` — text rendering for button LCDs. `FontSet` holds a lookup chain per
   style (configured `defaults.fonts` file first, then the embedded DejaVu Sans Mono
-  regular/bold/oblique/bold-oblique) plus the emoji chain (configured, then embedded
-  monochrome Noto Emoji); `FontSet::embedded()` is parsed once and shared,
+  regular/bold/oblique/bold-oblique, then for bold/italic the configured regular font)
+  plus the emoji chain (configured, then embedded monochrome Noto Emoji) and last the
+  configured `extra` font (CJK); `FontSet::embedded()` is parsed once and shared,
   `FontSet::load(&FontPaths)` reads configured files (`path#N` = `.ttc` face, 256 MiB
   cap), scanning each with `scan_font` (fails on nothing drawable, reports gaps and
   ignored COLR/SVG colour in a `FontReport`). Glyphs are outlines or colour bitmaps

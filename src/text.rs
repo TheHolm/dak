@@ -9,8 +9,11 @@
 //!
 //! Glyphs are looked up per character, in this order: the configured font for the span's
 //! style (regular, bold, italic or bold italic), the embedded DejaVu Sans Mono face of
-//! that style, the configured emoji font, the embedded monochrome Noto Emoji, and finally
-//! the style font's "missing glyph" box. A glyph counts when the font has an outline for
+//! that style, the configured regular font (for bold/italic text, so a script only a
+//! configured regular font covers is not lost in bold), the configured emoji font, the
+//! embedded monochrome Noto Emoji, the configured extra font (typically CJK), and
+//! finally the style font's "missing glyph" box. Glyphs from the emoji and extra fonts
+//! are fitted into their display columns, keeping the monospace grid. A glyph counts when the font has an outline for
 //! it or a colour bitmap (CBDT/sbix, PNG or BGRA): bitmaps are drawn as scaled pictures in
 //! their own colours. COLR and SVG colour glyphs cannot be drawn and are skipped the same
 //! way as missing ones, falling back to the next font. Configured fonts are scanned when
@@ -45,10 +48,10 @@ pub const MAX_LINE_CHARS: usize = 6;
 /// Matches the config documentation for the `text` and `text_exec` commands.
 pub const MAX_LINES: usize = 3;
 
-/// The keys `defaults.fonts` may contain, in documentation order: the four text styles
-/// and the emoji fallback. Also the vocabulary `tests/man_pages.rs` requires
-/// `dak-config.5` to document.
-pub const FONT_KEYS: &[&str] = &["regular", "bold", "italic", "bold_italic", "emoji"];
+/// The keys `defaults.fonts` may contain, in documentation order: the four text styles,
+/// the emoji fallback and the last-resort extra font (e.g. CJK). Also the vocabulary
+/// `tests/man_pages.rs` requires `dak-config.5` to document.
+pub const FONT_KEYS: &[&str] = &["regular", "bold", "italic", "bold_italic", "emoji", "extra"];
 
 /// Largest font file `defaults.fonts` may name; bigger files are refused rather than
 /// read into memory whole. Big enough for the largest real fonts (the ~112 MiB Noto
@@ -100,6 +103,8 @@ pub struct FontPaths {
     pub bold_italic: Option<String>,
     /// Fallback font for characters none of the text fonts have (typically emoji).
     pub emoji: Option<String>,
+    /// Last-resort font, after the emoji fonts (typically CJK).
+    pub extra: Option<String>,
 }
 
 impl FontPaths {
@@ -111,20 +116,23 @@ impl FontPaths {
             "italic" => Some(&mut self.italic),
             "bold_italic" => Some(&mut self.bold_italic),
             "emoji" => Some(&mut self.emoji),
+            "extra" => Some(&mut self.extra),
             _ => None,
         }
     }
 }
 
-/// The name of the embedded font each [`FONT_KEYS`] slot falls back to, as used in the
-/// startup warning about characters a configured font cannot draw.
-fn embedded_name(key: &str) -> &'static str {
+/// What characters a configured font cannot draw turn into, as used in the startup
+/// warning: the embedded font the slot falls back to, or (for `extra`, the last font of
+/// the lookup) the missing-glyph box.
+fn fallback_description(key: &str) -> &'static str {
     match key {
-        "regular" => "DejaVu Sans Mono",
-        "bold" => "DejaVu Sans Mono Bold",
-        "italic" => "DejaVu Sans Mono Oblique",
-        "bold_italic" => "DejaVu Sans Mono Bold Oblique",
-        _ => "Noto Emoji",
+        "regular" => "fall back to the embedded DejaVu Sans Mono",
+        "bold" => "fall back to the embedded DejaVu Sans Mono Bold",
+        "italic" => "fall back to the embedded DejaVu Sans Mono Oblique",
+        "bold_italic" => "fall back to the embedded DejaVu Sans Mono Bold Oblique",
+        "emoji" => "fall back to the embedded Noto Emoji",
+        _ => "are shown as a missing-glyph box",
     }
 }
 
@@ -142,6 +150,11 @@ pub struct FontSet {
     /// Fallback chain for characters no face of the style has: the configured emoji
     /// font (if any), then the embedded Noto Emoji.
     emoji: Vec<FontArc>,
+    /// The configured regular font, tried for bold/italic text after that style's own
+    /// fonts (`None` without one).
+    regular: Option<FontArc>,
+    /// The configured extra font, tried last (`None` without one).
+    extra: Option<FontArc>,
     /// Colour bitmaps decoded so far, shared by every clone of the set.
     bitmaps: Arc<Mutex<BitmapCache>>,
 }
@@ -207,6 +220,8 @@ impl FontSet {
                         vec![embedded_font(FONT_BOLD_ITALIC_BYTES)],
                     ],
                     emoji: vec![embedded_font(EMOJI_BYTES)],
+                    regular: None,
+                    extra: None,
                     bitmaps: Arc::default(),
                 })
             })
@@ -230,15 +245,22 @@ impl FontSet {
             ("italic", &paths.italic),
             ("bold_italic", &paths.bold_italic),
             ("emoji", &paths.emoji),
+            ("extra", &paths.extra),
         ];
         for (index, (key, path)) in slots.into_iter().enumerate() {
             let Some(path) = path else { continue };
             match load_font_file(path) {
                 Ok((font, scan)) => {
                     report_scan(key, path, &scan, &mut report);
-                    match set.faces.get_mut(index) {
-                        Some(chain) => chain.insert(0, font),
-                        None => set.emoji.insert(0, font),
+                    match key {
+                        "emoji" => set.emoji.insert(0, font),
+                        "extra" => set.extra = Some(font),
+                        _ => {
+                            if key == "regular" {
+                                set.regular = Some(font.clone());
+                            }
+                            set.faces[index].insert(0, font);
+                        }
                     }
                 }
                 Err(error) => errors.push(format!("defaults.fonts.{key}: {error}")),
@@ -259,11 +281,17 @@ impl FontSet {
     /// Finds the font and glyph to draw `ch` in `style` with, following the lookup
     /// order in the module documentation, skipping bitmaps that fail to decode.
     fn resolve(&self, ch: char, style: &Style) -> Resolved<'_> {
-        let chain = &self.faces[style_index(style)];
+        let index = style_index(style);
+        let chain = &self.faces[index];
+        // The configured regular font backs up bold/italic text (for regular text it is
+        // already first in `chain`).
+        let regular = self.regular.iter().filter(|_| index != 0);
         let candidates = chain
             .iter()
+            .chain(regular)
             .map(|font| (font, false))
-            .chain(self.emoji.iter().map(|font| (font, true)));
+            .chain(self.emoji.iter().map(|font| (font, true)))
+            .chain(self.extra.iter().map(|font| (font, true)));
         for (font, from_emoji) in candidates {
             match drawable_glyph(font, ch) {
                 Some((id, false)) => {
@@ -501,10 +529,10 @@ fn report_scan(key: &str, path: &str, scan: &FontScan, report: &mut FontReport) 
     }
     if !scan.undrawable.is_empty() {
         report.warnings.push(format!(
-            "defaults.fonts.{key}: {} of {} characters cannot be drawn; they fall back to the embedded {}",
+            "defaults.fonts.{key}: {} of {} characters cannot be drawn; they {}",
             scan.undrawable.len(),
             scan.total,
-            embedded_name(key)
+            fallback_description(key)
         ));
         let list: Vec<String> = scan
             .undrawable

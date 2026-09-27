@@ -338,7 +338,8 @@ may name other TrueType/OpenType files, each optional:
 "fonts": {
   "regular": "/usr/share/fonts/truetype/iosevka/Iosevka\-Regular.ttf",
   "bold": "...", "italic": "...", "bold_italic": "...",
-  "emoji": "/usr/share/fonts/truetype/noto/NotoSansSymbols2\-Regular.ttf"
+  "emoji": "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+  "extra": "/usr/share/fonts/opentype/noto/NotoSansCJK\-Regular.ttc#0"
 }
 .RE
 .fi
@@ -347,7 +348,11 @@ may name other TrueType/OpenType files, each optional:
 The font for text in that style.
 .TP
 .B emoji
-The fallback for characters none of the text fonts have.
+The fallback for characters none of the text fonts have (emoji, symbols).
+.TP
+.B extra
+A last\-resort font tried after the emoji fonts, typically for
+Chinese/Japanese/Korean.
 .PP
 Paths expand a leading
 .B ~
@@ -364,15 +369,28 @@ larger than 256 MiB or invalid font file is a config error, and fonts cannot be
 changed at runtime.
 .PP
 Each character is looked up in the configured font of its style, then the
-embedded font of that style, then the configured
+embedded font of that style, then (for bold/italic text) the configured
+.B regular
+font, then the configured
 .B emoji
-font, then the embedded Noto Emoji; if none has it, a box is drawn. A
+font, then the embedded Noto Emoji, then the configured
+.B extra
+font; if none has it, a box is drawn. A character both an emoji font and
+.B extra
+have is thus drawn as an emoji. Characters from the emoji fonts and
+.B extra
+are fitted into their columns. A
 proportional font works, but lines of wide letters are then drawn smaller to
 fit.
 .PP
-The embedded fonts have no CJK characters; name a CJK font as
-.B emoji
-(Latin stays in DejaVu, CJK always regular weight) or as
+The embedded fonts have no CJK characters (ideographs, kana, Hangul, half\-width
+and full\-width forms); name a CJK font as
+.B extra
+(Latin stays in DejaVu; CJK in the font's one weight, so
+.B #[bold]
+does not embolden it unless
+.B bold
+also names a CJK Bold font) or as
 .B regular
 (all text in that font). In
 .B NotoSansCJK\-Regular.ttc

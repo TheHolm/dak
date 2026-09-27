@@ -38,8 +38,11 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
 - Configured fonts are checked at startup; if some characters cannot be
   drawn you get one warning with the count and the embedded font they fall
   back to (`-d scene` lists them).
-- Chinese/Japanese/Korean work through an external font (e.g. Noto Sans CJK
-  as `emoji` or `regular`). Right-to-left scripts (Hebrew, Arabic) are not
+- Chinese/Japanese/Korean work through a new `defaults.fonts.extra` font
+  (e.g. Noto Sans CJK), tried after the emoji fonts; Latin stays in DejaVu
+  and CJK characters take two of the six columns. Bold/italic text now falls
+  back to your configured `regular` font before giving up, so a CJK
+  `regular` font no longer shows boxes in bold. Right-to-left scripts (Hebrew, Arabic) are not
   supported yet; formatting tags past the visible 6x3 area still apply.
 - The `.deb` packages now ship a complete `/usr/share/doc/dak/copyright`
   with the full AGPL text (before, it only named the licence) plus the
@@ -82,6 +85,10 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   character (outline / bitmap / undrawable), skipping `is_blank_by_design`
   characters, and notes COLR/SVG tables. `load_font_file` now returns
   `(FontArc, FontScan)` and refuses fonts with nothing drawable;
+  `FONT_KEYS`/`FontPaths` gain `extra`; `FontSet` gains `regular` (tried for
+  bold/italic after the style chain) and `extra` (after the emoji chain,
+  fitted into cells like emoji); the extra slot's gap warning says the
+  characters are shown as a missing-glyph box;
   `FontSet::load` returns `(FontSet, FontReport { warnings, details })`;
   `LoadedConfig::font_details` carries the code-point lists, printed by
   `main.rs` as `scene` debug output. `MAX_FONT_FILE_BYTES` is 256 MiB (was
@@ -126,7 +133,9 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   fonts, new `tests/colour_fonts.rs` with in-memory test fonts from
   `tests/common/font_builder.rs` (CBDT drawn in own colours/aspect/over
   highlights, COLR-only/SVG-only/empty fonts refused, COLR+outline and
-  partly-drawable warnings, 256 MiB limit), `embedded_fonts_scan_clean`, new `tests/packaging.rs` (copyright matches the licence files,
+  partly-drawable warnings, 256 MiB limit), new `tests/cjk_fonts.rs`
+  (`extra` draws CJK in two columns, emoji fonts win over it, bold/italic
+  fall back to the configured regular font), `embedded_fonts_scan_clean`, new `tests/packaging.rs` (copyright matches the licence files,
   covers every font, is installed by both packaging paths), and
   `tests/man_pages.rs` now also checks `SETUP_ENTRY_FIELDS`, `MARKUP_VALUES`
   and `FONT_KEYS` are documented. New `examples/styled-text.json`.

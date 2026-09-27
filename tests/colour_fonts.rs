@@ -256,6 +256,7 @@ fn config_warns_about_partly_drawable_font() {
         ("italic", "DejaVu Sans Mono Oblique"),
         ("bold_italic", "DejaVu Sans Mono Bold Oblique"),
         ("emoji", "Noto Emoji"),
+        ("extra", ""),
     ] {
         let config_path = write_config_with_defaults(
             &format!(r#"{{"fonts": {{"{key}": "{}"}}}}"#, path.display()),
@@ -263,10 +264,15 @@ fn config_warns_about_partly_drawable_font() {
         );
         let config = load_config_from_path(config_path.to_str().unwrap()).unwrap();
         let _ = std::fs::remove_file(&config_path);
+        let outcome = if fallback.is_empty() {
+            "are shown as a missing-glyph box".to_string()
+        } else {
+            format!("fall back to the embedded {fallback}")
+        };
         assert_eq!(
             config.warnings,
             vec![format!(
-                "defaults.fonts.{key}: 2 of 3 characters cannot be drawn; they fall back to the embedded {fallback}"
+                "defaults.fonts.{key}: 2 of 3 characters cannot be drawn; they {outcome}"
             )]
         );
         assert_eq!(

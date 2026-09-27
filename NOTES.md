@@ -873,6 +873,13 @@ Gotchas found on the way:
   head/hhea/maxp/hmtx/cmap(format 12)/glyf/loca, optional CBDT+CBLC (index
   format 1, image format 17), empty COLR+CPAL / SVG. `loca` needs numGlyphs+1
   entries - one short and ttf-parser silently finds no outlines at all.
+- CJK coverage (checked against the real fonts): DejaVu Sans Mono has **no**
+  CJK ideographs, kana, Hangul syllables (0/11172), half-width katakana,
+  full-width ASCII or CJK punctuation - Noto Sans CJK has all. Noto Sans CJK
+  and the emoji fonts share only 39 characters outside DejaVu, all squared
+  emoji (U+1F170.., U+1F201..); the emoji fonts have no CJK text. Hence the
+  lookup puts `extra` after the emoji fonts. Loading Noto Color Emoji +
+  Noto Sans CJK `#0` (read + scan + parse) takes ~100 ms on the dev host.
 - Supporting COLR/SVG later: estimated ~1.3-1.8k lines hand-written (COLRv1
   painter on tiny-skia + resvg for SVG) or ~300 via usvg's own text rendering
   (which would also bring shaping: ZWJ sequences, flags, Arabic); +2-4 MB.
