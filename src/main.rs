@@ -65,6 +65,9 @@ async fn main() -> Result<(), MirajazzError> {
             for warning in &config.warnings {
                 log.warn(warning);
             }
+            for detail in &config.font_details {
+                log.debug(Subsystem::Scene, detail);
+            }
             config
         }
         Err(errors) => {

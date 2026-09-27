@@ -37,6 +37,7 @@ FreeBSD/cross-compiling) and states its own environment inline.
 6. [Animated button images: real-hardware findings](#6-animated-button-images-real-hardware-findings)
 7. [Device disconnect/reconnect on FreeBSD](#7-device-disconnectreconnect-on-freebsd)
 8. [Package licence files (`debian/copyright`)](#8-package-licence-files-debiancopyright)
+9. [Font formats and the startup glyph scan](#9-font-formats-and-the-startup-glyph-scan)
 
 ---
 
@@ -828,3 +829,50 @@ package must carry more than the AGPL. Findings and decisions:
   we ship no Debian changelog. Setting `section = "utils"` in
   `[package.metadata.deb]` fixed the `recommended-field Section` warning.
 
+---
+
+## 9. Font formats and the startup glyph scan
+
+`src/text.rs` draws with `ab_glyph`, which rasterises outlines only; colour
+bitmaps (CBDT/sbix, PNG or premultiplied BGRA) are decoded with the `image`
+crate and blended as pictures. COLR (v0/v1) and SVG-in-OpenType are **not**
+drawn. `scan_font` (ttf-parser 0.25, already in the tree via ab_glyph) checks
+every mapped character of each configured font at startup.
+
+**Real fonts** (measured 2026-09, release build, on a throwaway Debian 13 VM with
+2 vCPU "QEMU Virtual CPU 2.5+", files in page cache; a Ryzen 5 5600 host was
+~1.5x faster):
+
+| Font | Size | Tables | Chars | Drawable | Scan |
+|---|---|---|---|---|---|
+| DejaVu Sans Mono 2.37 | 0.3 MiB | glyf | 3306 | all but U+FFF9-FFFC* | 3.5 ms |
+| Noto Emoji mono 3.000 | 1.9 MiB | glyf | 1441 | all | 7.3 ms |
+| Noto Color Emoji (Debian `fonts-noto-color-emoji` 2.051) | 10.7 MiB | CBDT | 1455 | all (PNG) | 0.3 ms |
+| Noto Color Emoji (Google Fonts download) | 23.1 MiB | glyf+COLR+SVG | 1448 | none | 0.4 ms |
+| Twemoji Mozilla 0.7.0 | 1.4 MiB | glyf+COLR | 1401 | none | 0.4 ms |
+| Twitter Color Emoji SVGinOT 15.1 | 14.6 MiB | glyf+SVG | 1413 | all (outlines) | 12.8 ms |
+| Noto Sans CJK Regular `.ttc#0` | 18.6 MiB | CFF | 44805 | all but 4 Hangul fillers* | ~130 ms |
+| Noto Sans CJK Super OTC `#0` | 111.8 MiB | CFF | 44805 | same | ~140 ms (+44 ms read) |
+
+\* blank by design; `is_blank_by_design` skips them, so the real run reports
+nothing. DejaVu Sans Mono **Oblique** 2.37 genuinely has an empty U+1D3D (unit
+test `embedded_fonts_scan_clean` allows exactly that).
+
+Gotchas found on the way:
+
+- The "Noto Color Emoji" on fonts.google.com is the COLRv1 build; distro
+  packages ship the CBDT build. GitHub `raw/main` URLs for the noto-emoji fonts
+  404 (the files are LFS/release assets) - `apt-get download
+  fonts-noto-color-emoji` is the easy way to get the CBDT one.
+- COLR fonts have a `glyf` table, but the cmap-mapped base glyphs are empty;
+  the layer glyphs carry the outlines. So "has glyf" does not mean drawable -
+  hence scanning glyphs rather than checking tables.
+- ttf-parser's `glyph_raster_image(id, u16::MAX)` picks the largest strike
+  (109 ppem for Noto Color Emoji); sbix JPEG/TIFF/PDF images return `None`.
+- Tests build fonts in memory (`tests/common/font_builder.rs`): minimal
+  head/hhea/maxp/hmtx/cmap(format 12)/glyf/loca, optional CBDT+CBLC (index
+  format 1, image format 17), empty COLR+CPAL / SVG. `loca` needs numGlyphs+1
+  entries - one short and ttf-parser silently finds no outlines at all.
+- Supporting COLR/SVG later: estimated ~1.3-1.8k lines hand-written (COLRv1
+  painter on tiny-skia + resvg for SVG) or ~300 via usvg's own text rendering
+  (which would also bring shaping: ZWJ sequences, flags, Arabic); +2-4 MB.

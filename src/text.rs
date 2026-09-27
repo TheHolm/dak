@@ -10,19 +10,23 @@
 //! Glyphs are looked up per character, in this order: the configured font for the span's
 //! style (regular, bold, italic or bold italic), the embedded DejaVu Sans Mono face of
 //! that style, the configured emoji font, the embedded monochrome Noto Emoji, and finally
-//! the style font's "missing glyph" box. Glyphs a font only has as colour bitmaps/layers
-//! (colour emoji fonts) cannot be drawn by `ab_glyph` and are skipped the same way as
-//! missing ones. There is no text shaping: variation selectors and zero-width joiners are
-//! dropped, and an emoji made of several code points (skin tone, ZWJ sequence, flag)
-//! shows only its first one - a monochrome font has no skin tones to show anyway.
+//! the style font's "missing glyph" box. A glyph counts when the font has an outline for
+//! it or a colour bitmap (CBDT/sbix, PNG or BGRA): bitmaps are drawn as scaled pictures in
+//! their own colours. COLR and SVG colour glyphs cannot be drawn and are skipped the same
+//! way as missing ones, falling back to the next font. Configured fonts are scanned when
+//! loaded (see [`scan_font`]) so a font with nothing drawable is refused and one with
+//! gaps is reported. There is no text shaping: variation selectors and zero-width joiners
+//! are dropped, and an emoji made of several code points (skin tone, ZWJ sequence, flag)
+//! shows only its first one.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use ab_glyph::{point, Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont};
-use image::{Rgb, RgbImage};
+use ab_glyph::{point, Font, FontArc, FontVec, GlyphId, GlyphImageFormat, PxScale, ScaleFont};
+use image::{Rgb, RgbImage, RgbaImage};
 use mirajazz::types::ImageFormat;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -47,8 +51,10 @@ pub const MAX_LINES: usize = 3;
 pub const FONT_KEYS: &[&str] = &["regular", "bold", "italic", "bold_italic", "emoji"];
 
 /// Largest font file `defaults.fonts` may name; bigger files are refused rather than
-/// read into memory whole.
-pub const MAX_FONT_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// read into memory whole. Big enough for the largest real fonts (the ~112 MiB Noto
+/// Sans CJK "Super OTC" collection), small enough to catch a path to something that is
+/// plainly not a font.
+pub const MAX_FONT_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// DejaVu Sans Mono (regular, bold, oblique, bold oblique) embedded into the binary, so
 /// text rendering works without any font files installed on the host. All four faces
@@ -110,6 +116,22 @@ impl FontPaths {
     }
 }
 
+/// The name of the embedded font each [`FONT_KEYS`] slot falls back to, as used in the
+/// startup warning about characters a configured font cannot draw.
+fn embedded_name(key: &str) -> &'static str {
+    match key {
+        "regular" => "DejaVu Sans Mono",
+        "bold" => "DejaVu Sans Mono Bold",
+        "italic" => "DejaVu Sans Mono Oblique",
+        "bold_italic" => "DejaVu Sans Mono Bold Oblique",
+        _ => "Noto Emoji",
+    }
+}
+
+/// Decoded colour bitmaps, keyed by the font's data address and the glyph id; `None`
+/// records a bitmap that failed to decode, so it is not retried on every draw.
+type BitmapCache = HashMap<(usize, u16), Option<Arc<RgbaImage>>>;
+
 /// The fonts text is drawn with: a lookup chain per style plus the emoji fallback chain.
 /// Parsed once (at startup for configured fonts) and shared behind an [`Arc`].
 #[derive(Clone)]
@@ -120,6 +142,32 @@ pub struct FontSet {
     /// Fallback chain for characters no face of the style has: the configured emoji
     /// font (if any), then the embedded Noto Emoji.
     emoji: Vec<FontArc>,
+    /// Colour bitmaps decoded so far, shared by every clone of the set.
+    bitmaps: Arc<Mutex<BitmapCache>>,
+}
+
+/// What loading `defaults.fonts` had to say beyond errors: one-line warnings (always
+/// shown) and details such as the full list of undrawable code points (debug output).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FontReport {
+    /// Warnings shown at startup, prefixed with `defaults.fonts.<slot>`.
+    pub warnings: Vec<String>,
+    /// Extra detail for `-d scene`, prefixed the same way.
+    pub details: Vec<String>,
+}
+
+/// The result of scanning a font's character map with [`scan_font`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FontScan {
+    /// Characters the font maps (not counting those in [`is_blank_by_design`]).
+    pub total: usize,
+    /// Of those, the code points with neither an outline nor a colour bitmap dak can
+    /// decode (COLR/SVG-only colour glyphs, JPEG/TIFF sbix images, empty glyphs).
+    pub undrawable: Vec<u32>,
+    /// Characters drawn from colour bitmaps (CBDT/sbix) rather than outlines.
+    pub bitmaps: usize,
+    /// Whether the font has COLR or SVG colour tables, whose colour dak ignores.
+    pub vector_colour: bool,
 }
 
 impl fmt::Debug for FontSet {
@@ -159,41 +207,45 @@ impl FontSet {
                         vec![embedded_font(FONT_BOLD_ITALIC_BYTES)],
                     ],
                     emoji: vec![embedded_font(EMOJI_BYTES)],
+                    bitmaps: Arc::default(),
                 })
             })
             .clone()
     }
 
-    /// Builds the font set for `paths`: each configured file is read and parsed now and
-    /// put in front of the embedded font of its slot. Every problem (missing file, file
-    /// too large, not a font, collection index out of range) is reported, prefixed with
-    /// `defaults.fonts.<slot>`.
-    pub fn load(paths: &FontPaths) -> Result<FontSet, Vec<String>> {
+    /// Builds the font set for `paths`: each configured file is read, scanned and parsed
+    /// now and put in front of the embedded font of its slot. Every problem (missing
+    /// file, file too large, not a font, collection index out of range, nothing
+    /// drawable) is an error, prefixed with `defaults.fonts.<slot>`; characters a font
+    /// cannot draw and ignored COLR/SVG colour come back in the [`FontReport`].
+    pub fn load(paths: &FontPaths) -> Result<(FontSet, FontReport), Vec<String>> {
         let embedded = FontSet::embedded();
         let mut set = (*embedded).clone();
+        set.bitmaps = Arc::default();
         let mut errors = Vec::new();
+        let mut report = FontReport::default();
         let slots = [
             ("regular", &paths.regular),
             ("bold", &paths.bold),
             ("italic", &paths.italic),
             ("bold_italic", &paths.bold_italic),
+            ("emoji", &paths.emoji),
         ];
         for (index, (key, path)) in slots.into_iter().enumerate() {
-            if let Some(path) = path {
-                match load_font_file(path) {
-                    Ok(font) => set.faces[index].insert(0, font),
-                    Err(error) => errors.push(format!("defaults.fonts.{key}: {error}")),
-                }
-            }
-        }
-        if let Some(path) = &paths.emoji {
+            let Some(path) = path else { continue };
             match load_font_file(path) {
-                Ok(font) => set.emoji.insert(0, font),
-                Err(error) => errors.push(format!("defaults.fonts.emoji: {error}")),
+                Ok((font, scan)) => {
+                    report_scan(key, path, &scan, &mut report);
+                    match set.faces.get_mut(index) {
+                        Some(chain) => chain.insert(0, font),
+                        None => set.emoji.insert(0, font),
+                    }
+                }
+                Err(error) => errors.push(format!("defaults.fonts.{key}: {error}")),
             }
         }
         if errors.is_empty() {
-            Ok(set)
+            Ok((set, report))
         } else {
             Err(errors)
         }
@@ -205,39 +257,272 @@ impl FontSet {
     }
 
     /// Finds the font and glyph to draw `ch` in `style` with, following the lookup
-    /// order in the module documentation. The flag is true when the glyph came from the
-    /// emoji chain (and so is fitted into its cells rather than drawn at its advance).
-    fn resolve(&self, ch: char, style: &Style) -> (&FontArc, GlyphId, bool) {
+    /// order in the module documentation, skipping bitmaps that fail to decode.
+    fn resolve(&self, ch: char, style: &Style) -> Resolved<'_> {
         let chain = &self.faces[style_index(style)];
-        for font in chain {
-            if let Some(id) = drawable_glyph(font, ch) {
-                return (font, id, false);
-            }
-        }
-        for font in &self.emoji {
-            if let Some(id) = drawable_glyph(font, ch) {
-                return (font, id, true);
+        let candidates = chain
+            .iter()
+            .map(|font| (font, false))
+            .chain(self.emoji.iter().map(|font| (font, true)));
+        for (font, from_emoji) in candidates {
+            match drawable_glyph(font, ch) {
+                Some((id, false)) => {
+                    return Resolved {
+                        font,
+                        id,
+                        fitted: from_emoji,
+                        bitmap: None,
+                    }
+                }
+                Some((id, true)) => {
+                    if let Some(bitmap) = self.bitmap(font, id) {
+                        return Resolved {
+                            font,
+                            id,
+                            fitted: true,
+                            bitmap: Some(bitmap),
+                        };
+                    }
+                }
+                None => {}
             }
         }
         let font = &chain[0];
-        (font, font.glyph_id(ch), false)
+        Resolved {
+            font,
+            id: font.glyph_id(ch),
+            fitted: false,
+            bitmap: None,
+        }
+    }
+
+    /// The decoded colour bitmap of glyph `id` in `font` (its largest strike), from the
+    /// cache or decoded now; `None` when it cannot be decoded.
+    fn bitmap(&self, font: &FontArc, id: GlyphId) -> Option<Arc<RgbaImage>> {
+        let key = (font.font_data().as_ptr() as usize, id.0);
+        let mut cache = self
+            .bitmaps
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .entry(key)
+            .or_insert_with(|| decode_bitmap(font, id).map(Arc::new))
+            .clone()
     }
 }
 
-/// `font`'s glyph for `ch` when it has a usable one: present in the character map and,
-/// unless `ch` is whitespace (which legitimately has no outline), an outline - which a
-/// colour-only emoji glyph lacks, so such fonts fall through to the next one.
-fn drawable_glyph(font: &FontArc, ch: char) -> Option<GlyphId> {
+/// How one character is drawn, as found by [`FontSet::resolve`].
+struct Resolved<'a> {
+    /// The font the glyph comes from.
+    font: &'a FontArc,
+    /// The glyph within `font`.
+    id: GlyphId,
+    /// Whether the glyph is fitted into its cells (emoji chain or a bitmap) rather than
+    /// advancing by its own width.
+    fitted: bool,
+    /// The decoded picture when the glyph is a colour bitmap.
+    bitmap: Option<Arc<RgbaImage>>,
+}
+
+/// `font`'s glyph for `ch` when it has a usable one: present in the character map and
+/// either whitespace (which legitimately has no outline), an outline, or a colour
+/// bitmap in a format [`decode_bitmap`] handles. The flag is true for a bitmap. COLR/SVG
+/// colour glyphs without an outline qualify for neither, so the next font is tried.
+fn drawable_glyph(font: &FontArc, ch: char) -> Option<(GlyphId, bool)> {
     let id = font.glyph_id(ch);
     if id.0 == 0 {
         return None;
     }
-    (ch.is_whitespace() || font.outline(id).is_some()).then_some(id)
+    if ch.is_whitespace() || font.outline(id).is_some() {
+        return Some((id, false));
+    }
+    let image = font.glyph_raster_image2(id, u16::MAX)?;
+    matches!(
+        image.format,
+        GlyphImageFormat::Png | GlyphImageFormat::BitmapPremulBgra32
+    )
+    .then_some((id, true))
 }
 
-/// Reads and parses one configured font file. A trailing `#N` on `spec` selects face
-/// `N` of a font collection; files over [`MAX_FONT_FILE_BYTES`] are refused.
-pub fn load_font_file(spec: &str) -> Result<FontArc, String> {
+/// Decodes the largest colour bitmap `font` has for glyph `id` into straight-alpha RGBA:
+/// PNG through the `image` crate, premultiplied BGRA by hand. `None` for anything else
+/// or data that does not decode.
+fn decode_bitmap(font: &FontArc, id: GlyphId) -> Option<RgbaImage> {
+    let image = font.glyph_raster_image2(id, u16::MAX)?;
+    match image.format {
+        GlyphImageFormat::Png => {
+            image::load_from_memory_with_format(image.data, image::ImageFormat::Png)
+                .ok()
+                .map(|decoded| decoded.to_rgba8())
+        }
+        GlyphImageFormat::BitmapPremulBgra32 => {
+            let (width, height) = (u32::from(image.width), u32::from(image.height));
+            if image.data.len() < (width * height * 4) as usize {
+                return None;
+            }
+            let mut rgba = RgbaImage::new(width, height);
+            for (pixel, bgra) in rgba.pixels_mut().zip(image.data.as_chunks::<4>().0) {
+                let alpha = bgra[3];
+                // Undo the premultiplication so blending can treat all bitmaps alike.
+                let straight = |value: u8| {
+                    if alpha == 0 {
+                        0
+                    } else {
+                        ((u32::from(value) * 255 + u32::from(alpha) / 2) / u32::from(alpha))
+                            .min(255) as u8
+                    }
+                };
+                *pixel = image::Rgba([
+                    straight(bgra[2]),
+                    straight(bgra[1]),
+                    straight(bgra[0]),
+                    alpha,
+                ]);
+            }
+            Some(rgba)
+        }
+        _ => None,
+    }
+}
+
+/// Characters a font legitimately draws as nothing, left out of [`scan_font`]'s counts:
+/// whitespace, controls, format/invisible characters (joiners, directional marks,
+/// variation selectors, tags) and characters that are blank by design (object
+/// replacement/interlinear annotation marks, Hangul fillers, the blank Braille cell).
+pub fn is_blank_by_design(ch: char) -> bool {
+    ch.is_whitespace()
+        || ch.is_control()
+        || matches!(
+            ch as u32,
+            0x00AD
+                | 0x034F
+                | 0x061C
+                | 0x115F
+                | 0x1160
+                | 0x17B4
+                | 0x17B5
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x2028..=0x202E
+                | 0x2060..=0x206F
+                | 0x2800
+                | 0x3164
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF9..=0xFFFC
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+        )
+}
+
+/// An outline sink that only notes whether anything was drawn; the scan needs to know
+/// whether a glyph has an outline, not its shape.
+struct NoOutline;
+
+impl ttf_parser::OutlineBuilder for NoOutline {
+    /// Ignored.
+    fn move_to(&mut self, _: f32, _: f32) {}
+    /// Ignored.
+    fn line_to(&mut self, _: f32, _: f32) {}
+    /// Ignored.
+    fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+    /// Ignored.
+    fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+    /// Ignored.
+    fn close(&mut self) {}
+}
+
+/// Scans face `index` of the font in `data`: every character its Unicode character maps
+/// list (minus [`is_blank_by_design`] ones) is checked for an outline or a decodable
+/// colour bitmap, without drawing anything. Takes a few milliseconds for a typical font
+/// and ~0.15 s for a 65k-glyph CJK face (see `NOTES.md`). `None` when the data is not a
+/// font.
+pub fn scan_font(data: &[u8], index: u32) -> Option<FontScan> {
+    use ttf_parser::{Face, RasterImageFormat, Tag};
+    let face = Face::parse(data, index).ok()?;
+    let raw = face.raw_face();
+    let mut scan = FontScan {
+        vector_colour: raw.table(Tag::from_bytes(b"COLR")).is_some()
+            || raw.table(Tag::from_bytes(b"SVG ")).is_some(),
+        ..FontScan::default()
+    };
+    let mut glyphs = std::collections::BTreeMap::new();
+    if let Some(cmap) = face.tables().cmap {
+        for subtable in cmap
+            .subtables
+            .into_iter()
+            .filter(|table| table.is_unicode())
+        {
+            subtable.codepoints(|code| {
+                if let Some(id) = subtable.glyph_index(code) {
+                    if id.0 != 0 {
+                        glyphs.entry(code).or_insert(id);
+                    }
+                }
+            });
+        }
+    }
+    for (code, id) in glyphs {
+        let Some(ch) = char::from_u32(code) else {
+            continue;
+        };
+        if is_blank_by_design(ch) {
+            continue;
+        }
+        scan.total += 1;
+        if face.outline_glyph(id, &mut NoOutline).is_some() {
+            continue;
+        }
+        match face.glyph_raster_image(id, u16::MAX) {
+            Some(image)
+                if matches!(
+                    image.format,
+                    RasterImageFormat::PNG | RasterImageFormat::BitmapPremulBgra32
+                ) =>
+            {
+                scan.bitmaps += 1
+            }
+            _ => scan.undrawable.push(code),
+        }
+    }
+    Some(scan)
+}
+
+/// Adds the warnings (and debug details) a font's scan calls for to `report`: ignored
+/// COLR/SVG colour, and characters that cannot be drawn and so fall back to the slot's
+/// embedded font.
+fn report_scan(key: &str, path: &str, scan: &FontScan, report: &mut FontReport) {
+    if scan.vector_colour {
+        report.warnings.push(format!(
+            "defaults.fonts.{key}: \"{path}\" has COLR/SVG colour glyphs, which dak cannot draw; its monochrome outlines are used instead"
+        ));
+    }
+    if !scan.undrawable.is_empty() {
+        report.warnings.push(format!(
+            "defaults.fonts.{key}: {} of {} characters cannot be drawn; they fall back to the embedded {}",
+            scan.undrawable.len(),
+            scan.total,
+            embedded_name(key)
+        ));
+        let list: Vec<String> = scan
+            .undrawable
+            .iter()
+            .map(|code| format!("U+{code:04X}"))
+            .collect();
+        report.details.push(format!(
+            "defaults.fonts.{key}: characters that cannot be drawn: {}",
+            list.join(" ")
+        ));
+    }
+}
+
+/// Reads, scans and parses one configured font file. A trailing `#N` on `spec` selects
+/// face `N` of a font collection; files over [`MAX_FONT_FILE_BYTES`] are refused, and so
+/// is a font none of whose characters can be drawn (typically a COLR/SVG-only colour
+/// emoji font).
+pub fn load_font_file(spec: &str) -> Result<(FontArc, FontScan), String> {
     let (path, index) = split_face_index(spec);
     let metadata = std::fs::metadata(path).map_err(|error| format!("\"{path}\": {error}"))?;
     if !metadata.is_file() {
@@ -250,14 +535,23 @@ pub fn load_font_file(spec: &str) -> Result<FontArc, String> {
         ));
     }
     let bytes = std::fs::read(path).map_err(|error| format!("\"{path}\": {error}"))?;
-    let font = FontVec::try_from_vec_and_index(bytes, index).map_err(|_| {
+    let not_a_font = || {
         if index == 0 {
             format!("\"{path}\" is not a TrueType/OpenType font")
         } else {
             format!("\"{path}\" is not a font collection with a face #{index}")
         }
-    })?;
-    Ok(FontArc::new(font))
+    };
+    let scan = scan_font(&bytes, index).ok_or_else(not_a_font)?;
+    if scan.total == scan.undrawable.len() {
+        return Err(if scan.vector_colour {
+            format!("\"{path}\" has no glyphs dak can draw (COLR/SVG-only colour fonts are not supported)")
+        } else {
+            format!("\"{path}\" has no glyphs dak can draw")
+        });
+    }
+    let font = FontVec::try_from_vec_and_index(bytes, index).map_err(|_| not_a_font())?;
+    Ok((FontArc::new(font), scan))
 }
 
 /// Splits a font spec into its path and collection face index: `"a.ttc#2"` is face 2 of
@@ -375,8 +669,12 @@ struct PlacedGlyph {
     /// Whether the glyph is vertically centred on the line (emoji) instead of sitting
     /// on the shared baseline.
     centred: bool,
-    /// The glyph's colour; `None` for the button's text colour.
+    /// The glyph's colour; `None` for the button's text colour. Unused for bitmaps,
+    /// which carry their own colours.
     fg: Option<Color>,
+    /// For a colour bitmap glyph: its picture and the width (at scale 1) of the cells it
+    /// is fitted into, centred on the line.
+    bitmap: Option<(Arc<RgbaImage>, f32)>,
 }
 
 /// A highlight rectangle behind one grapheme cluster, at scale 1 relative to its line.
@@ -428,8 +726,22 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
             let start = laid.width;
             let mut chars = grapheme.chars().filter(|ch| !IGNORED_CHARS.contains(ch));
             let first = chars.next().expect("grapheme has a drawable character");
-            let (font, id, is_emoji) = fonts.resolve(first, &span.style);
-            if is_emoji {
+            let resolved = fonts.resolve(first, &span.style);
+            let (font, id) = (resolved.font, resolved.id);
+            if let Some(bitmap) = resolved.bitmap {
+                // A colour picture: fitted into its cells when drawn, keeping its aspect.
+                let target = cells as f32 * cell;
+                laid.glyphs.push(PlacedGlyph {
+                    font: font.clone(),
+                    id,
+                    x: start,
+                    scale: 1.0,
+                    centred: true,
+                    fg: None,
+                    bitmap: Some((bitmap, target)),
+                });
+                laid.width += target;
+            } else if resolved.fitted {
                 // Fit the emoji into its cells, never larger than its natural size so it
                 // cannot outgrow the line height; the rest of the cluster (skin tone,
                 // joined emoji) cannot be combined without shaping and is dropped.
@@ -443,6 +755,7 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                     scale,
                     centred: true,
                     fg: span.style.fg.clone(),
+                    bitmap: None,
                 });
                 laid.width += target;
             } else {
@@ -450,8 +763,12 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                     let (font, id) = if index == 0 {
                         (font, id)
                     } else {
-                        let (font, id, _) = fonts.resolve(ch, &span.style);
-                        (font, id)
+                        // A combining mark: only an outline can sit on its base character.
+                        let resolved = fonts.resolve(ch, &span.style);
+                        if resolved.bitmap.is_some() {
+                            continue;
+                        }
+                        (resolved.font, resolved.id)
                     };
                     laid.glyphs.push(PlacedGlyph {
                         font: font.clone(),
@@ -460,6 +777,7 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                         scale: 1.0,
                         centred: false,
                         fg: span.style.fg.clone(),
+                        bitmap: None,
                     });
                     // Combining marks sit on the preceding base character.
                     if ch.width() != Some(0) {
@@ -555,6 +873,35 @@ pub fn render_lines(
         }
 
         for glyph in &line.glyphs {
+            if let Some((picture, cells_width)) = &glyph.bitmap {
+                // Fit the picture into its cells and the line height, keeping its aspect,
+                // centred in that box.
+                let (box_width, box_height) = (cells_width * scale, line_height);
+                let (picture_width, picture_height) = (
+                    picture.width().max(1) as f32,
+                    picture.height().max(1) as f32,
+                );
+                let fit = (box_width / picture_width).min(box_height / picture_height);
+                let (draw_width, draw_height) = (
+                    (picture_width * fit).round().max(1.0) as u32,
+                    (picture_height * fit).round().max(1.0) as u32,
+                );
+                let x0 = left + glyph.x * scale + (box_width - draw_width as f32) / 2.0;
+                let y0 = baseline - ascent + (box_height - draw_height as f32) / 2.0;
+                let scaled_picture = image::imageops::resize(
+                    picture.as_ref(),
+                    draw_width,
+                    draw_height,
+                    image::imageops::FilterType::Triangle,
+                );
+                blend_picture(
+                    &mut image,
+                    &scaled_picture,
+                    x0.round() as i32,
+                    y0.round() as i32,
+                );
+                continue;
+            }
             let glyph_scale = scale * glyph.scale;
             let glyph_baseline = if glyph.centred {
                 // Put the glyph's line box centre on the primary font's line centre.
@@ -602,6 +949,29 @@ pub fn render_lines(
     }
 
     Ok(image::DynamicImage::ImageRgb8(image))
+}
+
+/// Alpha-blends `picture` onto `image` with its top-left corner at (`x`, `y`), clipping
+/// whatever falls outside the image.
+fn blend_picture(image: &mut RgbImage, picture: &RgbaImage, x: i32, y: i32) {
+    for (px, py, pixel) in picture.enumerate_pixels() {
+        let (tx, ty) = (x + px as i32, y + py as i32);
+        if tx < 0 || ty < 0 || tx as u32 >= image.width() || ty as u32 >= image.height() {
+            continue;
+        }
+        let alpha = f32::from(pixel.0[3]) / 255.0;
+        let backdrop = image.get_pixel(tx as u32, ty as u32).0;
+        let channel = |index: usize| {
+            (f32::from(pixel.0[index]) * alpha + f32::from(backdrop[index]) * (1.0 - alpha))
+                .round()
+                .clamp(0.0, 255.0) as u8
+        };
+        image.put_pixel(
+            tx as u32,
+            ty as u32,
+            Rgb([channel(0), channel(1), channel(2)]),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -898,11 +1268,11 @@ mod tests {
     #[test]
     fn emoji_is_drawn_from_noto() {
         let fonts = FontSet::embedded();
-        let (_, id, is_emoji) = fonts.resolve('\u{1F600}', &Style::default());
-        assert!(is_emoji);
-        assert_ne!(id.0, 0);
-        let (_, _, is_emoji) = fonts.resolve('A', &Style::default());
-        assert!(!is_emoji);
+        let resolved = fonts.resolve('\u{1F600}', &Style::default());
+        assert!(resolved.fitted);
+        assert!(resolved.bitmap.is_none());
+        assert_ne!(resolved.id.0, 0);
+        assert!(!fonts.resolve('A', &Style::default()).fitted);
         let image = render_markup("#[fg=yellow,u=1F600]");
         let lit = image
             .pixels()
@@ -932,6 +1302,45 @@ mod tests {
         assert_eq!(lay_out(&lines[0], &fonts).glyphs.len(), 3);
         // Four lines render without error, only three are drawn.
         render_markup("a\nb\nc\nd");
+    }
+
+    /// Every embedded font passes the startup scan cleanly: all mapped characters are
+    /// drawable, except U+1D3D (MODIFIER LETTER CAPITAL OU), which DejaVu Sans Mono
+    /// Oblique 2.37 maps to an empty glyph. None carries COLR/SVG colour.
+    #[test]
+    fn embedded_fonts_scan_clean() {
+        for (name, bytes, expected) in [
+            ("regular", FONT_BYTES, vec![]),
+            ("bold", FONT_BOLD_BYTES, vec![]),
+            ("oblique", FONT_ITALIC_BYTES, vec![0x1D3D]),
+            ("bold oblique", FONT_BOLD_ITALIC_BYTES, vec![]),
+            ("emoji", EMOJI_BYTES, vec![]),
+        ] {
+            let scan = scan_font(bytes, 0).expect("embedded font parses");
+            assert!(scan.total > 1000, "{name}: {}", scan.total);
+            assert_eq!(scan.undrawable, expected, "{name}");
+            assert!(!scan.vector_colour, "{name}");
+            assert_eq!(scan.bitmaps, 0, "{name}");
+        }
+    }
+
+    /// Blank-by-design characters include whitespace, joiners, variation selectors and
+    /// Hangul fillers, but not ordinary letters or emoji.
+    #[test]
+    fn blank_by_design_characters() {
+        for ch in [
+            ' ',
+            '\u{200D}',
+            '\u{FE0F}',
+            '\u{3164}',
+            '\u{FFFC}',
+            '\u{E0041}',
+        ] {
+            assert!(is_blank_by_design(ch), "{:04X}", ch as u32);
+        }
+        for ch in ['A', '\u{1F600}', '\u{4E00}'] {
+            assert!(!is_blank_by_design(ch), "{:04X}", ch as u32);
+        }
     }
 
     /// `split_face_index` separates a `#N` collection index, but leaves other `#`s alone.

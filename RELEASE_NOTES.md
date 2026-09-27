@@ -27,14 +27,24 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   now renders differently; set `"markup": "none"` to keep the old output.
 - New `defaults.fonts` lets you draw text with your own font files
   (`regular`, `bold`, `italic`, `bold_italic`, `emoji`; `~`, `$variables` and
-  `.ttc#N` faces supported). Characters a font lacks fall back to the
-  embedded fonts. A missing or broken font file stops dak from starting.
-  Fonts are loaded once; `$defaults.markup` is readable, `markup`/`fonts` are
-  not assignable.
+  `.ttc#N` faces supported, up to 256 MiB). Characters a font lacks fall back
+  to the embedded fonts. A missing or broken font file stops dak from
+  starting. Fonts are loaded once; `$defaults.markup` is readable,
+  `markup`/`fonts` are not assignable.
+- Colour bitmap emoji fonts (CBDT/sbix, e.g. Debian/Ubuntu's
+  `fonts-noto-color-emoji`) are drawn in full colour. COLR and SVG colour
+  fonts cannot be drawn: one with no plain outlines at all stops dak from
+  starting, one that also has outlines is drawn in monochrome with a warning.
+- Configured fonts are checked at startup; if some characters cannot be
+  drawn you get one warning with the count and the embedded font they fall
+  back to (`-d scene` lists them).
+- Chinese/Japanese/Korean work through an external font (e.g. Noto Sans CJK
+  as `emoji` or `regular`). Right-to-left scripts (Hebrew, Arabic) are not
+  supported yet; formatting tags past the visible 6x3 area still apply.
 - The `.deb` packages now ship a complete `/usr/share/doc/dak/copyright`
   with the full AGPL text (before, it only named the licence) plus the
   embedded fonts' licences; the FreeBSD package installs the same file.
-- The release binary is about 3 MB larger (the embedded fonts).
+- The release binary is about 3.7 MB larger (the embedded fonts, plus PNG decoding for colour emoji).
 
 ### Details
 - New `src/markup.rs`: `Markup::{None, Tmux}` (`MARKUP_VALUES`), `Align`,
@@ -61,6 +71,21 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   line box behind their clusters, and glyphs now blend over the actual
   pixel rather than the canvas colour. `render_text`/`render_text_colored`/
   `render_error_image`/`button_text` keep their signatures.
+- Colour bitmaps and the scan: `drawable_glyph` also accepts glyphs whose
+  largest raster image is PNG or premultiplied BGRA; `decode_bitmap` decodes
+  them (BGRA un-premultiplied by hand) into a per-`FontSet` cache keyed by
+  font data address and glyph id, and `render_lines` fits the picture into
+  its cells and the line height, keeping its aspect, then alpha-blends it.
+  `resolve` returns a `Resolved { font, id, fitted, bitmap }`. New
+  `scan_font` (direct `ttf-parser` 0.25 dependency, the version ab_glyph
+  already used) walks all Unicode cmap subtables and classifies each mapped
+  character (outline / bitmap / undrawable), skipping `is_blank_by_design`
+  characters, and notes COLR/SVG tables. `load_font_file` now returns
+  `(FontArc, FontScan)` and refuses fonts with nothing drawable;
+  `FontSet::load` returns `(FontSet, FontReport { warnings, details })`;
+  `LoadedConfig::font_details` carries the code-point lists, printed by
+  `main.rs` as `scene` debug output. `MAX_FONT_FILE_BYTES` is 256 MiB (was
+  32). Scan timings on real fonts are in `NOTES.md` section 9.
 - Fonts added under `fonts/` unmodified: `DejaVuSansMono-{Bold,Oblique,
   BoldOblique}.ttf` (2.37, same release as the existing regular face) and
   `NotoEmoji-VariableFont_wght.ttf` (google/fonts `ofl/notoemoji`, upstream
@@ -98,7 +123,10 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   emoji drawn, width cutting), new `tests/text_markup.rs` (config
   validation, font loading/errors, `~`/`$` expansion, read-only targets),
   new `SceneRunner` tests for markup in all three text types and custom
-  fonts, new `tests/packaging.rs` (copyright matches the licence files,
+  fonts, new `tests/colour_fonts.rs` with in-memory test fonts from
+  `tests/common/font_builder.rs` (CBDT drawn in own colours/aspect/over
+  highlights, COLR-only/SVG-only/empty fonts refused, COLR+outline and
+  partly-drawable warnings, 256 MiB limit), `embedded_fonts_scan_clean`, new `tests/packaging.rs` (copyright matches the licence files,
   covers every font, is installed by both packaging paths), and
   `tests/man_pages.rs` now also checks `SETUP_ENTRY_FIELDS`, `MARKUP_VALUES`
   and `FONT_KEYS` are documented. New `examples/styled-text.json`.

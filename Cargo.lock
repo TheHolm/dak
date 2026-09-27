@@ -462,6 +462,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "ttf-parser",
  "unicode-segmentation",
  "unicode-width",
 ]

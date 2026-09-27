@@ -11,7 +11,7 @@ use crate::log::{Log, Subsystem};
 use crate::map::Mapping;
 use crate::markup::Markup;
 use crate::press::Defaults;
-use crate::text::{FontPaths, FontSet, FONT_KEYS};
+use crate::text::{FontPaths, FontReport, FontSet, FONT_KEYS};
 use crate::variables::{
     check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
     VarRef, VarType, VarValue, Variables,
@@ -48,6 +48,9 @@ pub struct LoadedConfig {
     /// The fonts button text is drawn with: `defaults.fonts` loaded in front of the
     /// embedded ones (just the embedded ones when the config names none).
     pub fonts: Arc<FontSet>,
+    /// Detail from scanning `defaults.fonts` (such as every code point a font cannot
+    /// draw), printed as `scene` debug output; the one-line summaries are in `warnings`.
+    pub font_details: Vec<String>,
 }
 
 /// The config `version` assumed when the top-level `version` key is absent.
@@ -386,10 +389,12 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     // value; only existence/type matter here, not the (runtime) values themselves.
     let runtime_variables = Variables::new(variables.clone(), &defaults);
     check_scenes(&runtime_variables, scenes, &mut warnings, &mut errors);
-    let fonts = if defaults.fonts == FontPaths::default() {
-        FontSet::embedded()
+    let (fonts, font_details) = if defaults.fonts == FontPaths::default() {
+        (FontSet::embedded(), Vec::new())
     } else {
-        Arc::new(load_fonts(&defaults.fonts, &runtime_variables, &mut errors))
+        let (fonts, report) = load_fonts(&defaults.fonts, &runtime_variables, &mut errors);
+        warnings.extend(report.warnings);
+        (Arc::new(fonts), report.details)
     };
 
     if !errors.is_empty() {
@@ -403,6 +408,7 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         variables,
         warnings,
         fonts,
+        font_details,
     })
 }
 
@@ -554,8 +560,13 @@ fn check_font_paths(value: &Value, errors: &mut Vec<String>) -> FontPaths {
 /// Expands the `defaults.fonts` paths (`$` references from the variables' initial
 /// values, then a leading `~`) and loads the files in front of the embedded fonts.
 /// Every unreadable or invalid font is a config error: the program must not start with
-/// text silently drawn in a font the config did not ask for.
-fn load_fonts(paths: &FontPaths, variables: &Variables, errors: &mut Vec<String>) -> FontSet {
+/// text silently drawn in a font the config did not ask for. The scan's findings (see
+/// [`FontReport`]) are returned alongside.
+fn load_fonts(
+    paths: &FontPaths,
+    variables: &Variables,
+    errors: &mut Vec<String>,
+) -> (FontSet, FontReport) {
     let mut expanded = paths.clone();
     let mut ok = true;
     for key in FONT_KEYS {
@@ -571,11 +582,11 @@ fn load_fonts(paths: &FontPaths, variables: &Variables, errors: &mut Vec<String>
         }
     }
     if !ok {
-        return (*FontSet::embedded()).clone();
+        return ((*FontSet::embedded()).clone(), FontReport::default());
     }
     FontSet::load(&expanded).unwrap_or_else(|font_errors| {
         errors.extend(font_errors);
-        (*FontSet::embedded()).clone()
+        ((*FontSet::embedded()).clone(), FontReport::default())
     })
 }
 

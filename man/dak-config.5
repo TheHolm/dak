@@ -312,6 +312,20 @@ characters such as emoji and CJK ideographs take two, and a character is never
 split. There is no text shaping: variation selectors and zero\-width joiners
 are dropped, and an emoji made of several code points (skin tone, joined
 sequence, flag) shows only its first one.
+.PP
+Tags are applied even where their text is not shown: lines are cut to 6
+columns and the button to 3 lines only after the whole text is parsed, so a
+style set in the hidden part still carries over to later lines, and the last
+.B align
+of a line decides its alignment even past the cut.
+.PP
+Right\-to\-left scripts are not supported: characters are drawn left to right in
+stored order, so Hebrew appears mirrored and Arabic letters unjoined. Print the
+text already reordered and reshaped (for example with
+.B python\-bidi
+and
+.BR arabic\-reshaper )
+as a workaround.
 .SH FONTS
 Button text is drawn with fonts embedded in
 .BR dak :
@@ -346,21 +360,44 @@ picks face
 (from 0) of a
 .B .ttc
 font collection. Files are loaded once at startup; a missing, unreadable,
-larger than 32 MiB or invalid font file is a config error, and fonts cannot be
+larger than 256 MiB or invalid font file is a config error, and fonts cannot be
 changed at runtime.
 .PP
 Each character is looked up in the configured font of its style, then the
 embedded font of that style, then the configured
 .B emoji
-font, then the embedded Noto Emoji; if none has it, a box is drawn. The
-embedded fonts have no CJK ideographs; name a CJK font as
-.B emoji
-(or
-.BR regular )
-to show them. Colour
-emoji fonts (such as Noto Color Emoji) store no outlines and are skipped. A
+font, then the embedded Noto Emoji; if none has it, a box is drawn. A
 proportional font works, but lines of wide letters are then drawn smaller to
 fit.
+.PP
+The embedded fonts have no CJK characters; name a CJK font as
+.B emoji
+(Latin stays in DejaVu, CJK always regular weight) or as
+.B regular
+(all text in that font). In
+.B NotoSansCJK\-Regular.ttc
+the face selects the region:
+.B #0
+Japanese,
+.B #1
+Korean,
+.B #2
+Simplified Chinese,
+.B #3
+Traditional Chinese,
+.B #4
+Hong Kong.
+.PP
+A glyph is drawable when the font has an outline or a colour bitmap (CBDT or
+sbix, PNG or BGRA). Bitmap emoji are drawn as pictures in their own colours;
+.B fg=
+does not affect them. COLR and SVG colour glyphs cannot be drawn. Every
+configured font is scanned at startup: a font with no drawable character (a
+COLR\- or SVG\-only colour font) is a config error; a COLR/SVG font that also
+has outlines is used in monochrome with a warning; and characters a font
+cannot draw are counted in one warning and fall back to the slot's embedded
+font (the code points are listed with
+.BR "\-d scene" ).
 
 .SH VARIABLES
 The optional

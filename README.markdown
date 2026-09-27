@@ -194,6 +194,10 @@ Markup is interpreted after `$` references are expanded, so `#[fg=$alert_colour]
 
 A line shows at most 6 *columns*: ordinary characters take one, wide characters such as emoji and CJK ideographs take two, and a character is never split in half. There is no text shaping: variation selectors and zero-width joiners are dropped, and an emoji made of several code points (a skin tone, a joined family, a flag) shows only its first one.
 
+Tags are applied even where their text is not shown: a line is cut to 6 columns and the button to 3 lines only *after* the whole text is parsed, so a style set in the hidden tail of a line (or on a fourth line) still carries over to the lines after it, and the last `align` on a line decides its alignment even if it sits past the cut.
+
+Right-to-left scripts are not supported: characters are drawn left to right in the order they are stored, so Hebrew comes out mirrored and Arabic letters are not joined. (Hebrew is also missing from the embedded fonts, so it needs a font of its own.) A program can work around this by printing the text already in display order and shape, e.g. with Python's `python-bidi` and `arabic-reshaper`, whose Arabic presentation forms the embedded DejaVu font can draw.
+
 Existing configs: with `tmux` now the default, text that happens to contain `#[` or `##` renders differently than before 0.13.0. Set `"markup": "none"` (per entry or in `defaults`) to keep the old behaviour.
 
 ### Fonts
@@ -215,9 +219,17 @@ Button text is drawn with fonts embedded in the binary: DejaVu Sans Mono in regu
 - `regular`, `bold`, `italic`, `bold_italic` — the font for text in that style.
 - `emoji` — the fallback for characters none of the text fonts have.
 
-Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 32 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
+Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
 
-Each character is looked up in the configured font of its style, then the embedded font of that style, then the configured `emoji` font, then the embedded Noto Emoji; if none has it, a box is drawn. So a Latin-only font still shows Cyrillic and emoji from the embedded fonts. The embedded fonts have no CJK ideographs: to show those, point `emoji` (or `regular`) at a CJK font such as Noto Sans CJK. Colour emoji fonts (Noto Color Emoji and the like) store pictures rather than outlines, which `dak` cannot draw: their glyphs are skipped and the next font is tried. A proportional font works too, but since lines are limited by character count, a line of wide letters is then drawn smaller than one of narrow letters.
+Each character is looked up in the configured font of its style, then the embedded font of that style, then the configured `emoji` font, then the embedded Noto Emoji; if none has it, a box is drawn. So a Latin-only font still shows Cyrillic and emoji from the embedded fonts. A proportional font works too, but since lines are limited by character count, a line of wide letters is then drawn smaller than one of narrow letters.
+
+**Chinese, Japanese and Korean.** The embedded fonts have no CJK characters, so name a CJK font such as Noto Sans CJK. Either as `emoji`: Latin text stays in DejaVu and CJK comes from your font, but always in its regular weight (the emoji slot has no bold/italic), and the slot is then not available for an emoji font. Or as `regular` (plus `bold` etc.): all text uses that proportional font. In `NotoSansCJK-Regular.ttc` the face picks the regional glyph style: `#0` Japanese, `#1` Korean, `#2` Simplified Chinese, `#3` Traditional Chinese, `#4` Hong Kong. CJK characters are two columns wide, so a line holds three of them.
+
+**Which font files work.** A glyph can be drawn when the font has an outline for it (ordinary TrueType/OpenType fonts, monochrome emoji fonts) or a colour *bitmap* (CBDT or sbix tables with PNG or BGRA pictures, e.g. the `fonts-noto-color-emoji` package of Debian/Ubuntu). Bitmap emoji are drawn as scaled pictures in their own colours, so `fg=` does not affect them. Colour glyphs stored as COLR layers or SVG documents (the "Noto Color Emoji" download from Google Fonts, Twemoji Mozilla) cannot be drawn. Every configured font is scanned when dak starts (a few milliseconds for a normal font, about 0.15 s for a 65,000-glyph CJK face):
+
+- a font none of whose characters can be drawn — typically a COLR- or SVG-only colour emoji font — is a config error;
+- a COLR/SVG font that also has plain outlines (e.g. Twitter Color Emoji SVGinOT) is accepted with a warning that its colour is ignored, and drawn in monochrome;
+- if only some characters cannot be drawn, you get one warning such as `defaults.fonts.emoji: 214 of 3731 characters cannot be drawn; they fall back to the embedded Noto Emoji` (run with `-d scene` to see which code points).
 
 ### Variables
 

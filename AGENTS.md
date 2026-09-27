@@ -81,9 +81,13 @@ under other platforms.
   style (configured `defaults.fonts` file first, then the embedded DejaVu Sans Mono
   regular/bold/oblique/bold-oblique) plus the emoji chain (configured, then embedded
   monochrome Noto Emoji); `FontSet::embedded()` is parsed once and shared,
-  `FontSet::load(&FontPaths)` reads configured files (`path#N` = `.ttc` face, 32 MiB
-  cap). `render_lines` draws `markup::Line`s; `render_text`/`render_text_colored`/
-  `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant
+  `FontSet::load(&FontPaths)` reads configured files (`path#N` = `.ttc` face, 256 MiB
+  cap), scanning each with `scan_font` (fails on nothing drawable, reports gaps and
+  ignored COLR/SVG colour in a `FontReport`). Glyphs are outlines or colour bitmaps
+  (CBDT/sbix PNG/BGRA, drawn as pictures); COLR/SVG are not drawn - see `NOTES.md`
+  section 9. `render_lines` draws `markup::Line`s; `render_text`/`render_text_colored`/
+  `button_text` keep the plain-text API. `FONT_KEYS` is a vocabulary constant.
+  `tests/colour_fonts.rs` uses in-memory fonts from `tests/common/font_builder.rs`
 - `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
   (`device`/`scene`/`action`) by `-d`/`--debug`
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
@@ -134,7 +138,7 @@ under other platforms.
 - `QUERY` in `main.rs` (vendor 0x0300, product 0x3002) filters the device list
 - Images are 60x60 JPEG; the `image` crate computes them on the fly
 - Button text: at most 3 lines x 6 display columns, scaled to fit; embedding the fonts
-  grew the release binary by about 3 MB (5.6 MB to 8.7 MB)
+  and colour-bitmap decoding grew the release binary by about 3.7 MB (5.6 MB to 9.4 MB stripped)
 - The device supports distinct press/release key and encoder states
 
 ## Status / known gaps

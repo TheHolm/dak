@@ -38,6 +38,9 @@ tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "ti
 serde_json = { version = "1.0.150"}
 serde = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
+# Direct access to font tables (the same version ab_glyph already uses, so no new
+# code): the startup scan of configured fonts and colour-table detection.
+ttf-parser = "0.25"
 # Grapheme clusters and display widths, so button text is cut to 6 columns without
 # splitting a character (emoji count as two columns).
 unicode-segmentation = "1"

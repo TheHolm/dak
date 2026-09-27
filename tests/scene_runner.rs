@@ -2713,7 +2713,7 @@ async fn set_text_settings_fonts_are_used() {
     std::fs::create_dir_all(&dir).unwrap();
     let bold = dir.join("bold.ttf");
     std::fs::copy("fonts/DejaVuSansMono-Bold.ttf", &bold).unwrap();
-    let fonts = dak::text::FontSet::load(&dak::text::FontPaths {
+    let (fonts, _) = dak::text::FontSet::load(&dak::text::FontPaths {
         regular: Some(bold.to_str().unwrap().to_string()),
         ..Default::default()
     })
