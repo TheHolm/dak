@@ -98,10 +98,19 @@ under other platforms.
   `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
   themselves, so a signal arriving mid-event is never lost. `main` is a plain
   function that loads the config before building the tokio runtime by hand
-- `src/log.rs` — centralized, filterable debug output, gated per `Subsystem`
-  (`device`/`scene`/`action`/`fonts`) by `-d`/`--debug`; `fonts` prints the font
-  lookup order and undrawable-character ranges built by `FontSet::load`, and only
-  has anything to print when `defaults.fonts` names a font
+- `src/log.rs` — centralized, filterable output. `Log` (still `Copy`) filters by
+  `Level` (error/warning/info/debug; errors always pass) and, for debug lines, per
+  `Subsystem` (`device`/`scene`/`action`/`fonts`) from `-d`/`logging.debug`; `fonts`
+  prints the font lookup order and undrawable-character ranges built by
+  `FontSet::load`. Lines go to a process-wide `Sinks` (`install`ed once the config is
+  read; plain console before that and in tests): `console`, `journal` (stderr with
+  `<N>` priority prefixes), `syslog` (libc `syslog(3)`), `file` (appended, reopenable).
+  `check_logging` validates the top-level `logging` section into `LoggingConfig`;
+  `LogSettings::resolve` merges it with `CliLogging` (`--log-level`, `--log-file`,
+  `--syslog`, `-d`) and resolves `auto` from `Environment` (`JOURNAL_STREAM` matching
+  fd 2 -> journal, detached -> syslog, else console). `LOGGING_KEYS`, `LOG_OUTPUTS`,
+  `LOG_LEVELS`, `SYSLOG_FACILITIES`, `TIMESTAMP_VALUES` are vocabulary constants
+  `tests/man_pages.rs` checks against `dak-config.5`; `tests/logging.rs` runs the binary
 - `src/map.rs` — interactive device-mapping wizard (`dak --map`)
 - `src/hardware.rs` — device family identifiers (`QUERY`/protocol version/default
   key+encoder counts/image format) and `discover`/`is_present` enumeration helpers,

@@ -52,6 +52,9 @@ pub struct LoadedConfig {
     /// and each configured font's undrawable characters (empty without configured
     /// fonts); the one-line summaries are in `warnings`.
     pub font_details: Vec<String>,
+    /// The validated `logging` section (defaults when absent); merged with the
+    /// command-line overrides by [`crate::log::LogSettings::resolve`].
+    pub logging: crate::log::LoggingConfig,
 }
 
 /// The config `version` assumed when the top-level `version` key is absent.
@@ -59,7 +62,14 @@ pub const DEFAULT_CONFIG_VERSION: &str = "1.0";
 
 /// Every key the top-level config object may contain; anything else is rejected. This is
 /// also the vocabulary `tests/man_pages.rs` requires `dak-config.5` to document.
-pub const TOP_LEVEL_KEYS: &[&str] = &["version", "variables", "defaults", "scenes", "devices"];
+pub const TOP_LEVEL_KEYS: &[&str] = &[
+    "version",
+    "variables",
+    "defaults",
+    "scenes",
+    "devices",
+    "logging",
+];
 
 /// The keys the optional `defaults` object may contain. Kept in step with the field set of
 /// [`Defaults`](crate::press::Defaults).
@@ -165,7 +175,7 @@ pub const ENCODER_EVENTS: &[&str] = &[
 ];
 
 /// Renders a slice of names as a `"a", "b"` list for error messages.
-fn quoted_list(names: &[&str]) -> String {
+pub(crate) fn quoted_list(names: &[&str]) -> String {
     names
         .iter()
         .map(|name| format!("\"{name}\""))
@@ -385,6 +395,10 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         .get("variables")
         .map(|variables| check_variables(variables, &mut errors))
         .unwrap_or_default();
+    let logging = map
+        .get("logging")
+        .map(|logging| crate::log::check_logging(logging, expand_tilde, &mut errors, &mut warnings))
+        .unwrap_or_default();
 
     // References are validated against the declarations with each variable at its initial
     // value; only existence/type matter here, not the (runtime) values themselves.
@@ -410,6 +424,7 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         warnings,
         fonts,
         font_details,
+        logging,
     })
 }
 

@@ -24,7 +24,7 @@ use dak::color::Color;
 use dak::control::{self, Controller, StopSignal, StopSource};
 use dak::exit;
 use dak::hardware;
-use dak::log::{Log, Subsystem};
+use dak::log::{CliLogging, Environment, Log, LogSettings, LoggingConfig, Subsystem};
 use dak::map::{ControlEvent, Mapping, TwistDirection};
 use dak::press::{ClickDetector, ClickEvent, Defaults, PressDecision, ReleaseDecision};
 use dak::reconnect::{self, SwappableDevice};
@@ -38,7 +38,27 @@ use dak::variables::{VarValue, Variables};
 /// a device or forks into the background.
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let log = Log::from_debug_values(&cli.debug);
+    // Until the config's `logging` section is read, lines go to the console (or the
+    // journal under systemd), filtered by the command-line level and `-d` alone.
+    let bootstrap = match LogSettings::resolve(
+        &LoggingConfig::default(),
+        &CliLogging {
+            file: None,
+            syslog: false,
+            ..CliLogging::from_cli(&cli)
+        },
+        &Environment::probe(false),
+    ) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return std::process::ExitCode::from(exit::FAILURE);
+        }
+    };
+    if let Ok(sinks) = bootstrap.open() {
+        dak::log::install(sinks);
+    }
+    let log = bootstrap.log;
     log.info(format!(
         "DAK (Dynamic Ajazz Keyboard) v{}",
         env!("CARGO_PKG_VERSION")
@@ -68,6 +88,14 @@ fn run(cli: Cli, log: Log) -> u8 {
     log.info(format!("Using config: {}", config_path.display()));
     let config = match actions::load_config_from_path(&config_path.to_string_lossy()) {
         Ok(config) => {
+            // From here on every line goes to the configured outputs.
+            let log = match apply_logging(&config, &cli, false) {
+                Ok(log) => log,
+                Err(error) => {
+                    log.error(error);
+                    return exit::CONFIG;
+                }
+            };
             log.info(format!(
                 "Loaded config version {} from {}",
                 config.version,
@@ -79,7 +107,7 @@ fn run(cli: Cli, log: Log) -> u8 {
             for detail in &config.font_details {
                 log.debug(Subsystem::Fonts, detail);
             }
-            config
+            (config, log)
         }
         Err(errors) => {
             for error in &errors {
@@ -88,11 +116,27 @@ fn run(cli: Cli, log: Log) -> u8 {
             return exit::CONFIG;
         }
     };
+    let (config, log) = config;
 
     let Some(runtime) = build_runtime(log) else {
         return exit::FAILURE;
     };
     runtime.block_on(serve(config, log))
+}
+
+/// Resolves the logging setup from the config's `logging` section and the command-line
+/// overrides, opens its outputs and installs them for every later line. Returns the
+/// filter to log through, or why the outputs could not be opened (in which case the
+/// previous outputs stay in use).
+fn apply_logging(config: &actions::LoadedConfig, cli: &Cli, detached: bool) -> Result<Log, String> {
+    let settings = LogSettings::resolve(
+        &config.logging,
+        &CliLogging::from_cli(cli),
+        &Environment::probe(detached),
+    )?;
+    let sinks = settings.open()?;
+    dak::log::install(sinks);
+    Ok(settings.log)
 }
 
 /// Makes `path` absolute against the current directory, so it keeps naming the same

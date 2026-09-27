@@ -20,7 +20,7 @@ line comments and
 block comments may appear anywhere the JSON grammar allows whitespace.
 Comment markers inside a string are part of the string value.
 .SH "TOP\-LEVEL STRUCTURE"
-The top level is a JSON object with up to five keys, all optional:
+The top level is a JSON object with up to six keys, all optional:
 .TP
 .B version
 A config schema version string, defaulting to
@@ -54,6 +54,11 @@ wizard of
 .BR dak (1)
 prints one definition in exactly this shape. See
 .B DEVICES
+below.
+.TP
+.B logging
+Where log lines go and how detailed they are. See
+.B LOGGING
 below.
 .SH DEFAULTS
 The optional
@@ -1031,6 +1036,112 @@ first connection at startup is fatal, and only for that device.
 On FreeBSD reconnecting may be flaky and needs more troubleshooting: after an
 unplug through VM USB passthrough the keypad was once not re\-enumerated by
 the kernel, and dak kept waiting for it.
+.SH LOGGING
+The optional
+.B logging
+object says where the program's log lines go and which of them are written.
+Without it every line goes where
+.B auto
+picks, at level
+.BR info .
+All keys are optional:
+.TP
+.B output
+One output name or an array of them (each at most once):
+.RS
+.TP
+.B auto
+The default. The systemd journal when stderr is connected to it (systemd sets
+.BR JOURNAL_STREAM ),
+syslog once
+.BR dak (1)
+has detached from its terminal, the console otherwise. Cannot be combined with
+other outputs.
+.TP
+.B console
+Informational and debug lines on stdout, warnings and errors on stderr.
+.TP
+.B journal
+Every line on stderr, prefixed with its syslog priority in angle brackets
+(\(lq<4>warning: ...\(rq), which journald records as the entry's priority, so
+.B journalctl \-p warning
+works.
+.TP
+.B syslog
+Sent to
+.BR syslog (3)
+as
+.B dak
+with the process id, using
+.BR syslog_facility .
+.TP
+.B file
+Appended to
+.BR file .
+.RE
+.TP
+.B file
+The log file for the
+.B file
+output; a leading
+.B ~
+is expanded. Defaults to
+.IR $XDG_STATE_HOME/dak/dak.log ,
+else
+.IR ~/.local/state/dak/dak.log .
+Missing directories are created (mode 0700) and the file is created with mode
+0600. A file that cannot be opened stops the program at startup. Setting it
+without the
+.B file
+output only produces a warning.
+.TP
+.B syslog_facility
+The facility syslog lines are sent with:
+.BR user " (the default), " daemon ", " local0 ", " local1 ", " local2 ", " local3 ,
+.BR local4 ", " local5 ", " local6 " or " local7 .
+.TP
+.B level
+The most detailed level written:
+.BR error ", " warning ", " info " (the default) or " debug .
+Errors are always written;
+.B warning
+hides the banner and the connect and disconnect lines.
+.TP
+.B debug
+An array of debug subsystems to enable, as with
+.BR "dak \-d" :
+.BR device ", " scene ", " actions " (or " action ") and " fonts .
+Their lines are only written when
+.B level
+is
+.BR debug .
+.TP
+.B timestamps
+.BR auto " (the default), " true " or " false
+(as JSON booleans or strings).
+.B auto
+stamps only log file lines, since the journal and syslog stamp every entry
+themselves;
+.B true
+stamps console, journal and file lines;
+.B false
+none.
+.PP
+The command line takes precedence:
+.B \-\-log\-level
+replaces
+.BR level ;
+.B \-d
+adds subsystems and, without
+.BR \-\-log\-level ,
+raises the level to
+.BR debug ;
+.B \-\-log\-file
+and
+.B \-\-syslog
+add their outputs next to the configured ones. Lines written before the
+configuration is read (the banner, the config location and configuration
+errors) always go to the console, or the journal under systemd.
 .SH EXAMPLE
 .nf
 .RS 4

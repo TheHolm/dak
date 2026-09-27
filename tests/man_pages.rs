@@ -18,6 +18,7 @@ use dak::actions::{
     CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
 };
 use dak::cli::Cli;
+use dak::log::{LOGGING_KEYS, LOG_LEVELS, LOG_OUTPUTS, SYSLOG_FACILITIES, TIMESTAMP_VALUES};
 use dak::markup::MARKUP_VALUES;
 use dak::text::FONT_KEYS;
 use dak::variables::{RESERVED_NAMES, VARIABLE_KEYS};
@@ -71,6 +72,21 @@ path. A command that contains an unquoted shell operator is run through the
 .BR sh (1)
 found on
 .BR PATH .
+.TP
+.B JOURNAL_STREAM
+Set by systemd when stderr goes to the journal. When it names the actual
+stderr, the
+.B auto
+log output writes journal lines (see
+.B LOGGING
+in
+.BR dak\-config (5)).
+.TP
+.BR XDG_STATE_HOME
+Where the default log file lives:
+.IR $XDG_STATE_HOME/dak/dak.log ,
+else
+.IR ~/.local/state/dak/dak.log .
 .SH FILES
 .TP
 .I ~/.config/dak/config.json
@@ -78,6 +94,11 @@ The preferred per\-user configuration location.
 .TP
 .I ./config.json
 Configuration in the current directory.
+.TP
+.I ~/.local/state/dak/dak.log
+The default log file, when the
+.B file
+log output is used.
 .SH SIGNALS
 .TP
 .BR SIGINT ", " SIGTERM
@@ -123,6 +144,9 @@ Run with an explicit configuration path.
 .TP
 .B dak \-d device,scene
 Print device and scene debug output.
+.TP
+.B dak \-\-log\-level warning \-\-log\-file /tmp/dak.log
+Write only warnings and errors, to the console and to a log file.
 .TP
 .B dak \-\-map
 Capture the connected device's mapping as JSON and exit.
@@ -410,7 +434,7 @@ fn dak_config_5_documents_the_config_vocabulary() {
     let text = canonical_text(
         &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
     );
-    let groups: [(&str, &[&str]); 10] = [
+    let groups: [(&str, &[&str]); 15] = [
         ("top-level key", TOP_LEVEL_KEYS),
         ("defaults key", DEFAULTS_KEYS),
         ("setup type", SETUP_KINDS),
@@ -421,6 +445,11 @@ fn dak_config_5_documents_the_config_vocabulary() {
         ("encoder event", ENCODER_EVENTS),
         ("variable key", VARIABLE_KEYS),
         ("reserved variable name", RESERVED_NAMES),
+        ("logging key", LOGGING_KEYS),
+        ("logging.output value", LOG_OUTPUTS),
+        ("logging.level value", LOG_LEVELS),
+        ("logging.syslog_facility value", SYSLOG_FACILITIES),
+        ("logging.timestamps value", TIMESTAMP_VALUES),
     ];
     for (label, names) in groups {
         for name in names {

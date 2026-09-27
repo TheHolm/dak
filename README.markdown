@@ -30,6 +30,9 @@ Options:
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
   -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action, fonts
+      --log-level <LEVEL> Log level: error, warning, info or debug
+      --log-file <PATH>   Also append log lines (timestamped) to PATH
+      --syslog            Also send log lines to syslog
       --map               Run the interactive device-mapping wizard instead of
                           normal operation (see Devices below) and exit
   -h, --help              Print usage help and exit
@@ -57,6 +60,10 @@ controlled with `-d` / `--debug` (repeatable, or comma-separated values added up
 | `fonts`   | only when `defaults.fonts` names a font: every font in lookup order (embedded ones marked as built in), each configured font's character counts, and the characters it cannot draw with the reason — listed as ranges like `U+1F1E6-1F1FF,1F3FB`, at most 20 lines per font |
 
 `-d` values are additive, e.g. `-d device -d scene` or `-d device,scene`.
+
+Where these lines go (console, systemd journal, syslog, a log file) and how detailed
+they are is set by the config's `logging` section, see [Logging](#logging);
+`--log-level`, `--log-file` and `--syslog` override it for one run.
 
 ### Config file search order
 
@@ -92,12 +99,13 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 `config.json` drives all runtime behavior. The **dak-config(5)** man page is
 the compact reference for this file format; the rest of this section is the
 same material with more explanation and full examples. The top level of the
-config is a dictionary with up to five keys:
+config is a dictionary with up to six keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
 - `"devices"` — the individual device definitions (see [Devices](#devices))
 - `"variables"` — optional declared variables that actions read and assign (see [Variables](#variables))
 - `"defaults"` — optional press-detection timing knobs, connect-time brightness levels, colours, text markup and fonts (see [Defaults](#defaults))
+- `"logging"` — optional log destinations and detail (see [Logging](#logging))
 - `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
 
 ### Comments
@@ -582,6 +590,47 @@ A complete config combining both sections looks like:
   }
 }
 ```
+
+### Logging
+
+The optional top-level `logging` section decides where log lines go and which are
+written. Without it dak does what is normal for how it was started, so most setups
+never need it:
+
+- **run from a terminal** — lines go to the console (info on stdout, warnings and
+  errors on stderr), as before;
+- **run by systemd** — lines go to the journal with their priority, so
+  `journalctl --user -u dak -p warning` shows only the problems. journald adds the
+  timestamps, unit name and pid itself, and forwards to syslog if the system is set
+  up that way;
+- **detached** from the terminal — lines go to syslog.
+
+```json
+"logging": {
+  "output": ["console", "file"],       // or "auto" (default), "journal", "syslog"
+  "file": "~/.local/state/dak/dak.log", // this is the default location
+  "syslog_facility": "user",            // or "daemon", "local0" ... "local7"
+  "level": "info",                      // "error", "warning", "info" or "debug"
+  "debug": ["device", "scene"],         // debug subsystems, like -d
+  "timestamps": "auto"                  // "auto" (file only), true or false
+}
+```
+
+| Key | Meaning | Default |
+|---|---|---|
+| `output` | one or more of `console`, `journal` (stderr with `<N>` priority prefixes), `syslog`, `file`; or `auto` alone | `"auto"` |
+| `file` | log file for the `file` output; `~` is expanded, the directory is created | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
+| `syslog_facility` | syslog facility | `user` |
+| `level` | most detailed level written; errors are always written, `warning` also hides the banner and connect lines | `info` |
+| `debug` | debug subsystems (`device`, `scene`, `actions`, `fonts`); written only at level `debug` | none |
+| `timestamps` | `auto` stamps only file lines (journal and syslog stamp their own), `true` stamps console, journal and file lines | `auto` |
+
+The command line wins over the config: `--log-level` replaces `level`, `-d` adds
+subsystems and (unless `--log-level` is given) raises the level to `debug`, and
+`--log-file`/`--syslog` add their output next to the configured ones. A log file that
+cannot be opened stops dak at startup with exit status 3. Lines from before the config
+is read (banner, config location, config errors) always go to the console, or the
+journal under systemd.
 
 ## Device install
 

@@ -51,6 +51,37 @@ forms are additive"
     )]
     pub debug: Vec<String>,
 
+    /// The most detailed log level written; replaces `logging.level`.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["error", "warning", "info", "debug"],
+        help = "Log level: error, warning, info or debug",
+        long_help = "The most detailed level of log lines written: error, warning, info or \
+debug. Replaces logging.level from the configuration. Errors are always written; debug lines \
+also need their subsystem enabled with -d or logging.debug"
+    )]
+    pub log_level: Option<String>,
+
+    /// Also append log lines to this file.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Also append log lines to PATH",
+        long_help = "Also append log lines, each with a timestamp, to PATH (created with its \
+directory when missing), in addition to the configured outputs; replaces logging.file"
+    )]
+    pub log_file: Option<PathBuf>,
+
+    /// Also send log lines to syslog.
+    #[arg(
+        long,
+        help = "Also send log lines to syslog",
+        long_help = "Also send log lines to syslog(3), in addition to the configured outputs, \
+with the facility from logging.syslog_facility (default user)"
+    )]
+    pub syslog: bool,
+
     /// Run the interactive device-mapping wizard instead of normal operation.
     #[arg(
         long,
