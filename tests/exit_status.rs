@@ -143,3 +143,109 @@ fn wait_and_replace_conflict() {
     let output = run_dak(&["--wait", "--replace"]);
     assert_eq!(status_of(&output), exit::USAGE);
 }
+
+/// A device definition no attached keypad can match (its serial is made up), so a run
+/// with it finds nothing to drive, whatever is plugged in.
+const ABSENT_DEVICE: &str = r#"{"1": {
+    "device_id": "0300:3002", "device_name": "absent", "serial": "DAK-TEST-ABSENT",
+    "key_count": 9, "encoder_count": 3, "screens": 6,
+    "buttons": [{"number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1}],
+    "encoders": []
+}}"#;
+
+/// `dak --map` with its standard input closed never spins: with no keypad attached it
+/// exits with the no-device status, and with one attached the first question sees end
+/// of input and the wizard stops with a failure instead of re-asking forever.
+#[test]
+fn map_with_closed_stdin_ends() {
+    let dir = common::temp_dir();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .arg("--map")
+        .env(dak::lock::LOCK_DIR_ENV, &dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A spinning wizard never exits; give it ten seconds before calling it a hang.
+    let mut finished = None;
+    for _ in 0..1000 {
+        if let Some(status) = child.try_wait().unwrap() {
+            finished = Some(status);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if finished.is_none() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(finished.is_some(), "--map kept running with stdin closed");
+    match status_of(&output) {
+        exit::NO_DEVICE => assert!(stderr.contains("no compatible devices found"), "{stderr}"),
+        exit::FAILURE => assert!(
+            stderr.contains("input ended before the mapping"),
+            "{stderr}"
+        ),
+        other => panic!("unexpected status {other}: {stderr}"),
+    }
+}
+
+/// Config warnings are printed at startup (before the run finds no device), and with
+/// `-d fonts` so is the lookup order of the configured fonts.
+#[test]
+fn startup_prints_config_warnings_and_font_details() {
+    let font = format!("{}/fonts/DejaVuSansMono.ttf", env!("CARGO_MANIFEST_DIR"));
+    let config = common::write_temp_config(&format!(
+        r#"{{"defaults": {{"fonts": {{"regular": "{font}"}}}},
+            "scenes": {{"on_start": {{"actions": {{"1b01": {{}}}}}}}}, "devices": {{}}}}"#
+    ));
+    let output = run_dak(&["-c", config.to_str().unwrap(), "-d", "fonts"]);
+    let _ = std::fs::remove_file(&config);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(status_of(&output), exit::NO_DEVICE, "{stderr}");
+    assert!(stderr.contains("warning: "), "{stderr}");
+    assert!(
+        stdout.contains("DejaVuSansMono.ttf") || stderr.contains("DejaVuSansMono.ttf"),
+        "the font lookup order names the configured font:\n{stdout}\n{stderr}"
+    );
+}
+
+/// A file log output with neither `logging.file` nor a default location (`HOME` and
+/// `XDG_STATE_HOME` unset) is a config error.
+#[test]
+fn file_output_without_a_location_is_a_config_error() {
+    let config = common::write_temp_config(
+        r#"{"logging": {"output": "file"}, "scenes": {"on_start": {}}, "devices": {}}"#,
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .args(["-c", config.to_str().unwrap()])
+        .env_remove("HOME")
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&config);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status_of(&output), exit::CONFIG, "{stderr}");
+    assert!(stderr.contains("no default location"), "{stderr}");
+}
+
+/// A configured device that is not attached is reported, and with nothing else to
+/// run a foreground dak exits with the no-device status.
+#[test]
+fn configured_but_absent_device_exits_with_no_device_status() {
+    let config = common::write_temp_config(&format!(
+        r#"{{"scenes": {{"on_start": {{}}}}, "devices": {ABSENT_DEVICE}}}"#
+    ));
+    let output = run_dak(&["-c", config.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&config);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status_of(&output), exit::NO_DEVICE, "{stderr}");
+    assert!(
+        stderr.contains("DAK-TEST-ABSENT") && stderr.contains("was not found"),
+        "{stderr}"
+    );
+}

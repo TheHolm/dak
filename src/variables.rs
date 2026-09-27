@@ -1093,4 +1093,110 @@ mod tests {
             None
         );
     }
+
+    /// The value accessors report the kind and return the matching payload only, and
+    /// the store exposes its declarations in name order.
+    #[test]
+    fn var_value_accessors_and_store_defs() {
+        let int = VarValue::Int(4);
+        let text = VarValue::Str("x".to_string());
+        assert_eq!(int.kind(), VarType::Int);
+        assert_eq!(text.kind(), VarType::Str);
+        assert_eq!(int.as_int(), Some(4));
+        assert_eq!(text.as_int(), None);
+        assert_eq!(int.as_str(), None);
+        assert_eq!(text.as_str(), Some("x"));
+
+        let variables = test_variables();
+        let names: Vec<&String> = variables.store().defs().keys().collect();
+        assert_eq!(names, ["count", "name"]);
+    }
+
+    /// `min`, `max` and `max_length` of the wrong JSON type (or outside 32 bits) are
+    /// rejected with the key and type named.
+    #[test]
+    fn check_variables_rejects_badly_typed_bounds() {
+        for (declaration, expected) in [
+            (
+                json!({ "type": "int", "min": "x" }),
+                "\"min\" must be a 32-bit integer, got a string",
+            ),
+            (
+                json!({ "type": "int", "max": 1e12 }),
+                "\"max\" must be a 32-bit integer",
+            ),
+            (
+                json!({ "type": "str", "max_length": "x" }),
+                "\"max_length\" must be a positive integer, got a string",
+            ),
+        ] {
+            let mut errors = Vec::new();
+            let defs = check_variables(&json!({ "v": declaration.clone() }), &mut errors);
+            assert!(defs.is_empty(), "{declaration}");
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "{declaration}: expected {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    /// A backslash right after a reference at the very end of the text is kept.
+    #[test]
+    fn expand_keeps_a_trailing_backslash_after_a_reference() {
+        let variables = test_variables();
+        assert_eq!(variables.expand(r"$name\").unwrap(), r"Bob\");
+    }
+
+    /// `parse_lone_reference` accepts exactly one whole reference (bare or scoped) and
+    /// nothing else.
+    #[test]
+    fn parse_lone_reference_accepts_only_a_whole_reference() {
+        assert_eq!(
+            parse_lone_reference("$defaults.markup"),
+            Some(VarRef {
+                scope: Scope::Defaults,
+                name: "markup".to_string()
+            })
+        );
+        assert_eq!(
+            parse_lone_reference("$name"),
+            Some(VarRef {
+                scope: Scope::Var,
+                name: "name".to_string()
+            })
+        );
+        assert_eq!(parse_lone_reference("name"), None);
+        assert_eq!(parse_lone_reference("$name!"), None);
+        assert_eq!(parse_lone_reference("$defaults."), None);
+    }
+
+    /// The reconnect defaults read back as numbers (seconds and attempts) and an
+    /// unknown `defaults.*` name is undefined, both to `read` and `kind_of`.
+    #[test]
+    fn reconnect_defaults_read_and_unknown_defaults() {
+        let variables = test_variables();
+        let defaults = |name: &str| VarRef {
+            scope: Scope::Defaults,
+            name: name.to_string(),
+        };
+        let expected = Defaults::default();
+        assert_eq!(
+            variables
+                .read(&defaults("device_reconnect_interval"))
+                .unwrap(),
+            expected.device_reconnect_interval.as_secs().to_string()
+        );
+        assert_eq!(
+            variables
+                .read(&defaults("device_reconnect_max_attempts"))
+                .unwrap(),
+            expected.device_reconnect_max_attempts.to_string()
+        );
+        assert_eq!(
+            variables.kind_of(&defaults("device_reconnect_interval")),
+            Some(VarType::Int)
+        );
+        assert!(variables.read(&defaults("nope")).is_err());
+        assert_eq!(variables.kind_of(&defaults("nope")), None);
+    }
 }

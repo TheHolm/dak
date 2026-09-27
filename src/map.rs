@@ -17,12 +17,13 @@ use async_hid::DeviceId as HidDeviceId;
 use mirajazz::{
     device::{list_devices, Device},
     error::MirajazzError,
-    state::DeviceStateReader,
-    types::{DeviceInput, HidDevice},
+    types::{DeviceInput, HidDevice, ImageFormat},
 };
 use serde::{Deserialize, Serialize};
 
+use crate::actions::ButtonDevice;
 use crate::hardware::{self, Kind};
+use crate::input::InputSource;
 use crate::log::{Log, Subsystem};
 
 /// One line each describing what `mirajazz`'s protocol versions 0-3 mean, shown to
@@ -238,6 +239,10 @@ pub enum MapError {
     Device(MirajazzError),
     /// The chosen device is held by a running `dak` (already reported).
     Busy,
+    /// The answers ran out (standard input was closed) before the wizard was done.
+    InputClosed,
+    /// Reading an answer failed.
+    Input(io::Error),
 }
 
 impl From<MirajazzError> for MapError {
@@ -247,13 +252,172 @@ impl From<MirajazzError> for MapError {
     }
 }
 
-/// Runs the whole `dak --map` wizard: device selection, count confirmation,
-/// screen count, button and encoder capture, display sanity check, JSON output,
-/// and screen clearing/shutdown.
+impl std::fmt::Display for MapError {
+    /// A one-line description for the error log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MapError::Device(error) => write!(f, "{error}"),
+            MapError::Busy => write!(f, "the device is in use by another dak"),
+            MapError::InputClosed => {
+                write!(
+                    f,
+                    "input ended before the mapping was complete; nothing was written"
+                )
+            }
+            MapError::Input(error) => write!(f, "failed to read input: {error}"),
+        }
+    }
+}
+
+/// Where the wizard reads its answers from and writes its prompts and complaints to:
+/// the terminal in a real run, in-memory buffers in tests.
+///
+/// Every question re-asks after an invalid answer, but none of them re-asks forever
+/// once the input is gone: end of input (a closed or exhausted stdin) and read errors
+/// end the wizard with [`MapError::InputClosed`]/[`MapError::Input`] - except
+/// [`Console::ask_number_with_default`], for which end of input means "keep the
+/// default". Output write errors are ignored (like a terminal that went away), so
+/// they can never loop either.
+pub struct Console<R, O, E> {
+    /// Where answers are read from, one line each.
+    input: R,
+    /// Where prompts and progress go (stdout).
+    out: O,
+    /// Where complaints about invalid answers go (stderr).
+    err: E,
+}
+
+impl Console<io::StdinLock<'static>, io::Stdout, io::Stderr> {
+    /// The terminal: stdin, stdout and stderr.
+    pub fn stdio() -> Self {
+        Console::new(io::stdin().lock(), io::stdout(), io::stderr())
+    }
+}
+
+impl<R: io::BufRead, O: Write, E: Write> Console<R, O, E> {
+    /// A console over the given streams.
+    pub fn new(input: R, out: O, err: E) -> Self {
+        Self { input, out, err }
+    }
+
+    /// Writes one line of output.
+    fn say(&mut self, text: impl std::fmt::Display) {
+        let _ = writeln!(self.out, "{text}");
+    }
+
+    /// Writes one line to the complaint stream.
+    fn complain(&mut self, text: impl std::fmt::Display) {
+        let _ = writeln!(self.err, "{text}");
+    }
+
+    /// Shows `prompt` (without a newline) and reads one answer line: `Ok(None)` at end
+    /// of input, an error when reading fails.
+    fn answer(&mut self, prompt: &str) -> Result<Option<String>, MapError> {
+        let _ = write!(self.out, "{prompt}");
+        if let Err(error) = self.out.flush() {
+            self.complain(format!("failed to flush stdout: {error}"));
+        }
+        let mut line = String::new();
+        match self.input.read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+            Err(error) => Err(MapError::Input(error)),
+        }
+    }
+
+    /// [`Console::answer`] for a question that cannot be skipped: end of input is
+    /// [`MapError::InputClosed`].
+    fn required_answer(&mut self, prompt: &str) -> Result<String, MapError> {
+        self.answer(prompt)?.ok_or(MapError::InputClosed)
+    }
+
+    /// Asks for a number in `min..=max`, asking again until a valid one is typed.
+    fn ask_number(&mut self, prompt: &str, min: u64, max: u64) -> Result<u64, MapError> {
+        loop {
+            let line = self.required_answer(&format!("{prompt} [{min}..{max}]: "))?;
+            match parse_number(&line) {
+                Some(number) if (min..=max).contains(&number) => return Ok(number),
+                _ => self.complain(format!("enter a number from {min} to {max}")),
+            }
+        }
+    }
+
+    /// Asks for a number in `min..=max`, or just Enter to keep `default`. End of input
+    /// also keeps the default (the question has a safe answer), unlike every other
+    /// question.
+    fn ask_number_with_default(
+        &mut self,
+        prompt: &str,
+        min: u64,
+        max: u64,
+        default: u64,
+    ) -> Result<u64, MapError> {
+        loop {
+            let prompt = format!("{prompt} [{min}..{max}, default {default}, Enter to keep it]: ");
+            let Some(line) = self.answer(&prompt)? else {
+                return Ok(default);
+            };
+            match parse_number_or_default(&line, default, min, max) {
+                Some(number) => return Ok(number),
+                None => self.complain(format!(
+                    "enter a number from {min} to {max}, or press Enter to keep {default}"
+                )),
+            }
+        }
+    }
+
+    /// Asks a yes/no question (`y`/`yes`/`1` or `n`/`no`/`0`), asking again until a
+    /// valid answer is typed.
+    fn confirm(&mut self, prompt: &str) -> Result<bool, MapError> {
+        loop {
+            let line = self.required_answer(&format!("{prompt}: enter y/yes or n/no: "))?;
+            match parse_yes_no(&line) {
+                Some(answer) => return Ok(answer),
+                None => self.complain("enter y/yes or n/no"),
+            }
+        }
+    }
+
+    /// Asks for a single key number in `1..=max`; a "no"-style answer (`no`, `n`,
+    /// `none`, `0`) means the number in question is not shown on any key.
+    fn ask_key_number(&mut self, prompt: &str, max: u8) -> Result<Option<u8>, MapError> {
+        loop {
+            let line = self.required_answer(&format!(
+                "{prompt} [key number, or 'no' if not on any button]: "
+            ))?;
+            if let Some(key) = parse_key_number(&line, max) {
+                return Ok(Some(key));
+            }
+            if is_no(&line) {
+                return Ok(None);
+            }
+            self.complain(format!("enter a key number from 1 to {max} or 'no'"));
+        }
+    }
+
+    /// Asks for a comma/space-separated list of key numbers in `1..=max`; `none` (or
+    /// an empty line) is the empty list.
+    fn ask_key_list(&mut self, prompt: &str, max: u8) -> Result<Vec<u8>, MapError> {
+        loop {
+            let line = self.required_answer(&format!("{prompt}: "))?;
+            match parse_key_list(&line, max) {
+                Some(keys) => return Ok(keys),
+                None => self.complain(format!(
+                    "enter key numbers from 1 to {max}, separated by spaces (or 'none')"
+                )),
+            }
+        }
+    }
+}
+
+/// Runs the whole `dak --map` wizard on the terminal: device selection, count
+/// confirmation, screen count, button and encoder capture, display sanity check, JSON
+/// output, and screen clearing/shutdown.
 ///
 /// The chosen device is locked like a normal run would (see [`crate::lock`]), so the
 /// wizard never captures input from a keypad a running `dak` is driving.
 pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
+    let mut console = Console::stdio();
     log.info("DAK device-mapping wizard (config is not read, no actions run)");
 
     // Step 1: numbered list of detected devices, user picks one by number.
@@ -265,26 +429,19 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
         log.error("no compatible devices found");
         return Err(MirajazzError::DeviceNotFoundError.into());
     }
-    println!("Detected devices:");
-    for (index, dev) in devices.iter().enumerate() {
-        let details = device_details(
-            &dev.id,
-            dev.vendor_id,
-            dev.product_id,
-            &dev.serial_number,
-            &dev.name,
-        );
-        let mut lines = details.lines();
-        if let Some(first) = lines.next() {
-            println!("  {}. {first}", index + 1);
-        }
-        for line in lines {
-            println!("     {line}");
-        }
-    }
-    let pick = ask_number("device to work on", 1, devices.len() as u64) as usize - 1;
-    let dev = &devices[pick];
-    println!();
+    let details: Vec<String> = devices
+        .iter()
+        .map(|dev| {
+            device_details(
+                &dev.id,
+                dev.vendor_id,
+                dev.product_id,
+                &dev.serial_number,
+                &dev.name,
+            )
+        })
+        .collect();
+    let dev = &devices[choose_device(&mut console, &details)?];
 
     let key = crate::lock::DeviceKey::new(
         dev.vendor_id,
@@ -313,42 +470,17 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
     // Every dev reaching this point already matched hardware::QUERIES above, so this
     // should always resolve; treated as a hard error rather than assumed, in case
     // that invariant is ever broken.
-    let kind = match Kind::from_vid_pid(dev.vendor_id, dev.product_id) {
-        Some(kind) => kind,
-        None => {
-            log.error(format!(
-                "unrecognized vendor/product ID {:04x}:{:04x}",
-                dev.vendor_id, dev.product_id
-            ));
-            return Err(MirajazzError::DeviceNotFoundError.into());
-        }
+    let Some(kind) = Kind::from_vid_pid(dev.vendor_id, dev.product_id) else {
+        log.error(format!(
+            "unrecognized vendor/product ID {:04x}:{:04x}",
+            dev.vendor_id, dev.product_id
+        ));
+        return Err(MirajazzError::DeviceNotFoundError.into());
     };
-    println!("Recognized as: {}", kind.human_name());
-    if !matches!(kind, Kind::Akp03ERev2) {
-        println!(
-            "Note: this device kind has not been verified against real hardware by DAK - see the README's \"Help me support more devices\" section."
-        );
-    }
+    let protocol_version = choose_protocol_version(&mut console, kind)?;
 
-    // The protocol version has to be settled before connecting (unlike key_count/
-    // encoder_count below, which get read back from an already-connected device and
-    // can be corrected afterward without reconnecting): it changes how mirajazz talks
-    // to the device at the wire level, so whatever value ends up used here is also
-    // what every later capture step runs under.
-    println!("Protocol versions:");
-    for (version, description) in PROTOCOL_VERSION_DESCRIPTIONS {
-        println!("  {version}: {description}");
-    }
-    let protocol_version = ask_number_with_default(
-        "protocol version to connect with",
-        0,
-        3,
-        kind.protocol_version() as u64,
-    ) as usize;
-    println!();
-
-    // Step 2: connect and confirm (or manually enter) the counts.
-    println!(
+    // Step 2: connect.
+    console.say(format!(
         "Connecting to {}...",
         device_summary(
             &dev.id,
@@ -357,7 +489,7 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
             &dev.serial_number,
             &dev.name
         )
-    );
+    ));
     let device = Device::connect(
         dev,
         protocol_version,
@@ -374,134 +506,17 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
     device.set_brightness(50).await?;
     device.clear_all_button_images().await?;
 
-    println!(
-        "mirajazz reports {} keys and {} encoders.",
-        device.key_count(),
-        device.encoder_count()
-    );
-    let key_count = if confirm("is the key count correct") {
-        device.key_count() as u8
-    } else {
-        ask_number("number of keys", 1, u8::MAX as u64) as u8
-    };
-    let encoder_count = if confirm("is the encoder count correct") {
-        device.encoder_count() as u8
-    } else {
-        ask_number("number of encoders", 0, u8::MAX as u64) as u8
-    };
-    println!();
-
-    // Step 3: how many buttons have screens.
-    let screens = ask_number("how many buttons have screens", 0, key_count as u64) as u8;
-    println!();
-
     let reader = device.get_reader(|_, _| Ok(DeviceInput::NoData));
-
-    // Step 4: capture one physical button at a time, in the order the user
-    // presses them. Codes already assigned to an earlier button are skipped.
-    let mut buttons = Vec::new();
-    let mut used: HashSet<u8> = HashSet::new();
-    for number in 1..=key_count {
-        println!("press button {number}: press it, hold it, then release it");
-        let (press, release) = capture_press_release(&reader, &used).await?;
-        println!("button {number} -> press code {press}, release code {release}");
-        used.insert(press);
-        used.insert(release);
-        buttons.push(ButtonMapping {
-            number,
-            press,
-            release,
-            screen: number <= screens,
-            draw_id: if number <= screens { number as i8 } else { -1 },
-        });
-    }
-    println!();
-
-    // Step 5: capture one encoder at a time, one notch per direction. Encoder
-    // knobs are pushed as buttons too, so the push/release codes are captured
-    // for each encoder after its two twist codes.
-    let mut encoders = Vec::new();
-    for number in 1..=encoder_count {
-        println!("turn encoder {number}: one notch clockwise, then one notch counter-clockwise");
-        let (cw, ccw) = capture_encoder_twists(&reader, &used).await?;
-        println!("encoder {number} -> first turn code {cw}, second turn code {ccw}");
-        used.insert(cw);
-        used.insert(ccw);
-        println!("press encoder {number}: push the knob, hold it, then release it");
-        let (press, release) = capture_press_release(&reader, &used).await?;
-        println!("encoder {number} -> push code {press}, release code {release}");
-        used.insert(press);
-        used.insert(release);
-        encoders.push(EncoderMapping {
-            number,
-            cw,
-            ccw,
-            press,
-            release,
-        });
-    }
-    println!();
-
-    // Step 6: paint the logical button number on every button (including the
-    // ones without a display, which stay dark) and ask the user to verify.
-    println!("painting button numbers on every button...");
-    for (index, number) in (1..=key_count).enumerate() {
-        let image = match crate::text::render_text(&[number.to_string()], kind.image_format()) {
-            Ok(image) => image,
-            Err(error) => {
-                log.error(format!("failed to render test label: {error}"));
-                return Err(MirajazzError::BadData.into());
-            }
-        };
-        device
-            .set_button_image(index as u8, kind.image_format(), image)
-            .await?;
-    }
-    device.flush().await?;
-    println!();
-
-    if !confirm("do the painted button numbers match your physical layout (1..N in order)") {
-        // Rework the display check: for every painted number find out which
-        // key shows it, then which keys are completely unlit.
-        println!(
-            "display recheck: for every number painted on a screen, name the key that shows it"
-        );
-        // shown[i] = number displayed on key `i` (0-based), None if unlit.
-        let mut shown: Vec<Option<i8>> = vec![None; buttons.len()];
-        for number in 1..=key_count {
-            if let Some(key) = ask_key_number(
-                &format!("which key number has number {number} displayed"),
-                key_count,
-            ) {
-                let slot = &mut shown[(key - 1) as usize];
-                if slot.is_none() {
-                    *slot = Some(number as i8);
-                } else {
-                    eprintln!("key {key} already shows another number; keeping the first answer");
-                }
-            }
-        }
-        let unlit = ask_key_list(
-            "enter the key numbers without any number displayed (or 'none')",
-            key_count,
-        );
-        for key in unlit {
-            shown[(key - 1) as usize] = None;
-        }
-        for (index, button) in buttons.iter_mut().enumerate() {
-            match shown[index] {
-                Some(draw) => {
-                    button.screen = true;
-                    button.draw_id = draw;
-                }
-                None => {
-                    button.screen = false;
-                    button.draw_id = -1;
-                }
-            }
-        }
-    }
-    println!();
+    let captured = map_connected(
+        &mut console,
+        &device,
+        device.encoder_count() as u8,
+        &reader,
+        kind.image_format(),
+        log,
+    )
+    .await?;
+    drop(reader);
 
     // Finished: emit the mapping as JSON, then clear the screens and end.
     let mapping = Mapping {
@@ -511,16 +526,16 @@ pub async fn run_map_wizard(log: Log) -> Result<(), MapError> {
             .serial_number
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
-        key_count,
-        encoder_count,
-        screens,
+        key_count: captured.key_count,
+        encoder_count: captured.encoder_count,
+        screens: captured.screens,
         protocol_version: Some(protocol_version),
         device_reconnect_interval: None,
         device_reconnect_max_attempts: None,
-        buttons,
-        encoders,
+        buttons: captured.buttons,
+        encoders: captured.encoders,
     };
-    println!("{}", mapping_json(&mapping));
+    console.say(mapping_json(&mapping));
 
     device.clear_all_button_images().await?;
     device.flush().await?;
@@ -732,15 +747,264 @@ mod capture {
     }
 }
 
+/// Step 1: lists the detected devices (each described by a multi-line `details`
+/// text, numbered from 1) and asks which one to map; returns its index.
+fn choose_device<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    details: &[String],
+) -> Result<usize, MapError> {
+    console.say("Detected devices:");
+    for (index, text) in details.iter().enumerate() {
+        let mut lines = text.lines();
+        if let Some(first) = lines.next() {
+            console.say(format!("  {}. {first}", index + 1));
+        }
+        for line in lines {
+            console.say(format!("     {line}"));
+        }
+    }
+    let pick = console.ask_number("device to work on", 1, details.len() as u64)? as usize - 1;
+    console.say("");
+    Ok(pick)
+}
+
+/// Reports what `kind` was recognized as and asks which protocol version to connect
+/// with, defaulting to the one `kind` uses.
+///
+/// The protocol version has to be settled before connecting (unlike the counts, which
+/// are read back from an already-connected device and can be corrected afterwards): it
+/// changes how mirajazz talks to the device at the wire level, so whatever value ends
+/// up used here is also what every later capture step runs under.
+fn choose_protocol_version<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    kind: Kind,
+) -> Result<usize, MapError> {
+    console.say(format!("Recognized as: {}", kind.human_name()));
+    if !matches!(kind, Kind::Akp03ERev2) {
+        console.say(
+            "Note: this device kind has not been verified against real hardware by DAK - see the README's \"Help me support more devices\" section.",
+        );
+    }
+    console.say("Protocol versions:");
+    for (version, description) in PROTOCOL_VERSION_DESCRIPTIONS {
+        console.say(format!("  {version}: {description}"));
+    }
+    let version = console.ask_number_with_default(
+        "protocol version to connect with",
+        0,
+        3,
+        kind.protocol_version() as u64,
+    )? as usize;
+    console.say("");
+    Ok(version)
+}
+
+/// Everything the wizard learned from a connected device (steps 2 to 6).
+#[derive(Debug, PartialEq)]
+struct Captured {
+    /// The confirmed key count.
+    key_count: u8,
+    /// The confirmed encoder count.
+    encoder_count: u8,
+    /// How many keys have a screen.
+    screens: u8,
+    /// Each button's codes and display, in logical order.
+    buttons: Vec<ButtonMapping>,
+    /// Each encoder's codes, in logical order.
+    encoders: Vec<EncoderMapping>,
+}
+
+/// Steps 2 to 6 on a connected, initialized device: confirm (or enter) the key and
+/// encoder counts the device reports (`device.key_count()`, `reported_encoders`), ask
+/// how many keys have screens, capture every button's and encoder's codes from
+/// `reader`, paint the logical numbers and let the user correct the display mapping.
+async fn map_connected<R, O, E, D, I>(
+    console: &mut Console<R, O, E>,
+    device: &D,
+    reported_encoders: u8,
+    reader: &I,
+    image_format: ImageFormat,
+    log: Log,
+) -> Result<Captured, MapError>
+where
+    R: io::BufRead,
+    O: Write,
+    E: Write,
+    D: ButtonDevice<Error = MirajazzError>,
+    I: InputSource,
+{
+    let reported_keys = device.key_count();
+    console.say(format!(
+        "mirajazz reports {reported_keys} keys and {reported_encoders} encoders."
+    ));
+    let key_count = if console.confirm("is the key count correct")? {
+        reported_keys
+    } else {
+        console.ask_number("number of keys", 1, u8::MAX as u64)? as u8
+    };
+    let encoder_count = if console.confirm("is the encoder count correct")? {
+        reported_encoders
+    } else {
+        console.ask_number("number of encoders", 0, u8::MAX as u64)? as u8
+    };
+    console.say("");
+
+    // Step 3: how many buttons have screens.
+    let screens = console.ask_number("how many buttons have screens", 0, key_count as u64)? as u8;
+    console.say("");
+
+    // Step 4: capture one physical button at a time, in the order the user presses
+    // them. Codes already assigned to an earlier button are skipped.
+    let mut buttons = Vec::new();
+    let mut used: HashSet<u8> = HashSet::new();
+    for number in 1..=key_count {
+        console.say(format!(
+            "press button {number}: press it, hold it, then release it"
+        ));
+        let (press, release) = capture_press_release(console, reader, &used).await?;
+        console.say(format!(
+            "button {number} -> press code {press}, release code {release}"
+        ));
+        used.insert(press);
+        used.insert(release);
+        buttons.push(ButtonMapping {
+            number,
+            press,
+            release,
+            screen: number <= screens,
+            draw_id: if number <= screens { number as i8 } else { -1 },
+        });
+    }
+    console.say("");
+
+    // Step 5: capture one encoder at a time, one notch per direction. Encoder knobs
+    // are pushed as buttons too, so the push/release codes are captured for each
+    // encoder after its two twist codes.
+    let mut encoders = Vec::new();
+    for number in 1..=encoder_count {
+        console.say(format!(
+            "turn encoder {number}: one notch clockwise, then one notch counter-clockwise"
+        ));
+        let (cw, ccw) = capture_encoder_twists(console, reader, &used).await?;
+        console.say(format!(
+            "encoder {number} -> first turn code {cw}, second turn code {ccw}"
+        ));
+        used.insert(cw);
+        used.insert(ccw);
+        console.say(format!(
+            "press encoder {number}: push the knob, hold it, then release it"
+        ));
+        let (press, release) = capture_press_release(console, reader, &used).await?;
+        console.say(format!(
+            "encoder {number} -> push code {press}, release code {release}"
+        ));
+        used.insert(press);
+        used.insert(release);
+        encoders.push(EncoderMapping {
+            number,
+            cw,
+            ccw,
+            press,
+            release,
+        });
+    }
+    console.say("");
+
+    // Step 6: paint the logical button number on every button (including the ones
+    // without a display, which stay dark) and ask the user to verify.
+    console.say("painting button numbers on every button...");
+    for (index, number) in (1..=key_count).enumerate() {
+        let image = match crate::text::render_text(&[number.to_string()], image_format) {
+            Ok(image) => image,
+            Err(error) => {
+                log.error(format!("failed to render test label: {error}"));
+                return Err(MirajazzError::BadData.into());
+            }
+        };
+        device
+            .set_button_image(index as u8, image_format, image)
+            .await?;
+    }
+    device.flush().await?;
+    console.say("");
+
+    recheck_display(console, &mut buttons, key_count)?;
+    console.say("");
+    Ok(Captured {
+        key_count,
+        encoder_count,
+        screens,
+        buttons,
+        encoders,
+    })
+}
+
+/// The end of step 6: asks whether the painted numbers match the physical layout and,
+/// if not, which key shows each number and which keys show none, rewriting every
+/// button's `screen`/`draw_id` from the answers.
+fn recheck_display<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    buttons: &mut [ButtonMapping],
+    key_count: u8,
+) -> Result<(), MapError> {
+    if console
+        .confirm("do the painted button numbers match your physical layout (1..N in order)")?
+    {
+        return Ok(());
+    }
+    console
+        .say("display recheck: for every number painted on a screen, name the key that shows it");
+    // shown[i] = number displayed on key `i` (0-based), None if unlit.
+    let mut shown: Vec<Option<i8>> = vec![None; buttons.len()];
+    for number in 1..=key_count {
+        let question = format!("which key number has number {number} displayed");
+        if let Some(key) = console.ask_key_number(&question, key_count)? {
+            let Some(slot) = shown.get_mut((key - 1) as usize) else {
+                continue;
+            };
+            if slot.is_none() {
+                *slot = Some(number as i8);
+            } else {
+                console.complain(format!(
+                    "key {key} already shows another number; keeping the first answer"
+                ));
+            }
+        }
+    }
+    let unlit = console.ask_key_list(
+        "enter the key numbers without any number displayed (or 'none')",
+        key_count,
+    )?;
+    for key in unlit {
+        if let Some(slot) = shown.get_mut((key - 1) as usize) {
+            *slot = None;
+        }
+    }
+    for (button, shown) in buttons.iter_mut().zip(shown) {
+        match shown {
+            Some(draw) => {
+                button.screen = true;
+                button.draw_id = draw;
+            }
+            None => {
+                button.screen = false;
+                button.draw_id = -1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads raw device reports until the `PressCapture` records a full
 /// press-and-release for a fresh button.
-async fn capture_press_release(
-    reader: &DeviceStateReader,
+async fn capture_press_release<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    reader: &impl InputSource,
     exclude: &HashSet<u8>,
 ) -> Result<(u8, u8), MirajazzError> {
     let mut capture = capture::PressCapture::new(exclude.clone());
     loop {
-        let (code, state) = next_event(reader).await?;
+        let (code, state) = next_event(console, reader).await?;
         if let Some(done) = capture.feed(code, state) {
             return Ok(done);
         }
@@ -749,58 +1013,32 @@ async fn capture_press_release(
 
 /// Reads raw device reports until the `TwistCapture` records two distinct
 /// twist codes for one encoder.
-async fn capture_encoder_twists(
-    reader: &DeviceStateReader,
+async fn capture_encoder_twists<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    reader: &impl InputSource,
     exclude: &HashSet<u8>,
 ) -> Result<(u8, u8), MirajazzError> {
     let mut capture = capture::TwistCapture::new(exclude.clone());
     loop {
-        let (code, state) = next_event(reader).await?;
+        let (code, state) = next_event(console, reader).await?;
         if let Some(done) = capture.feed(code, state) {
             return Ok(done);
         }
     }
 }
 
-/// Turns a raw input report into a `(code, state)` pair; reports that do not
-/// carry the expected ACK prefix are noise and yield `None`.
-fn raw_event(data: &[u8]) -> Option<(u8, u8)> {
-    data.starts_with(&[65, 67, 75]).then(|| (data[9], data[10]))
-}
-
 /// Reads one report from the device and extracts its `(code, state)` pair,
-/// skipping non-ACK noise reports. Every observed event is echoed to stdout so
-/// the user sees that the device is responding during a capture.
-async fn next_event(reader: &DeviceStateReader) -> Result<(u8, u8), MirajazzError> {
+/// skipping non-ACK noise reports. Every observed event is echoed so the user sees
+/// that the device is responding during a capture.
+async fn next_event<R: io::BufRead, O: Write, E: Write>(
+    console: &mut Console<R, O, E>,
+    reader: &impl InputSource,
+) -> Result<(u8, u8), MirajazzError> {
     loop {
-        let data = reader.raw_read_data(512).await?;
-        if let Some(event) = raw_event(&data) {
-            println!("  observed key {:>3}, state {}", event.0, event.1);
+        let data = reader.read_report().await?;
+        if let Some(event) = crate::input::decode_report(&data) {
+            console.say(format!("  observed key {:>3}, state {}", event.0, event.1));
             return Ok(event);
-        }
-    }
-}
-
-/// Asks the user to type a number in `min..=max` and keeps asking until a
-/// valid one is entered.
-fn ask_number(prompt: &str, min: u64, max: u64) -> u64 {
-    loop {
-        print!("{prompt} [{min}..{max}]: ");
-        if let Err(error) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {error}");
-        }
-        let mut line = String::new();
-        let input = match io::stdin().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => parse_number(&line),
-            Err(error) => {
-                eprintln!("failed to read input: {error}");
-                None
-            }
-        };
-        match input {
-            Some(number) if (min..=max).contains(&number) => return number,
-            _ => eprintln!("enter a number from {min} to {max}"),
         }
     }
 }
@@ -818,90 +1056,12 @@ fn parse_number_or_default(input: &str, default: u64, min: u64, max: u64) -> Opt
     }
 }
 
-/// Asks the user to type a number in `min..=max`, or just press Enter to keep
-/// `default`. End-of-input (piping from a closed/empty stream) also keeps the
-/// default rather than looping forever, unlike [`ask_number`] (which has no
-/// default to fall back to).
-fn ask_number_with_default(prompt: &str, min: u64, max: u64, default: u64) -> u64 {
-    loop {
-        print!("{prompt} [{min}..{max}, default {default}, Enter to keep it]: ");
-        if let Err(error) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {error}");
-        }
-        let mut line = String::new();
-        let input = match io::stdin().read_line(&mut line) {
-            Ok(0) => Some(default),
-            Ok(_) => parse_number_or_default(&line, default, min, max),
-            Err(error) => {
-                eprintln!("failed to read input: {error}");
-                None
-            }
-        };
-        match input {
-            Some(number) => return number,
-            None => {
-                eprintln!("enter a number from {min} to {max}, or press Enter to keep {default}")
-            }
-        }
-    }
-}
-
-/// Asks a yes/no question. The user answers with `y`/`yes` or `n`/`no`;
-/// the numeric `1`/`0` forms are accepted as well and the prompt repeats
-/// until a valid answer is typed.
-fn confirm(prompt: &str) -> bool {
-    loop {
-        print!("{prompt}: enter y/yes or n/no: ");
-        if let Err(error) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {error}");
-        }
-        let mut line = String::new();
-        let valid = match io::stdin().read_line(&mut line) {
-            Ok(_) => parse_yes_no(&line),
-            Err(error) => {
-                eprintln!("failed to read input: {error}");
-                None
-            }
-        };
-        match valid {
-            Some(answer) => return answer,
-            None => eprintln!("enter y/yes or n/no"),
-        }
-    }
-}
-
 /// Parses a yes/no answer: `y`, `yes` or `1` for yes; `n`, `no` or `0` for no.
 fn parse_yes_no(input: &str) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" | "1" => Some(true),
         "n" | "no" | "0" => Some(false),
         _ => None,
-    }
-}
-
-/// Asks for a single key number in `1..=max`; answering "no" (or `n`, `none`,
-/// `0`) means the number in question is not displayed on any screen.
-fn ask_key_number(prompt: &str, max: u8) -> Option<u8> {
-    loop {
-        print!("{prompt} [key number, or 'no' if not on any button]: ");
-        if let Err(error) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {error}");
-        }
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(_) => {
-                if let Some(key) = parse_key_number(&line, max) {
-                    return Some(key);
-                }
-                if is_no(&line) {
-                    return None;
-                }
-                eprintln!("enter a key number from 1 to {max} or 'no'");
-            }
-            Err(error) => {
-                eprintln!("failed to read input: {error}");
-            }
-        }
     }
 }
 
@@ -914,30 +1074,6 @@ fn parse_key_number(input: &str, max: u8) -> Option<u8> {
     match parse_number(input) {
         Some(number) if (1..=max as u64).contains(&number) => Some(number as u8),
         _ => None,
-    }
-}
-
-/// Asks for a comma/space-separated list of key numbers in `1..=max`;
-/// answering "none" yields an empty list.
-fn ask_key_list(prompt: &str, max: u8) -> Vec<u8> {
-    loop {
-        print!("{prompt}: ");
-        if let Err(error) = io::stdout().flush() {
-            eprintln!("failed to flush stdout: {error}");
-        }
-        let mut line = String::new();
-        let keys = match io::stdin().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => parse_key_list(&line, max),
-            Err(error) => {
-                eprintln!("failed to read input: {error}");
-                None
-            }
-        };
-        match keys {
-            Some(keys) => return keys,
-            None => eprintln!("enter key numbers from 1 to {max}, separated by spaces (or 'none')"),
-        }
     }
 }
 
@@ -976,9 +1112,11 @@ mod tests {
     use super::HidDeviceId;
     use super::{
         device_details, device_summary, is_no, parse_key_list, parse_key_number, parse_number,
-        parse_number_or_default, parse_yes_no, raw_event,
+        parse_number_or_default, parse_yes_no,
     };
     use super::{ButtonMapping, ControlEvent, EncoderMapping, Mapping, TwistDirection};
+    use crate::input::decode_report as raw_event;
+    use crate::log::Log;
     use std::collections::HashSet;
 
     /// `parse_number` accepts surrounding whitespace and the decimal format the
@@ -1005,8 +1143,8 @@ mod tests {
         assert_eq!(parse_number_or_default("abc", 2, 0, 3), None);
     }
 
-    /// `raw_event` extracts `(data[9], data[10])` from an ACK-prefixed report
-    /// and rejects reports without the ACK prefix.
+    /// The shared report decoder the capture loops use extracts `(data[9], data[10])`
+    /// from an ACK-prefixed report and rejects reports without the ACK prefix.
     #[test]
     fn raw_event_extracts_code_and_state_from_ack_reports() {
         let mut report = vec![0u8; 512];
@@ -1583,5 +1721,340 @@ mod tests {
                 release: 79,
             }],
         }
+    }
+
+    // -- the console and the wizard steps, driven by scripted answers --
+
+    /// A console reading `answers` and collecting its output and complaints.
+    fn console(answers: &str) -> super::Console<&[u8], Vec<u8>, Vec<u8>> {
+        super::Console::new(answers.as_bytes(), Vec::new(), Vec::new())
+    }
+
+    /// What a console has written to stdout and stderr so far.
+    fn written(console: &super::Console<&[u8], Vec<u8>, Vec<u8>>) -> (String, String) {
+        (
+            String::from_utf8_lossy(&console.out).into_owned(),
+            String::from_utf8_lossy(&console.err).into_owned(),
+        )
+    }
+
+    /// Every question re-asks after an invalid answer (complaining on stderr) and
+    /// returns the first valid one.
+    #[test]
+    fn questions_re_ask_until_valid() {
+        let mut c = console("x\n9\n3\n");
+        assert_eq!(c.ask_number("n", 1, 5).unwrap(), 3);
+        let (out, err) = written(&c);
+        assert_eq!(out.matches("n [1..5]: ").count(), 3, "{out}");
+        assert_eq!(err.matches("enter a number from 1 to 5").count(), 2);
+
+        let mut c = console("maybe\nyes\nn\n");
+        assert!(c.confirm("ok").unwrap());
+        assert!(!c.confirm("ok").unwrap());
+        assert!(written(&c).1.contains("enter y/yes or n/no"));
+
+        let mut c = console("7\n\n2\n");
+        assert_eq!(c.ask_number_with_default("v", 0, 3, 2).unwrap(), 2);
+        assert_eq!(c.ask_number_with_default("v", 0, 3, 1).unwrap(), 2);
+        assert!(written(&c).1.contains("or press Enter to keep 2"));
+
+        let mut c = console("12\nno\n3\n");
+        assert_eq!(c.ask_key_number("k", 4).unwrap(), None);
+        assert_eq!(c.ask_key_number("k", 4).unwrap(), Some(3));
+        assert!(written(&c).1.contains("from 1 to 4 or 'no'"));
+
+        let mut c = console("1 9\n2, 1 2\nnone\n");
+        assert_eq!(c.ask_key_list("l", 4).unwrap(), vec![2, 1]);
+        assert_eq!(c.ask_key_list("l", 4).unwrap(), Vec::<u8>::new());
+        assert!(written(&c).1.contains("separated by spaces"));
+    }
+
+    /// End of input ends every question that has no default with `InputClosed`
+    /// instead of re-asking forever (the old behaviour spun at 100% CPU with stdin
+    /// closed), even after invalid answers; a question with a default keeps it.
+    #[test]
+    fn end_of_input_ends_the_wizard() {
+        use super::MapError;
+        assert!(matches!(
+            console("").ask_number("n", 1, 5),
+            Err(MapError::InputClosed)
+        ));
+        assert!(matches!(
+            console("bad\n").ask_number("n", 1, 5),
+            Err(MapError::InputClosed)
+        ));
+        assert!(matches!(
+            console("").confirm("ok"),
+            Err(MapError::InputClosed)
+        ));
+        assert!(matches!(
+            console("?\n").ask_key_number("k", 3),
+            Err(MapError::InputClosed)
+        ));
+        assert!(matches!(
+            console("").ask_key_list("l", 3),
+            Err(MapError::InputClosed)
+        ));
+        assert_eq!(
+            console("").ask_number_with_default("v", 0, 3, 2).unwrap(),
+            2
+        );
+    }
+
+    /// A reader whose every read fails.
+    struct BrokenInput;
+
+    impl std::io::Read for BrokenInput {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("terminal gone"))
+        }
+    }
+
+    /// A read error ends the wizard with that error instead of re-asking forever, for
+    /// questions with and without a default.
+    #[test]
+    fn read_errors_end_the_wizard() {
+        use super::MapError;
+        let mut c =
+            super::Console::new(std::io::BufReader::new(BrokenInput), Vec::new(), Vec::new());
+        assert!(matches!(c.ask_number("n", 1, 2), Err(MapError::Input(_))));
+        assert!(matches!(
+            c.ask_number_with_default("v", 0, 3, 2),
+            Err(MapError::Input(_))
+        ));
+        let message = c.confirm("ok").unwrap_err().to_string();
+        assert_eq!(message, "failed to read input: terminal gone");
+    }
+
+    /// Every wizard error has a one-line description for the log.
+    #[test]
+    fn map_errors_describe_themselves() {
+        use super::MapError;
+        assert!(MapError::InputClosed
+            .to_string()
+            .contains("nothing was written"));
+        assert!(MapError::Busy.to_string().contains("in use"));
+        assert_eq!(
+            MapError::from(mirajazz::error::MirajazzError::BadData).to_string(),
+            mirajazz::error::MirajazzError::BadData.to_string()
+        );
+    }
+
+    /// The device list is numbered from 1 with continuation lines indented, and the
+    /// answer is returned as a 0-based index.
+    #[test]
+    fn choose_device_lists_and_picks() {
+        let mut c = console("2\n");
+        let details = [
+            "first\nserial A".to_string(),
+            "second\nserial B".to_string(),
+        ];
+        assert_eq!(super::choose_device(&mut c, &details).unwrap(), 1);
+        let (out, _) = written(&c);
+        assert!(
+            out.contains("  1. first\n     serial A\n  2. second\n"),
+            "{out}"
+        );
+        assert!(out.contains("device to work on [1..2]: "), "{out}");
+    }
+
+    /// The protocol question defaults to the kind's own version, and only kinds the
+    /// project has not verified get the "not verified" note.
+    #[test]
+    fn choose_protocol_version_defaults_to_the_kind() {
+        use crate::hardware::Kind;
+        let mut c = console("\n");
+        let version = super::choose_protocol_version(&mut c, Kind::Akp03ERev2).unwrap();
+        assert_eq!(version, Kind::Akp03ERev2.protocol_version());
+        assert!(!written(&c).0.contains("not been verified"));
+
+        let mut c = console("1\n");
+        assert_eq!(
+            super::choose_protocol_version(&mut c, Kind::SoomfonSe).unwrap(),
+            1
+        );
+        let (out, _) = written(&c);
+        assert!(out.contains("not been verified"), "{out}");
+        assert!(out.contains("  3: "), "every version is described: {out}");
+    }
+
+    /// Buttons as step 4 creates them: the first `screens` have displays in order.
+    fn captured_buttons(count: u8, screens: u8) -> Vec<ButtonMapping> {
+        (1..=count)
+            .map(|number| ButtonMapping {
+                number,
+                press: number,
+                release: number,
+                screen: number <= screens,
+                draw_id: if number <= screens { number as i8 } else { -1 },
+            })
+            .collect()
+    }
+
+    /// When the painted numbers match, nothing changes.
+    #[test]
+    fn recheck_display_keeps_a_matching_layout() {
+        let mut buttons = captured_buttons(3, 2);
+        let before = buttons.clone();
+        super::recheck_display(&mut console("y\n"), &mut buttons, 3).unwrap();
+        assert_eq!(buttons, before);
+    }
+
+    /// A mismatch is corrected from the answers: which key shows each number (a key
+    /// named twice keeps its first number, a number shown nowhere is "no"), then which
+    /// keys are unlit.
+    #[test]
+    fn recheck_display_rewrites_screens_from_the_answers() {
+        let mut buttons = captured_buttons(3, 3);
+        // Number 1 is on key 2, number 2 on key 2 again (ignored), number 3 nowhere;
+        // key 3 is unlit.
+        let mut c = console("n\n2\n2\nno\n3\n");
+        super::recheck_display(&mut c, &mut buttons, 3).unwrap();
+        let screens: Vec<(bool, i8)> = buttons.iter().map(|b| (b.screen, b.draw_id)).collect();
+        assert_eq!(screens, vec![(false, -1), (true, 1), (false, -1)]);
+        assert!(written(&c).1.contains("key 2 already shows another number"));
+    }
+
+    /// A stand-in for the connected keypad in the wizard tests: records what is drawn.
+    #[derive(Default)]
+    struct WizardDevice {
+        /// Every call, in order (`image<key>`, `flush`).
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl crate::actions::ButtonDevice for WizardDevice {
+        type Error = mirajazz::error::MirajazzError;
+
+        async fn set_button_image(
+            &self,
+            key: u8,
+            _image_format: mirajazz::types::ImageFormat,
+            _image: image::DynamicImage,
+        ) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push(format!("image{key}"));
+            Ok(())
+        }
+
+        async fn clear_button_image(&self, key: u8) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push(format!("clear{key}"));
+            Ok(())
+        }
+
+        async fn flush(&self) -> Result<(), Self::Error> {
+            self.calls.lock().unwrap().push("flush".to_string());
+            Ok(())
+        }
+
+        fn key_count(&self) -> u8 {
+            2
+        }
+
+        async fn set_brightness(&self, _percent: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn set_led_brightness(&self, _percent: u8) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    /// The wizard's steps 2-6 against a scripted keypad: counts confirmed, one screen,
+    /// both buttons and the encoder captured from the reports (noise and repeated or
+    /// already-used codes skipped), every button painted and flushed, the layout
+    /// confirmed.
+    #[tokio::test]
+    async fn map_connected_captures_every_control() {
+        use crate::input::{encode_report, ScriptedInput, ScriptedReport};
+        let device = WizardDevice::default();
+        let (input, reports) = ScriptedInput::new();
+        let mut noise = encode_report(9, 1);
+        noise[0] = 0;
+        for report in [
+            noise,
+            // Button 1: press and release code 1.
+            encode_report(1, 1),
+            encode_report(1, 0),
+            // Button 2: code 1 is taken; code 2 pressed and released.
+            encode_report(1, 1),
+            encode_report(2, 1),
+            encode_report(2, 0),
+            // Encoder 1: clockwise 81 (twice), then counter-clockwise 80.
+            encode_report(81, 0),
+            encode_report(81, 0),
+            encode_report(80, 0),
+            // Its push: 79.
+            encode_report(79, 1),
+            encode_report(79, 0),
+        ] {
+            reports.send(ScriptedReport::Data(report)).unwrap();
+        }
+        let format = crate::hardware::Kind::Akp03ERev2.image_format();
+        let mut c = console("y\ny\n1\ny\n");
+        let captured = super::map_connected(&mut c, &device, 1, &input, format, Log::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured,
+            super::Captured {
+                key_count: 2,
+                encoder_count: 1,
+                screens: 1,
+                buttons: vec![
+                    ButtonMapping {
+                        number: 1,
+                        press: 1,
+                        release: 1,
+                        screen: true,
+                        draw_id: 1
+                    },
+                    ButtonMapping {
+                        number: 2,
+                        press: 2,
+                        release: 2,
+                        screen: false,
+                        draw_id: -1
+                    },
+                ],
+                encoders: vec![EncoderMapping {
+                    number: 1,
+                    cw: 81,
+                    ccw: 80,
+                    press: 79,
+                    release: 79
+                }],
+            }
+        );
+        assert_eq!(*device.calls.lock().unwrap(), ["image0", "image1", "flush"]);
+        let (out, _) = written(&c);
+        assert!(
+            out.contains("mirajazz reports 2 keys and 1 encoders."),
+            "{out}"
+        );
+        assert!(out.contains("  observed key  81, state 0"), "{out}");
+    }
+
+    /// Corrected counts are used instead of the reported ones, and a keypad that goes
+    /// away during a capture ends the wizard with the device error.
+    #[tokio::test]
+    async fn map_connected_uses_corrected_counts_and_stops_on_disconnect() {
+        use crate::input::{ScriptedInput, ScriptedReport};
+        let device = WizardDevice::default();
+        let (input, reports) = ScriptedInput::new();
+        reports.send(ScriptedReport::Disconnect).unwrap();
+        let format = crate::hardware::Kind::Akp03ERev2.image_format();
+        let mut c = console("n\n4\nn\n0\n0\n");
+        let result = super::map_connected(&mut c, &device, 3, &input, format, Log::default()).await;
+        assert!(
+            matches!(result, Err(super::MapError::Device(_))),
+            "{result:?}"
+        );
+        let (out, _) = written(&c);
+        assert!(out.contains("number of keys [1..255]"), "{out}");
+        assert!(
+            out.contains("how many buttons have screens [0..4]"),
+            "{out}"
+        );
+        assert!(device.calls.lock().unwrap().is_empty());
     }
 }

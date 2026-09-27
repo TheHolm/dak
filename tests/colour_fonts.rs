@@ -409,3 +409,43 @@ fn debug_listing_empty_without_configured_fonts() {
     let _ = std::fs::remove_file(&path);
     assert!(config.font_details.is_empty());
 }
+
+/// A raw premultiplied-BGRA CBDT bitmap (the other colour bitmap format besides PNG)
+/// is drawn with its premultiplication undone: half-transparent green over black
+/// comes out as half-bright green, and fully transparent pixels leave the backdrop.
+#[test]
+fn premultiplied_bgra_bitmap_is_drawn_straight() {
+    const SIZE: u8 = 16;
+    // Top half: green at alpha 128, premultiplied to G = 128. Bottom half: transparent.
+    let mut bgra = Vec::new();
+    for row in 0..SIZE {
+        for _ in 0..SIZE {
+            if row < SIZE / 2 {
+                bgra.extend_from_slice(&[0, 128, 0, 128]);
+            } else {
+                bgra.extend_from_slice(&[0, 0, 0, 0]);
+            }
+        }
+    }
+    let font = build_font(
+        &[('\u{1F600}', Glyph::Bgra(bgra, SIZE))],
+        ColourTables::default(),
+    );
+    let path = write_font("bgra.ttf", &font);
+    let (fonts, report) = FontSet::load(&FontPaths {
+        emoji: Some(path.to_str().unwrap().to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let image = render("#[bg=blue,u=1F600]", &fonts);
+    // Straight green 255 at alpha ~0.5 over the blue highlight: both show.
+    assert!(
+        image
+            .pixels()
+            .any(|p| p.0[1] > 100 && p.0[2] > 100 && p.0[0] < 20),
+        "no green-over-blue pixel"
+    );
+    // The transparent half leaves pure highlight blue.
+    assert!(image.pixels().any(|p| p.0 == [0, 0, 255]));
+}

@@ -312,20 +312,16 @@ pub fn format_ranges(groups: &[(&str, Vec<u32>)], width: usize, max_lines: usize
         let tokens = range_tokens(codes);
         let sizes = range_sizes(codes);
         let mut line = String::new();
-        let mut first = true;
         for (token, size) in tokens.iter().zip(sizes) {
             if lines.len() >= max_lines {
                 hidden_ranges += 1;
                 hidden_chars += size;
                 continue;
             }
+            // `line` is only empty before a group's first token: a full line is always
+            // replaced by its continuation straight away (or the rest is capped above).
             if line.is_empty() {
-                line = if first {
-                    format!("undrawable, {label}: U+{token}")
-                } else {
-                    format!("undrawable, {label} (cont.): U+{token}")
-                };
-                first = false;
+                line = format!("undrawable, {label}: U+{token}");
             } else if line.len() + 1 + token.len() > width {
                 lines.push(std::mem::take(&mut line));
                 if lines.len() >= max_lines {
@@ -1371,6 +1367,50 @@ mod tests {
             button_text("e\u{301}bcdefg"),
             vec!["e\u{301}bcdef".to_string()]
         );
+    }
+
+    /// A stray variation selector (a cluster that draws nothing) is kept but takes no
+    /// column, so six more characters still fit after it.
+    #[test]
+    fn button_text_keeps_zero_width_clusters_for_free() {
+        assert_eq!(
+            button_text("\u{FE0F}abcdefg"),
+            vec!["\u{FE0F}abcdef".to_string()]
+        );
+    }
+
+    /// Every reason a glyph cannot be drawn has its own `-d fonts` label.
+    #[test]
+    fn undrawable_labels_are_distinct() {
+        let labels = [
+            Undrawable::Colr,
+            Undrawable::Svg,
+            Undrawable::UnsupportedBitmap,
+            Undrawable::ProbablySbix,
+            Undrawable::Empty,
+        ]
+        .map(Undrawable::label);
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+        assert!(labels.iter().all(|label| !label.is_empty()));
+    }
+
+    /// A font file whose name really ends in `#<digits>` is opened as a whole file
+    /// rather than split into a path and face index.
+    #[test]
+    fn split_face_index_prefers_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("dak_face_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let odd = dir.join("font#1");
+        std::fs::write(&odd, b"").unwrap();
+        let odd = odd.to_str().unwrap();
+        assert_eq!(split_face_index(odd), (odd, 0));
+        let missing = format!("{}/other.ttc#2", dir.display());
+        assert_eq!(
+            split_face_index(&missing),
+            (&missing[..missing.len() - 2], 2)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Rendering writes the text into a button-sized image with visible, grayscale pixels.

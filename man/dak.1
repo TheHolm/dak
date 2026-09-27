@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH DAK 1 2026-09-27 "dak 0.14.0" "User Commands"
+.TH DAK 1 2026-09-27 "dak 0.14.1" "User Commands"
 .SH NAME
 dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
 .SH SYNOPSIS
@@ -55,7 +55,7 @@ Detach from the terminal and run in the background as a daemon: fork, start a ne
 Write the process id (of the daemon, with \-\-detach) to PATH, and remove the file again on exit
 .TP
 \fB\-\-map\fR
-Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits
+Run the interactive device\-mapping wizard instead of normal operation: no config is read and no actions run; the wizard walks through capturing the connected device\*(Aqs buttons and encoders and prints the resulting device definition as JSON, then exits. The answers are read from standard input; when it ends (or cannot be read) before the wizard is done, the wizard stops with exit status 1 and prints nothing
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

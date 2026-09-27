@@ -2,7 +2,7 @@
 
 mod common;
 
-use dak::actions::{load_config, load_config_from_path};
+use dak::actions::load_config_from_path;
 
 use crate::common::{
     assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
@@ -60,10 +60,13 @@ fn comment_markers_inside_strings_are_not_comments() {
     assert!(config.is_ok());
 }
 
-/// `load_config` reads the repository's `config.json`; also guards that the shipped sample stays valid.
+/// The shipped `config.json.example` (the template new users copy to `config.json`)
+/// loads and validates. The user's own `config.json` is gitignored and absent from a
+/// fresh checkout, so no test may depend on it.
 #[test]
-fn load_config_reads_repo_config_json() {
-    let config = load_config();
+fn shipped_example_config_loads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.json.example");
+    let config = load_config_from_path(path.to_str().unwrap());
     assert!(config.is_ok(), "{:?}", config.err());
 }
 
@@ -1779,6 +1782,46 @@ fn validates_variable_assignments() {
         let config = load_config_from_path(path.to_str().unwrap());
         let _ = std::fs::remove_file(&path);
         let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(expected),
+            "{action}: expected {expected:?}, got: {errors}"
+        );
+    }
+}
+
+/// Over-long literal strings follow the operator's policy at load time (`=` is an
+/// error, `:=` a warning, the silent operator says nothing); a right-hand side reading
+/// an undefined variable and a `$(...)` command line with an unterminated quote are
+/// errors.
+#[test]
+fn validates_string_lengths_and_bad_right_hand_sides() {
+    let variables = r#"{"name": {"type": "str", "max_length": 3, "value": "abc"}}"#;
+    let load = |action: &str| {
+        let escaped = action.replace('\\', "\\\\").replace('"', "\\\"");
+        let path = write_variables_config(
+            variables,
+            &format!(r#"{{"on_start": {{"actions": {{"1b01": {{"pressed": "{escaped}"}}}}}}}}"#),
+        );
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        config
+    };
+
+    let errors = error_texts(load("$name = \"abcdef\"").unwrap_err());
+    assert!(
+        errors.contains("6-character string, longer than 3; use \":=\" to truncate"),
+        "{errors}"
+    );
+    let warnings = load("$name := \"abcdef\"").unwrap().warnings.join("\n");
+    assert!(warnings.contains("truncated"), "{warnings}");
+    let quiet = load("$name ~= \"abcdef\"").unwrap();
+    assert!(quiet.warnings.is_empty(), "{:?}", quiet.warnings);
+
+    for (action, expected) in [
+        ("$name := $nope", "references undefined variable \"$nope\""),
+        ("$name := $(echo 'open)", "unbalanced quotes"),
+    ] {
+        let errors = error_texts(load(action).unwrap_err());
         assert!(
             errors.contains(expected),
             "{action}: expected {expected:?}, got: {errors}"

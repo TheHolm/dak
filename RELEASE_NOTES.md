@@ -5,6 +5,89 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.14.1 — Bug fixes found while raising test coverage
+
+### User-facing changes
+- **`dak --map` no longer hangs when its input ends.** With standard input
+  closed or exhausted (e.g. `dak --map </dev/null`, or a pipe that runs dry)
+  the wizard used to repeat its question forever at full CPU. It now stops with
+  "input ended before the mapping was complete; nothing was written" and exit
+  status 1. A read error on standard input ends it the same way.
+- **A `SIGUSR1` or `SIGHUP` sent right after startup is no longer lost.** A
+  rescan or reload requested just after dak reported that it was ready (for
+  example by a udev/devd hook that fires as the service starts) could be
+  silently ignored until the next signal. It is now always acted on.
+
+### Details
+- Coverage went from 87.4% to 95.6% of lines (`main.rs` 70.9% → 93.4%,
+  `map.rs` 65.6% → 91.8%). What is still uncovered is listed under "Status /
+  known gaps" in `AGENTS.md`; how to measure is in `NOTES.md` section 12.
+- **Lost signal (`src/main.rs`).** `Supervisor::run` sampled the reload/rescan
+  counters when it started, after `serve` had sent `READY=1`. A signal counted
+  in between was treated as already handled. The counters are now fields set
+  in `Supervisor::new` (right after the signal handler is installed).
+  `supervisor_acts_on_requests_made_during_startup` fails against the old
+  sampling. Found on FreeBSD, where parallel tests widened the gap.
+- **`--map` input (`src/map.rs`).** The `ask_*`/`confirm` helpers, which read
+  stdin directly, became methods of `Console<R: BufRead, O: Write, E: Write>`
+  that return `Result<_, MapError>`. New `MapError::InputClosed` and
+  `MapError::Input` variants, and `MapError` implements `Display`.
+  `run_map_wizard` is now device glue around testable steps: `choose_device`,
+  `choose_protocol_version`, `map_connected` (steps 2–6, generic over
+  `ButtonDevice` and the new `InputSource`) and `recheck_display`.
+- **New `src/input.rs`.** It contains:
+  - the `InputSource` trait (`read_report`), implemented for mirajazz's
+    `DeviceStateReader`
+  - `decode_report`/`encode_report`, replacing `main.rs`'s inline ACK check
+    and `map::raw_event`
+  - `ScriptedInput`, a channel-fed fake reader
+- **`run_device` split up (`src/main.rs`).**
+  - The input-loop state moved into `Session<D: ButtonDevice>`, with one
+    handler per event (`on_report`, `on_timer`, `on_click`, `on_exec`,
+    `on_refresh`, `reset_after_disconnect`) and `run_connection`, the
+    `select!` loop over an `InputSource`.
+  - Raw-code translation is the pure `route()` → `Dispatch`.
+  - `await_reconnect` is generic over a `Reopen` trait; `ReopenDevice` is the
+    real rediscover-and-connect.
+  - Behaviour is unchanged.
+- **Restored tests.** Commit `1661197` had replaced 18 dispatch tests in
+  `main.rs` instead of adding next to them. The 14 still meaningful ones are
+  back (press/release edges, short/long/double click, encoder turns, action
+  lists, timer delivery, unknown scenes), adapted to the `variables` argument.
+- **New tests.**
+  - `main.rs` unit tests: `Supervisor` (busy/failed/cancelled starts,
+    undrivable and unopenable devices, `--wait`, `finished`, parking, quit),
+    `Session`/`route`/`run_connection`, `await_reconnect` (retries, give up
+    and park, stop).
+  - `map.rs` wizard tests (every question, EOF and read errors, scripted
+    capture).
+  - `logging` section type errors and `default_log_file` order (now through a
+    pure `default_log_file_from`).
+  - `apply_assignment` rejections, `$(...)` into strings (non-UTF-8 output,
+    failing command), timer seconds from a variable, string-length checks at
+    load time.
+  - Variable declaration and expansion edge cases, `--replace` without a
+    holder record and lock I/O errors.
+  - Premultiplied-BGRA colour bitmaps (`font_builder` gained `Glyph::Bgra`).
+  - `SceneRunner` edge cases.
+  - Binary runs for `--map` with closed stdin, startup warnings and
+    `-d fonts`, file logging without `HOME`, an absent configured device, and
+    a service handling SIGUSR1/SIGHUP with an absent device and an
+    unopenable log file.
+- **Tests no longer need the gitignored `config.json`.** Two tests read the
+  user's own file and failed on a fresh checkout.
+  `load_config_reads_repo_config_json` became `shipped_example_config_loads`
+  (it loads `config.json.example`), and the working-directory lookup test
+  checks `config_search_dirs` directly. `AGENTS.md` now says so explicitly.
+- **Test robustness.**
+  - The parking tests retry when a just-released lock still looks held (a
+    parallel test's `fork` briefly copying the fd).
+  - `tests/daemon.rs` kills its spawned `dak` if a test fails, instead of
+    leaving it running.
+- **Small cleanup.** `text::format_ranges` lost a `(cont.)` branch that could
+  never run.
+- Verified on FreeBSD 15.1 (build, test suite, coverage) in a throwaway VM.
+
 ## v0.14.0 — Runs as a proper daemon: background mode, logging, reload, one dak per keypad
 
 ### User-facing changes

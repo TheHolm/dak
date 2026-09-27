@@ -40,6 +40,7 @@ FreeBSD/cross-compiling) and states its own environment inline.
 9. [Font formats and the startup glyph scan](#9-font-formats-and-the-startup-glyph-scan)
 10. [Device lock files shared between users](#10-device-lock-files-shared-between-users)
 11. [Running as a service (systemd, autostart, hooks)](#11-running-as-a-service-systemd-autostart-hooks)
+12. [Measuring test coverage](#12-measuring-test-coverage)
 
 ---
 
@@ -963,3 +964,52 @@ never drive the same device. Things learned while building it:
   matches `attach` on vendor/product; `attach` fires before `hidraw` is ready on
   some systems - if so, dak's rescan simply retries on its reconnect interval.
 - `--detach` is for autostart/xinitrc and hand starts; systemd must not use it.
+
+---
+
+## 12. Measuring test coverage
+
+Environment: `cargo-llvm-cov` 0.9.x with the `llvm-tools` rustup component, on
+Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg's
+`rust` has no llvm-tools). Last measured for v0.14.1: 95.6% of lines on Linux.
+
+- Run `cargo llvm-cov --summary-only` (`--show-missing-lines` for line numbers,
+  `--no-fail-fast` to get a report despite a failing test). Point
+  `CARGO_LLVM_COV_TARGET_DIR` somewhere outside the repo to keep the instrumented
+  build (slow: the first one takes well over 10 minutes) apart from `target/`.
+- **Stale profiles.** Reusing a coverage target dir after large source changes
+  produced nonsense totals (files reported with more lines than they have, 66%
+  overall) even after `cargo llvm-cov clean --workspace`. A fresh target dir gave
+  the real numbers. If a file's line total does not roughly match `wc -l`, start
+  from an empty target dir.
+- **Forked daemon.** Code that only runs in the `--detach` daemon *is* counted.
+  Checked by running the instrumented binary with
+  `LLVM_PROFILE_FILE=.../dak-%p-%m.profraw`: only one file appeared (named after the
+  parent's pid), yet `serve`'s READY/readiness lines, which only the daemon runs,
+  had counts in it. The forked child keeps writing to the profile file it inherited.
+  So `daemon.rs`'s remaining misses are the real failure branches
+  (`pipe`/`fork`/`setsid`/`chdir`/`dup2` errors), not a measuring gap.
+- **Spawned test processes and pipes.** Tests that spawn `dak` (or `sleep` from an
+  action) keep inherited stdout/stderr open. Running `cargo test ... | tail` then
+  waits for those children too, and an agent's shell tool can look hung. Redirect
+  to a file and use `</dev/null`.
+- **FreeBSD.** `cargo install cargo-llvm-cov` and the instrumented run work
+  natively. `vendor/*` is not in the report (path dependencies that are not
+  workspace members are excluded), so the FreeBSD HID backend has no numbers.
+  FreeBSD-only lines in `src/`: the non-Linux `@abstract` `NOTIFY_SOCKET` branch in
+  `daemon::notify_to` (untested), and `lock_dir`'s `/tmp` fallback (covered there,
+  since FreeBSD has no `/run/lock`).
+- **Unreachable on purpose.** Roughly 250 lines are `unreachable!` arms,
+  syscall-failure branches, `Default`/`Debug` boilerplate, and the hardware glue
+  listed under "Status / known gaps" in `AGENTS.md`. Do not add tests just to hit
+  these.
+- **Parallel-test races seen while raising coverage** (both fixed in v0.14.1):
+  1. A lock file just released can look held for a moment. Another test's `fork`
+     briefly copies the fd, which stays open until `exec` closes it (`O_CLOEXEC`).
+     Tests that release and retake a lock must retry (see `lock_frees_up`,
+     `rescan_until_done`).
+  2. `Supervisor::run` used to sample the reload/rescan counters itself, after
+     `READY=1`. A SIGUSR1/SIGHUP arriving right after READY was counted before the
+     sample and silently dropped. That was a real bug, seen on FreeBSD under
+     parallel load. The counters are now sampled in `Supervisor::new`.
+
