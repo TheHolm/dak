@@ -150,6 +150,14 @@ under other platforms.
   and OFL-1.1 texts; the only licence file installed by both the `.deb`s (as a
   cargo-deb asset) and the FreeBSD `.pkg`. `tests/packaging.rs` keeps it in step with
   `LICENSE`/`fonts/*`. See `NOTES.md` section 8 for why (Debian/Ubuntu policy)
+- `debian/dak.service` — the systemd user unit (`Type=notify`, `--wait`, reload via
+  SIGHUP, `RestartPreventExitStatus=3`, `KillMode=process`, bound to
+  `graphical-session.target`), a cargo-deb asset;
+  `examples/service/` — `dak.desktop` (XDG autostart `dak --detach --wait` for
+  non-systemd desktops such as FreeBSD; there is deliberately no rc.d script, see
+  `NOTES.md` section 11) and udev/devd rescan-on-plug hooks, all shipped as inactive
+  examples in both packages; `examples/service.json` — the service example config. `tests/packaging.rs`
+  checks their key settings and that both packaging paths ship them
 - `config.json` — the user's own runtime config (gitignored, not checked in):
   scenes, per-key actions (pressed/released/short/long press/double click), timers
 - `config.json.example` — checked-in template new users copy to `config.json`
@@ -169,8 +177,10 @@ under other platforms.
 - `docker/` — Dockerfile and docker-compose for a local build environment
 - `README.markdown` — user-facing usage/config docs
 - `INSTALL.md` — building from source (both platforms, plus a FreeBSD-specific
-  note about a stray cross-compile `.cargo/config.toml`) and one-time device/
-  permissions setup (Linux udev rules, FreeBSD hidraw setup)
+  note about a stray cross-compile `.cargo/config.toml`), one-time device/
+  permissions setup (Linux udev rules, FreeBSD hidraw setup), and running as a
+  service (systemd user unit, XDG autostart/xinitrc with a logout `pkill`, rescan
+  hooks)
 - `RELEASE_NOTES.md` — history of tagged releases; see the merge/release
   convention below
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.

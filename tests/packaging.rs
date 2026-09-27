@@ -145,3 +145,121 @@ fn both_packaging_paths_install_the_copyright_file() {
         "both .deb jobs should compare the packaged copyright file"
     );
 }
+
+/// The systemd user unit is a `Type=notify` service that reloads with SIGHUP, does not
+/// restart on a config error (status 3), leaves `launch`ed programs alone on stop, runs
+/// without `--detach` and follows the graphical session.
+#[test]
+fn systemd_unit_has_the_service_settings() {
+    let unit = read("debian/dak.service");
+    let setting = |line: &str| unit.lines().any(|l| l.trim() == line);
+    for line in [
+        "Type=notify",
+        "ExecStart=/usr/bin/dak --wait",
+        "ExecReload=/bin/kill -HUP $MAINPID",
+        "Restart=on-failure",
+        "RestartPreventExitStatus=3",
+        "KillMode=process",
+        "PartOf=graphical-session.target",
+        "WantedBy=graphical-session.target",
+    ] {
+        assert!(setting(line), "debian/dak.service lacks {line:?}");
+    }
+    assert!(
+        unit.lines()
+            .filter(|line| line.starts_with("ExecStart="))
+            .all(|line| !line.contains("--detach")),
+        "a notify unit must not fork"
+    );
+    assert_eq!(
+        format!("RestartPreventExitStatus={}", dak::exit::CONFIG),
+        "RestartPreventExitStatus=3",
+        "the unit's status 3 must be the config-error status"
+    );
+}
+
+/// The XDG autostart example starts dak detached and waiting, stays out of menus,
+/// is skipped by systemd sessions (which use the unit), and says it is not active.
+#[test]
+fn autostart_entry_has_the_settings() {
+    let entry = read("examples/service/dak.desktop");
+    let setting = |line: &str| entry.lines().any(|l| l.trim() == line);
+    for line in [
+        "[Desktop Entry]",
+        "Type=Application",
+        "Exec=dak --detach --wait",
+        "Terminal=false",
+        "NoDisplay=true",
+        "X-systemd-skip=true",
+    ] {
+        assert!(setting(line), "dak.desktop lacks {line:?}");
+    }
+    assert!(entry.contains("Not active by default"));
+    assert!(
+        entry.contains("pkill -u \"$USER\" -x dak"),
+        "it explains stopping at logout"
+    );
+}
+
+/// The plug-in hooks send the rescan signal for the supported keypad, and say they are
+/// not active by default.
+#[test]
+fn rescan_hooks_signal_dak() {
+    let udev = read("examples/service/99-dak-rescan.rules");
+    assert!(udev.contains(r#"ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002""#));
+    assert!(udev.contains("pkill -USR1 -x dak"));
+    let devd = read("examples/service/dak-rescan.conf");
+    assert!(devd.contains(r#"match "vendor" "0x0300";"#));
+    assert!(devd.contains(r#"match "product" "0x3002";"#));
+    assert!(devd.contains("pkill -USR1 -x dak"));
+    for hook in [&udev, &devd] {
+        assert!(hook.contains("Not active by default"));
+    }
+}
+
+/// Both packaging paths ship the service files, and CI checks each artifact has them.
+#[test]
+fn both_packaging_paths_ship_the_service_files() {
+    let cargo_toml = read("Cargo.toml");
+    for asset in [
+        r#"{ source = "debian/dak.service", dest = "usr/lib/systemd/user/dak.service", mode = "644" }"#,
+        r#"{ source = "examples/service/99-dak-rescan.rules", dest = "usr/share/doc/dak/examples/99-dak-rescan.rules", mode = "644" }"#,
+        r#"{ source = "examples/service/dak.desktop", dest = "usr/share/doc/dak/examples/dak.desktop", mode = "644" }"#,
+        r#"{ source = "examples/service.json", dest = "usr/share/doc/dak/examples/service.json", mode = "644" }"#,
+    ] {
+        assert!(
+            cargo_toml.contains(asset),
+            "Cargo.toml lacks the deb asset {asset}"
+        );
+    }
+    let release = read(".woodpecker/release.yaml");
+    for needle in [
+        "cp examples/service/dak.desktop examples/service/dak-rescan.conf examples/service.json",
+        "grep -qF 'usr/local/share/examples/dak/dak.desktop'",
+        "grep -qF 'usr/local/share/examples/dak/dak-rescan.conf'",
+    ] {
+        assert!(release.contains(needle), "release.yaml lacks {needle:?}");
+    }
+    for needle in [
+        "grep -qF 'usr/lib/systemd/user/dak.service'",
+        "grep -qF 'usr/share/doc/dak/examples/99-dak-rescan.rules'",
+        "grep -qF 'usr/share/doc/dak/examples/dak.desktop'",
+    ] {
+        assert_eq!(
+            release.matches(needle).count(),
+            2,
+            "both .deb jobs should check {needle}"
+        );
+    }
+}
+
+/// The README states the current version (it once lagged several releases behind).
+#[test]
+fn readme_states_the_crate_version() {
+    let readme = read("README.markdown");
+    let expected = format!("The current version is **v{}**.", env!("CARGO_PKG_VERSION"));
+    assert!(
+        readme.contains(&expected),
+        "README.markdown should say {expected:?}"
+    );
+}

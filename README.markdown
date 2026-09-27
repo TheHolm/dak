@@ -13,7 +13,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.10.1**.
+The current version is **v0.14.0**.
 
 ## Usage
 
@@ -648,8 +648,12 @@ is attached). Once detached, `auto` logging goes to syslog; set `logging` or pas
 `--log-file` for a file instead. `--pid-file PATH` records the process id (also without
 `--detach`) and removes the file on exit.
 
-Under systemd don't detach: run dak in the foreground as a `Type=notify` service; it
-tells systemd when it is ready (`READY=1`, with a `STATUS=` line) and when it is
+Under systemd don't detach: the `.deb` ships a `Type=notify` user unit
+(`systemctl --user enable --now dak`); without systemd (FreeBSD) start it from your
+desktop's autostart with the shipped `dak.desktop` example, or from `~/.xinitrc`, and
+stop it at logout with `pkill -u "$USER" -x dak`. See "Running as a service" in
+[INSTALL.md](INSTALL.md), which also has udev/devd hooks that make dak pick a keypad up
+when it is plugged in. Run as a unit, dak tells systemd when it is ready (`READY=1`, with a `STATUS=` line) and when it is
 stopping. Commands started by actions and `text_exec`/`image_exec` always get
 `/dev/null` as stdin, so a program waiting for input can never hang on the terminal,
 and a failing `text_exec`/`image_exec` program's stderr is quoted in the error.

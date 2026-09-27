@@ -23,8 +23,9 @@ bindings distinguish short presses, long presses and double clicks, encoders bin
 per rotation notch, and each scene may run a timer. See dak-config(5) for the configuration \
 file format.\n\n\
 dak is a command-line-only tool: a config file plus a binary, with no GUI. It runs until it \
-is told to stop (Ctrl-C or SIGTERM) or its devices are gone, then restores the button \
-images it changed and shuts the devices down."
+is told to stop (Ctrl-C or SIGTERM), then restores the button images it changed and shuts the \
+devices down. SIGHUP reloads the configuration and SIGUSR1 looks for missing keypads again. Run \
+from a terminal it also ends once no configured keypad is left; as a service it waits for one."
 )]
 pub struct Cli {
     /// Path to the config file.

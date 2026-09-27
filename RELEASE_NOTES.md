@@ -5,6 +5,110 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.14.0 — Runs as a proper daemon: background mode, logging, reload, one dak per keypad
+
+### User-facing changes
+- **Service support.** The `.deb` ships a systemd user unit
+  (`systemctl --user enable --now dak`): dak starts with your graphical
+  session, reports when it is ready, reloads with `systemctl --user reload
+  dak` and stops at logout. Without systemd (e.g. FreeBSD) an XDG autostart
+  example (`dak.desktop`, `dak --detach --wait`) starts dak with the desktop;
+  INSTALL.md shows how to stop it at logout.
+- **`--detach`** runs dak in the background. Config errors still show in the
+  terminal, and the command only returns once the keypads are connected (or
+  with the daemon's own exit status and error). **`--pid-file PATH`** writes
+  the process id.
+- **Signals.** `SIGTERM` now stops dak cleanly like Ctrl-C (buttons cleared,
+  keypad shut down) instead of leaving stale images; a second one exits at
+  once. `SIGHUP` re-reads the config: an invalid one is reported and the
+  running one kept, a valid one restarts every keypad with it (from
+  `on_start`, variables reset) and reopens the log file. `SIGUSR1` looks for
+  keypads again.
+- **Keypads that come back later.** A keypad dak gave up on
+  (`device_reconnect_max_attempts`) is released and picked up again on
+  `SIGUSR1`. Run as a service, dak keeps running without any keypad instead
+  of exiting. Inactive udev and devd rules that send `SIGUSR1` whenever a
+  keypad is plugged in are included as examples.
+- **One dak per keypad.** Two dak instances (same or different users) no
+  longer both drive the same keypad. The second one skips it with a message
+  naming the holder's user and pid; `--wait` waits for the keypad to be
+  released (good for switching users) and `--replace` stops your own running
+  dak and takes over. `dak --map` refuses a keypad in use.
+- **Logging.** New top-level `logging` section: outputs `console`,
+  `journal` (with priorities, so `journalctl -p warning` works), `syslog`,
+  `file` (timestamped, rotatable), or the default `auto` (journal under
+  systemd, syslog when detached, console otherwise); plus `level`, `debug`,
+  `syslog_facility` and `timestamps`. New flags `--log-level`, `--log-file`
+  and `--syslog`.
+- **Exit statuses.** 0 ok, 1 failure, 2 bad command line, 3 config error,
+  4 no configured keypad, 5 all keypads in use by another dak.
+- Programs run by actions, `text_exec` and `image_exec` get `/dev/null` as
+  input and never the terminal; a failing `text_exec`/`image_exec` program's
+  error output is shown in the warning.
+
+### Details
+- New modules: `src/exit.rs` (statuses, `EXIT_CODES` checked against
+  dak(1)), `src/control.rs` (one signal task for INT/TERM/HUP/USR1 feeding a
+  `Controller`: quit flag plus reload/rescan counters so bursts collapse;
+  level-triggered `StopSource`/`StopSignal` replacing the per-iteration
+  `tokio::signal::ctrl_c()` calls that could lose a Ctrl-C arriving
+  mid-event), `src/lock.rs`, `src/daemon.rs`; `src/log.rs` rewritten.
+- `main` is a plain function: parse CLI, bootstrap logger (CLI level/-d,
+  console or journal), absolute config path, load + validate config, open
+  log outputs, then fork if `--detach`, then build the tokio runtime by hand
+  (forking must precede runtime threads).
+- Logging: `Log` stays `Copy`, gains a `Level`; a debug line needs level
+  debug and its subsystem. Lines go through a process-wide `Sinks`
+  (console; journal = stderr with `<N>` per line; syslog via libc
+  openlog/syslog("%s"); file appended 0600 in a 0700 dir, RFC 3339 ms
+  timestamps, reopenable). `auto` = journal when `JOURNAL_STREAM` matches
+  fd 2's dev:ino, syslog when detached, else console. CLI outputs are added
+  after `auto` is resolved; `-d` raises the level unless `--log-level`.
+- Locking: `flock(LOCK_EX|LOCK_NB)` on
+  `dak-<vid>-<pid>-<serial|path-…>.lock` in `$DAK_LOCK_DIR`/`/run/lock`/
+  `/tmp`, holder record pid/uid/user/since. Opened
+  `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`, regular files only, without `O_CREAT`
+  first (`fs.protected_regular`), created `O_EXCL` + `fchmod 0666`, read-only
+  fallback. `--replace` signals only same uid or as root, 10 s timeout.
+  Lock held through reconnects, released while parked. NOTES.md section 10.
+- Detach: pipe, fork, setsid, fork, chdir /, stdio to /dev/null, pid file
+  (O_NOFOLLOW; removed at exit only if it still holds our pid). The parent
+  blocks on the pipe for one `StartupReport` (`R<text>`/`F<status> <text>`,
+  last error from `log::last_error`). sd_notify is hand-written (datagram
+  to a path or Linux abstract `@` socket).
+- Supervisor (`main.rs`): JoinSet of device tasks, `LockTable` shared with
+  them, per-generation `StopSource`. Device tasks report `Started::
+  {Connected, Waiting}` once; READY=1 is sent after all reported or ended.
+  Give-up parks the task (`park_until_rescan`) instead of ending it.
+  Reload: RELOADING=1 + MONOTONIC_USEC, validate, rebuild logging, stop the
+  generation (each device restores and shuts down), fresh `Variables`,
+  rediscover, retain only still-matched locks, restart. Idle foreground
+  exits 4 (0 on a clean quit); `service_mode` (detached or NOTIFY_SOCKET)
+  waits with a STATUS line.
+- Child processes: stdin `/dev/null` for exec kinds, `$(cmd)` and action
+  commands; exec stderr drained concurrently (previously piped and never
+  read, so a chatty program could block until the 5 s timeout), first 512
+  bytes quoted in the failure.
+- Packaging: cargo-deb assets for the unit, the udev example and
+  `dak.desktop` and `examples/service.json`; release.yaml stages
+  `dak.desktop`, the devd example and service.json, and asserts them in the `.pkg`/`.deb`s.
+- Docs: dak(1) gains RUNNING IN THE BACKGROUND, SIGNALS, full EXIT STATUS,
+  NOTIFY_SOCKET/JOURNAL_STREAM/DAK_LOCK_DIR/XDG_STATE_HOME, lock/pid/unit/
+  autostart/hook FILES and rewritten NOTES; dak-config(5) gains LOGGING; README
+  Logging, Running in the background, Signals, One dak per keypad; INSTALL.md
+  Running as a service; NOTES.md sections 10-11. The README's stated
+  version (stuck at v0.10.1) is fixed and now checked by a test.
+- Tests: new `tests/exit_status.rs`, `tests/logging.rs`,
+  `tests/device_lock.rs` (re-runs itself as a second lock-holding process
+  for `--replace`), `tests/daemon.rs` (detach life cycle, service-mode
+  reload/rescan, log reopen after rotation); packaging tests for the
+  service files; unit tests throughout. Flaky
+  `wait_until_stops_when_cancelled` no longer depends on a fixed 30 ms.
+- Not verified on real hardware yet (the dev container sees the keypad in
+  sysfs but has no `/dev/hidraw*`): a live device session across
+  SIGHUP/SIGUSR1/parking, and autostart on a FreeBSD desktop. An rc.d script
+  was considered and dropped: rc.d cannot start a service in a user's session.
+
 ## v0.13.0 — Styled button text, emoji and custom fonts
 
 ### User-facing changes

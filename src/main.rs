@@ -2699,7 +2699,10 @@ mod tests {
         };
         assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
         assert!(!park.locks.holds(&park.key));
-        drop(dak::lock::try_lock(&dir, &park.key).expect("the lock is free while parked"));
+        assert!(
+            lock_frees_up(&dir, &park.key),
+            "the lock is free while parked"
+        );
 
         park.controller.handle(dak::control::SignalAction::Rescan);
         assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
@@ -2754,6 +2757,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Whether the lock of `key` in `dir` can be taken within a second. A lock just
+    /// released may look held for an instant: another test forking a child at that
+    /// moment gives the child a copy of the fd until its exec closes it (O_CLOEXEC).
+    fn lock_frees_up(dir: &std::path::Path, key: &dak::lock::DeviceKey) -> bool {
+        (0..200).any(|_| {
+            let free = dak::lock::try_lock(dir, key).is_ok();
+            if !free {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            free
+        })
+    }
+
     /// The lock table keeps only the locks it is told to keep.
     #[test]
     fn lock_table_retain_releases_the_rest() {
@@ -2766,7 +2782,7 @@ mod tests {
         table.insert(&b, dak::lock::try_lock(&dir, &b).unwrap());
         table.retain(&[a.file_name()].into_iter().collect());
         assert!(table.holds(&a) && !table.holds(&b));
-        drop(dak::lock::try_lock(&dir, &b).expect("b was released"));
+        assert!(lock_frees_up(&dir, &b), "b was released");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

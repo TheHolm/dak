@@ -10,7 +10,7 @@ DAK (Dynamic Ajazz Keyboard) controls an Ajazz AKP03E or AKP03R USB macro keypad
 .PP
 All runtime behavior is configurable: scenes swap what the buttons show and do, per\-button bindings distinguish short presses, long presses and double clicks, encoders bind one action per rotation notch, and each scene may run a timer. See dak\-config(5) for the configuration file format.
 .PP
-dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It runs until it is told to stop (Ctrl\-C or SIGTERM) or its devices are gone, then restores the button images it changed and shuts the devices down.
+dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It runs until it is told to stop (Ctrl\-C or SIGTERM), then restores the button images it changed and shuts the devices down. SIGHUP reloads the configuration and SIGUSR1 looks for missing keypads again. Run from a terminal it also ends once no configured keypad is left; as a service it waits for one.
 .SH OPTIONS
 .TP
 \fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR
@@ -141,12 +141,37 @@ The default log file, when the
 .B file
 log output is used.
 .TP
-.I PATH
-of
-.B \-\-pid\-file
-Holds the process id while
+.I PIDFILE
+The file named by
+.BR \-\-pid\-file ;
+holds the process id while
 .B dak
-runs; removed on exit.
+runs and is removed on exit.
+.TP
+.I /usr/lib/systemd/user/dak.service
+The systemd user unit shipped by the Debian/Ubuntu package
+.RB ( "systemctl \-\-user enable \-\-now dak" ).
+.TP
+.I /usr/share/doc/dak/examples/dak.desktop
+.TQ
+.I /usr/local/share/examples/dak/dak.desktop
+An inactive XDG autostart entry
+.RB ( "dak \-\-detach \-\-wait" )
+for desktops without systemd, such as FreeBSD; copy it to
+.IR ~/.config/autostart/ .
+A detached
+.B dak
+does not end at logout; stop it from the logout path with
+.BR "pkill \-u $USER \-x dak" .
+.TP
+.I /usr/share/doc/dak/examples/99\-dak\-rescan.rules
+.TQ
+.I /usr/local/share/examples/dak/dak\-rescan.conf
+Inactive udev and devd rules that send
+.B SIGUSR1
+to every
+.B dak
+when a keypad is plugged in.
 .TP
 .I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
 One lock file per keypad (in

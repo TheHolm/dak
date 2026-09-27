@@ -1,7 +1,7 @@
 //! The program's exit statuses.
 //!
 //! Each failure class the program can end with has its own status, so a service manager
-//! (systemd's `RestartPreventExitStatus=`, an rc.d script) or a calling script can tell a
+//! (systemd's `RestartPreventExitStatus=`, a session startup script) or a caller can tell a
 //! broken configuration, which restarting will not fix, apart from a keypad that is
 //! merely unplugged or busy. [`EXIT_CODES`] is the list `tests/man_pages.rs` requires the
 //! `EXIT STATUS` section of `dak(1)` to document.

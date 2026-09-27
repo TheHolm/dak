@@ -1,0 +1,25 @@
+# XDG autostart entry for dak (Dynamic Ajazz Keyboard), for desktops without
+# systemd user units - e.g. FreeBSD, or Linux without systemd.
+#
+# Not active by default. To start dak with your desktop session:
+#   mkdir -p ~/.config/autostart
+#   cp dak.desktop ~/.config/autostart/
+# (Do not put it in /etc/xdg/autostart: it would start dak for every user.)
+#
+# On systemd desktops use the user unit instead (systemctl --user enable dak);
+# X-systemd-skip=true below makes systemd-based sessions ignore this file, so the
+# two never run side by side.
+#
+# A dak started with --detach runs in its own session and does NOT stop when you
+# log out: add `pkill -u "$USER" -x dak` to your logout path (see INSTALL.md,
+# "Starting at login without systemd"), or the next user's dak keeps waiting for
+# the keypad.
+[Desktop Entry]
+Type=Application
+Name=DAK keypad controller
+Comment=Drives the Ajazz macro keypad (dak)
+Exec=dak --detach --wait
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-systemd-skip=true

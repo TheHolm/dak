@@ -122,12 +122,37 @@ The default log file, when the
 .B file
 log output is used.
 .TP
-.I PATH
-of
-.B \-\-pid\-file
-Holds the process id while
+.I PIDFILE
+The file named by
+.BR \-\-pid\-file ;
+holds the process id while
 .B dak
-runs; removed on exit.
+runs and is removed on exit.
+.TP
+.I /usr/lib/systemd/user/dak.service
+The systemd user unit shipped by the Debian/Ubuntu package
+.RB ( "systemctl \-\-user enable \-\-now dak" ).
+.TP
+.I /usr/share/doc/dak/examples/dak.desktop
+.TQ
+.I /usr/local/share/examples/dak/dak.desktop
+An inactive XDG autostart entry
+.RB ( "dak \-\-detach \-\-wait" )
+for desktops without systemd, such as FreeBSD; copy it to
+.IR ~/.config/autostart/ .
+A detached
+.B dak
+does not end at logout; stop it from the logout path with
+.BR "pkill \-u $USER \-x dak" .
+.TP
+.I /usr/share/doc/dak/examples/99\-dak\-rescan.rules
+.TQ
+.I /usr/local/share/examples/dak/dak\-rescan.conf
+Inactive udev and devd rules that send
+.B SIGUSR1
+to every
+.B dak
+when a keypad is plugged in.
 .TP
 .I /run/lock/dak\-<vid>\-<pid>\-<serial>.lock
 One lock file per keypad (in

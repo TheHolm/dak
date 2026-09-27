@@ -1,0 +1,12 @@
+# udev rule: tell every running dak to look for keypads when one is plugged in
+# (or comes back after a suspend), so a dak that gave up on a keypad, or started
+# without one, picks it up without being restarted.
+#
+# Not active by default. To use it (as root):
+#   cp 99-dak-rescan.rules /etc/udev/rules.d/
+#   udevadm control --reload
+#
+# Vendor 0300, product 3002 is the Ajazz AKP03E/AKP03R; add a line per other
+# keypad model you use. pkill signals the dak of every user, which is harmless:
+# a dak with nothing to look for ignores the rescan.
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", RUN+="/usr/bin/pkill -USR1 -x dak"

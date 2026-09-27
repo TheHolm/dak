@@ -28,6 +28,13 @@ assets = [
     { source = "man/dak.1", dest = "usr/share/man/man1/dak.1", mode = "644" },
     { source = "man/dak-config.5", dest = "usr/share/man/man5/dak-config.5", mode = "644" },
     { source = "debian/copyright", dest = "usr/share/doc/dak/copyright", mode = "644" },
+    # systemd user unit: `systemctl --user enable --now dak`.
+    { source = "debian/dak.service", dest = "usr/lib/systemd/user/dak.service", mode = "644" },
+    # Rescan-on-plug udev rule and XDG autostart entry, shipped as examples only
+    # (not active).
+    { source = "examples/service/99-dak-rescan.rules", dest = "usr/share/doc/dak/examples/99-dak-rescan.rules", mode = "644" },
+    { source = "examples/service/dak.desktop", dest = "usr/share/doc/dak/examples/dak.desktop", mode = "644" },
+    { source = "examples/service.json", dest = "usr/share/doc/dak/examples/service.json", mode = "644" },
 ]
 
 [dependencies]
