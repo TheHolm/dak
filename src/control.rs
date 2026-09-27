@@ -22,6 +22,10 @@ pub enum SignalAction {
     /// Stop cleanly: restore the changed buttons and close every device. A second
     /// quit request while the first is still being handled exits immediately.
     Quit,
+    /// Re-read the configuration and, when it is valid, restart every device with it.
+    Reload,
+    /// Look again for devices that were given up on or never found.
+    Rescan,
 }
 
 /// The signals the program handles, by name.
@@ -33,6 +37,8 @@ pub enum Signal {
     Terminate,
     /// `SIGHUP` (terminal hang-up, `systemctl reload`).
     Hangup,
+    /// `SIGUSR1` (`systemctl kill -s USR1`, the udev/devd plug-in hooks).
+    User1,
 }
 
 impl Signal {
@@ -42,14 +48,16 @@ impl Signal {
             Signal::Interrupt => "SIGINT",
             Signal::Terminate => "SIGTERM",
             Signal::Hangup => "SIGHUP",
+            Signal::User1 => "SIGUSR1",
         }
     }
 
-    /// What this signal asks for. Until configuration reload exists `SIGHUP` stops the
-    /// program cleanly too, instead of killing it on the spot (its default action).
+    /// What this signal asks for: INT and TERM stop, HUP reloads, USR1 rescans.
     pub fn action(self) -> SignalAction {
         match self {
-            Signal::Interrupt | Signal::Terminate | Signal::Hangup => SignalAction::Quit,
+            Signal::Interrupt | Signal::Terminate => SignalAction::Quit,
+            Signal::Hangup => SignalAction::Reload,
+            Signal::User1 => SignalAction::Rescan,
         }
     }
 }
@@ -59,6 +67,11 @@ impl Signal {
 pub struct ControlState {
     /// Whether a quit has been requested.
     pub quit: bool,
+    /// How many reloads have been requested so far; waiters compare it to the last
+    /// value they handled, so requests arriving in a burst collapse into one.
+    pub reload: u64,
+    /// How many rescans have been requested so far (see `reload`).
+    pub rescan: u64,
 }
 
 /// What [`Controller::handle`] decided to do about a signal.
@@ -118,6 +131,40 @@ impl Controller {
                     Handled::Recorded
                 }
             }
+            SignalAction::Reload => {
+                self.state.send_modify(|state| state.reload += 1);
+                Handled::Recorded
+            }
+            SignalAction::Rescan => {
+                self.state.send_modify(|state| state.rescan += 1);
+                Handled::Recorded
+            }
+        }
+    }
+
+    /// Resolves with the new count once more reloads than `seen` were requested.
+    pub async fn reload_after(&self, seen: u64) -> u64 {
+        let mut rx = self.state.subscribe();
+        let count = rx
+            .wait_for(|state| state.reload > seen)
+            .await
+            .map(|state| state.reload);
+        match count {
+            Ok(count) => count,
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    /// Resolves with the new count once more rescans than `seen` were requested.
+    pub async fn rescan_after(&self, seen: u64) -> u64 {
+        let mut rx = self.state.subscribe();
+        let count = rx
+            .wait_for(|state| state.rescan > seen)
+            .await
+            .map(|state| state.rescan);
+        match count {
+            Ok(count) => count,
+            Err(_) => std::future::pending().await,
         }
     }
 
@@ -206,12 +253,14 @@ pub fn spawn_signal_handler(
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
+    let mut user1 = signal(SignalKind::user_defined1())?;
     Ok(tokio::spawn(async move {
         loop {
             let received = tokio::select! {
                 Some(()) = interrupt.recv() => Signal::Interrupt,
                 Some(()) = terminate.recv() => Signal::Terminate,
                 Some(()) = hangup.recv() => Signal::Hangup,
+                Some(()) = user1.recv() => Signal::User1,
                 else => return,
             };
             dispatch(&controller, received, log);
@@ -223,8 +272,13 @@ pub fn spawn_signal_handler(
 /// repeated quit.
 fn dispatch(controller: &Controller, received: Signal, log: Log) {
     let action = received.action();
+    let doing = match action {
+        SignalAction::Quit => "shutting down",
+        SignalAction::Reload => "reloading the configuration",
+        SignalAction::Rescan => "looking for missing devices",
+    };
     match controller.handle(action) {
-        Handled::Recorded => log.info(format!("received {}; shutting down", received.name())),
+        Handled::Recorded => log.info(format!("received {}; {doing}", received.name())),
         Handled::ForceExit => {
             log.warn(format!(
                 "received {} again while shutting down; exiting immediately",
@@ -240,12 +294,32 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// INT, TERM and (until reload exists) HUP all ask for a clean stop.
+    /// INT and TERM ask for a clean stop, HUP for a reload, USR1 for a rescan.
     #[test]
-    fn stop_signals_map_to_quit() {
-        for signal in [Signal::Interrupt, Signal::Terminate, Signal::Hangup] {
+    fn signals_map_to_their_actions() {
+        for signal in [Signal::Interrupt, Signal::Terminate] {
             assert_eq!(signal.action(), SignalAction::Quit, "{signal:?}");
         }
+        assert_eq!(Signal::Hangup.action(), SignalAction::Reload);
+        assert_eq!(Signal::User1.action(), SignalAction::Rescan);
+    }
+
+    /// Reload and rescan requests count up independently and never force an exit;
+    /// a waiter sees requests made before it started waiting.
+    #[tokio::test]
+    async fn reload_and_rescan_generations_count_up() {
+        let controller = Controller::new();
+        assert_eq!(controller.handle(SignalAction::Reload), Handled::Recorded);
+        assert_eq!(controller.handle(SignalAction::Reload), Handled::Recorded);
+        assert_eq!(controller.handle(SignalAction::Rescan), Handled::Recorded);
+        let state = controller.state();
+        assert_eq!((state.reload, state.rescan, state.quit), (2, 1, false));
+        let reload = tokio::time::timeout(Duration::from_secs(1), controller.reload_after(0));
+        assert_eq!(reload.await.unwrap(), 2);
+        let rescan = tokio::time::timeout(Duration::from_secs(1), controller.rescan_after(0));
+        assert_eq!(rescan.await.unwrap(), 1);
+        let none = tokio::time::timeout(Duration::from_millis(50), controller.rescan_after(1));
+        assert!(none.await.is_err(), "no newer rescan was requested");
     }
 
     /// Signal names are the conventional upper-case ones.
@@ -254,6 +328,7 @@ mod tests {
         assert_eq!(Signal::Interrupt.name(), "SIGINT");
         assert_eq!(Signal::Terminate.name(), "SIGTERM");
         assert_eq!(Signal::Hangup.name(), "SIGHUP");
+        assert_eq!(Signal::User1.name(), "SIGUSR1");
     }
 
     /// The first quit is recorded; a second one asks for an immediate exit.
@@ -325,10 +400,10 @@ mod tests {
         let _task = spawn_signal_handler(controller.clone(), Log::default()).unwrap();
         // SAFETY: raising a signal at our own process; the handler is installed above.
         unsafe {
-            libc::raise(libc::SIGHUP);
+            libc::raise(libc::SIGUSR1);
         }
-        tokio::time::timeout(Duration::from_secs(2), controller.quit_requested())
+        tokio::time::timeout(Duration::from_secs(2), controller.rescan_after(0))
             .await
-            .expect("the delivered SIGHUP is recorded as a quit");
+            .expect("the delivered SIGUSR1 is recorded as a rescan");
     }
 }

@@ -149,8 +149,14 @@ fn run(cli: Cli, log: Log) -> u8 {
 
     let status = match build_runtime(log) {
         Some(runtime) => {
-            let conflict = Conflict::from_flags(cli.wait, cli.replace);
-            runtime.block_on(serve(config, log, conflict, readiness.as_ref()))
+            let options = ServeOptions {
+                cli: &cli,
+                config_path: &config_path,
+                conflict: Conflict::from_flags(cli.wait, cli.replace),
+                detached: cli.detach,
+                readiness: readiness.as_ref(),
+            };
+            runtime.block_on(serve(config, log, options))
         }
         None => exit::FAILURE,
     };
@@ -168,7 +174,9 @@ fn run(cli: Cli, log: Log) -> u8 {
 /// In the terminal `dak --detach` was started from, once the daemon reported: what
 /// happened, with the daemon's own message.
 fn report_detached_start(log: Log, status: u8, message: &str) {
-    if status == exit::SUCCESS {
+    if status == exit::SUCCESS && message == NO_DEVICE_YET {
+        log.warn(format!("dak is running in the background, but {message}"));
+    } else if status == exit::SUCCESS {
         log.info(format!("dak is running in the background: {message}"));
     } else {
         log.error(format!(
@@ -216,22 +224,38 @@ fn build_runtime(log: Log) -> Option<tokio::runtime::Runtime> {
     }
 }
 
+/// Everything [`serve`] needs besides the loaded config: how it was started and what to
+/// do on conflicts, so a reload can reapply the same command line.
+struct ServeOptions<'a> {
+    /// The parsed command line (for the logging overrides on reload).
+    cli: &'a Cli,
+    /// The absolute config path, re-read on `SIGHUP`.
+    config_path: &'a std::path::Path,
+    /// What to do about devices held by another dak.
+    conflict: Conflict,
+    /// Whether the program detached from its terminal.
+    detached: bool,
+    /// The startup pipe to the waiting `--detach` terminal, if any.
+    readiness: Option<&'a daemon::Readiness>,
+}
+
 /// Matches the config's `devices` definitions against the discovered hardware and
 /// drives every present device: each connects with its own key/encoder counts, applies
-/// the `on_start` scene, and reacts to keys, encoder events and scene timers, until a
-/// stop signal arrives or every device has ended. Returns the exit status.
+/// the `on_start` scene, and reacts to keys, encoder events and scene timers. Returns the
+/// exit status once the program is told to stop or has nothing left to drive.
+///
+/// This is the device supervisor: besides starting the device tasks it handles
+/// `SIGHUP` (re-read the config; when valid, rebuild logging and restart every device
+/// with it, keeping the locks of devices still in use), `SIGUSR1` (look again for
+/// configured devices that are missing, while devices that gave up reconnecting look
+/// for themselves) and the end of every task.
 ///
 /// A device definition is matched to a discovered device by its serial number, falling
-/// back to the VID:PID string when the definition's serial is "unknown". Definitions with
-/// no matching hardware and discovered devices without a config definition are reported
-/// and skipped; when no configured device is found the program exits with
-/// [`exit::NO_DEVICE`].
-async fn serve(
-    config: actions::LoadedConfig,
-    log: Log,
-    conflict: Conflict,
-    readiness: Option<&daemon::Readiness>,
-) -> u8 {
+/// back to the VID:PID string when the definition's serial is "unknown". In the
+/// foreground the program ends with [`exit::NO_DEVICE`] when no configured device is
+/// (or remains) available; as a service (`--detach`, or under systemd) it keeps
+/// running and waits for a rescan instead.
+async fn serve(config: actions::LoadedConfig, log: Log, options: ServeOptions<'_>) -> u8 {
     // Signal listeners go in first, so a SIGTERM during discovery already ends the
     // program cleanly instead of killing it.
     let controller = Arc::new(Controller::new());
@@ -239,107 +263,24 @@ async fn serve(
         log.error(format!("failed to install signal handlers: {error}"));
         return exit::FAILURE;
     }
-    // A quit request stops every device task (and any lock wait) from here on.
-    let stop = Arc::new(StopSource::new());
-    {
-        let (controller, stop) = (controller.clone(), stop.clone());
-        tokio::spawn(async move {
-            controller.quit_requested().await;
-            daemon::notify("STOPPING=1");
-            stop.stop();
-        });
-    }
+    let service = service_mode(options.detached, daemon::notify_socket().is_some());
+    let mut supervisor = Supervisor::new(config, log, &options, controller.clone(), service);
 
-    // Discovered devices come back from an unordered set. Each config device definition
-    // (keyed by a logical device id) is matched against this set: serial numbers tell
-    // identical devices apart, a VID:PID fallback covers devices without serials.
-    let devices: Vec<HidDevice> = match list_devices(&hardware::QUERIES).await {
-        Ok(devices) => devices.into_iter().collect(),
+    let devices = match discover().await {
+        Ok(devices) => devices,
         Err(error) => {
             log.error(format!("device discovery failed: {error}"));
             return exit::FAILURE;
         }
     };
-    let assignments = match_devices(&config, &devices, log);
-    if assignments.is_empty() {
+    let assignments = match_devices(&supervisor.config.devices.by_id, &devices, log, true);
+    if assignments.is_empty() && !service {
         log.error("no device defined in config was found");
         return exit::NO_DEVICE;
     }
-
-    // Drive every present device, each on its own task with its own input loop, scene
-    // state and timer. The stop signal reaches every loop, so every device runs its
-    // cleanup.
-    let mut handles = Vec::new();
-    // One variable/default state shared by every device: the declarations are global, so
-    // an assignment from one device's input is visible to all of them.
-    let variables = Arc::new(std::sync::Mutex::new(Variables::new(
-        config.variables.clone(),
-        &config.defaults,
-    )));
-    let lock_dir = lock::lock_dir();
-    let (mut busy, mut failed) = (0usize, 0usize);
-    let mut started = Vec::new();
-    for (device_number, definition, device_info) in assignments {
-        let key = device_key(&device_info);
-        // Refusing and replacing settle the lock before the device task starts (so a
-        // device held elsewhere is merely skipped); waiting happens inside the task, so
-        // the other devices start meanwhile.
-        let lock = if conflict == Conflict::Wait {
-            None
-        } else {
-            match take_device_lock(&lock_dir, &key, conflict, &stop.signal(), log, None).await {
-                Ok(lock) => Some(lock),
-                Err(LockError::Busy(_)) => {
-                    busy += 1;
-                    continue;
-                }
-                Err(LockError::Cancelled) => break,
-                Err(_) => {
-                    failed += 1;
-                    continue;
-                }
-            }
-        };
-        let scenes = config.scenes.clone();
-        let defaults = config.defaults.clone();
-        let variables = variables.clone();
-        let fonts = config.fonts.clone();
-        let signal = stop.signal();
-        let lock_dir = lock_dir.clone();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        started.push(start_rx);
-        let start = Arc::new(StartSignal::new(start_tx));
-        handles.push(tokio::spawn(async move {
-            let _lock = match lock {
-                Some(lock) => lock,
-                None => {
-                    match take_device_lock(&lock_dir, &key, conflict, &signal, log, Some(&start))
-                        .await
-                    {
-                        Ok(lock) => lock,
-                        Err(LockError::Cancelled) => return Ok(()),
-                        Err(_) => return Err(TaskError::Reported(exit::FAILURE)),
-                    }
-                }
-            };
-            run_device(
-                device_number,
-                definition,
-                device_info,
-                scenes,
-                log,
-                defaults,
-                variables,
-                fonts,
-                signal,
-                start,
-            )
-            .await
-            .map_err(TaskError::Device)
-        }));
-    }
-    if handles.is_empty() {
-        if stop.signal().is_stopped() {
+    let (started, busy, failed) = supervisor.start(assignments).await;
+    if supervisor.tasks.is_empty() && !service {
+        if supervisor.stopped() {
             return exit::SUCCESS;
         }
         if busy > 0 && failed == 0 {
@@ -348,50 +289,533 @@ async fn serve(
         }
         return exit::FAILURE;
     }
-
-    // Startup is complete once every device task has either painted its first scene,
-    // started waiting for its lock, or ended. When at least one got that far, the
-    // program is up: systemd and a waiting `--detach` terminal are told so.
-    let mut connected = 0usize;
-    let mut waiting = 0usize;
-    for start in started {
-        match start.await {
-            Ok(Started::Connected) => connected += 1,
-            Ok(Started::Waiting) => waiting += 1,
-            Err(_) => {}
-        }
-    }
-    if connected + waiting > 0 && !stop.signal().is_stopped() {
-        let summary = startup_summary(connected, waiting);
+    let summary = supervisor.wait_started(started).await;
+    if !supervisor.stopped() {
         log.debug(Subsystem::Device, format!("startup complete: {summary}"));
         daemon::notify(&format!("READY=1\n{}", daemon::status_line(&summary)));
-        if let Some(readiness) = readiness {
+        if let Some(readiness) = options.readiness {
             readiness.report(daemon::StartupReport::Ready(summary));
         }
     }
+    supervisor.run().await
+}
 
-    // Wait for every device task, so one device failing (e.g. its first connection
-    // could not be opened) does not take the other, working devices down with it; the
-    // first failure is still reported as the program's exit status once all are done.
-    let mut status = exit::SUCCESS;
-    for handle in handles {
-        let failure = match handle.await {
-            Ok(Ok(())) => continue,
-            Ok(Err(TaskError::Device(error))) => {
-                log.error(format!("device task ended with an error: {error}"));
-                device_error_status(&error)
+/// Whether the program runs as a service, which keeps it alive (waiting for a rescan)
+/// when it has no device to drive: detached, or started by systemd.
+fn service_mode(detached: bool, notify_socket: bool) -> bool {
+    detached || notify_socket
+}
+
+/// Lists every attached keypad of the supported family.
+async fn discover() -> Result<Vec<HidDevice>, MirajazzError> {
+    Ok(list_devices(&hardware::QUERIES)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+/// The device locks this process holds, by lock file name. Shared between the
+/// supervisor and the device tasks, so a lock can outlive the task that took it (a
+/// reload restarts the task but keeps the lock) and a task can give its lock up while
+/// parked.
+#[derive(Clone, Default)]
+struct LockTable(Arc<std::sync::Mutex<HashMap<String, DeviceLock>>>);
+
+impl LockTable {
+    /// Whether the lock of `key` is held.
+    fn holds(&self, key: &DeviceKey) -> bool {
+        self.0
+            .lock()
+            .expect("lock table poisoned")
+            .contains_key(&key.file_name())
+    }
+
+    /// Records a newly taken lock.
+    fn insert(&self, key: &DeviceKey, lock: DeviceLock) {
+        self.0
+            .lock()
+            .expect("lock table poisoned")
+            .insert(key.file_name(), lock);
+    }
+
+    /// Releases the lock of `key`, if held.
+    fn release(&self, key: &DeviceKey) {
+        self.0
+            .lock()
+            .expect("lock table poisoned")
+            .remove(&key.file_name());
+    }
+
+    /// Releases every lock whose file name is not in `keep`.
+    fn retain(&self, keep: &std::collections::HashSet<String>) {
+        self.0
+            .lock()
+            .expect("lock table poisoned")
+            .retain(|name, _| keep.contains(name));
+    }
+
+    /// Ensures the lock of `key` is held, taking it per `conflict` when not.
+    async fn ensure(
+        &self,
+        dir: &std::path::Path,
+        key: &DeviceKey,
+        conflict: Conflict,
+        stop: &StopSignal,
+        log: Log,
+        start: Option<&StartSignal>,
+    ) -> Result<(), LockError> {
+        if self.holds(key) {
+            return Ok(());
+        }
+        let lock = take_device_lock(dir, key, conflict, stop, log, start).await?;
+        self.insert(key, lock);
+        Ok(())
+    }
+}
+
+/// What a device task tells the supervisor while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskEvent {
+    /// The device gave up reconnecting and waits for a rescan.
+    Parked(u8),
+    /// A parked device is looking for its device again.
+    Resumed(u8),
+}
+
+/// How a device task that gave up reconnecting waits for a rescan and gets back in
+/// (see [`await_reconnect`]).
+struct Park {
+    /// The device's logical number.
+    number: u8,
+    /// Its lock identity.
+    key: DeviceKey,
+    /// The process's device locks.
+    locks: LockTable,
+    /// Where lock files live.
+    lock_dir: std::path::PathBuf,
+    /// What to do when another dak took the device meanwhile.
+    conflict: Conflict,
+    /// Where rescan requests are recorded.
+    controller: Arc<Controller>,
+    /// Tells the supervisor about parking and resuming.
+    events: mpsc::UnboundedSender<TaskEvent>,
+}
+
+/// The state of one generation of device tasks (everything a reload replaces) and the
+/// bookkeeping across generations.
+struct Supervisor<'a> {
+    /// The running configuration.
+    config: Arc<actions::LoadedConfig>,
+    /// The variable/default state shared by every device of this generation.
+    variables: Arc<std::sync::Mutex<Variables>>,
+    /// The current output filter.
+    log: Log,
+    /// How the program was started.
+    options: &'a ServeOptions<'a>,
+    /// Signal requests.
+    controller: Arc<Controller>,
+    /// Whether to keep running without devices.
+    service: bool,
+    /// Where lock files live.
+    lock_dir: std::path::PathBuf,
+    /// The locks held.
+    locks: LockTable,
+    /// Stops this generation's tasks (on quit or reload).
+    generation: Arc<StopSource>,
+    /// Stops `generation` when a quit is requested.
+    quit_watch: tokio::task::JoinHandle<()>,
+    /// The running device tasks, each returning its device number and outcome.
+    tasks: tokio::task::JoinSet<(u8, Result<(), TaskError>)>,
+    /// Device number to lock file name of every running task.
+    live: HashMap<u8, String>,
+    /// Running tasks that gave up and wait for a rescan.
+    parked: std::collections::HashSet<u8>,
+    /// Task events, and the sender handed to new tasks.
+    events: (
+        mpsc::UnboundedSender<TaskEvent>,
+        mpsc::UnboundedReceiver<TaskEvent>,
+    ),
+    /// The first failure status seen.
+    status: u8,
+}
+
+impl<'a> Supervisor<'a> {
+    /// A supervisor for `config` with no tasks started yet.
+    fn new(
+        config: actions::LoadedConfig,
+        log: Log,
+        options: &'a ServeOptions<'a>,
+        controller: Arc<Controller>,
+        service: bool,
+    ) -> Self {
+        let variables = Arc::new(std::sync::Mutex::new(Variables::new(
+            config.variables.clone(),
+            &config.defaults,
+        )));
+        let (generation, quit_watch) = new_generation(&controller);
+        Self {
+            config: Arc::new(config),
+            variables,
+            log,
+            options,
+            controller,
+            service,
+            lock_dir: lock::lock_dir(),
+            locks: LockTable::default(),
+            generation,
+            quit_watch,
+            tasks: tokio::task::JoinSet::new(),
+            live: HashMap::new(),
+            parked: std::collections::HashSet::new(),
+            events: mpsc::unbounded_channel(),
+            status: exit::SUCCESS,
+        }
+    }
+
+    /// Whether this generation was stopped.
+    fn stopped(&self) -> bool {
+        self.generation.signal().is_stopped()
+    }
+
+    /// Starts a task for every assignment whose lock can be taken, returning their
+    /// startup reports plus how many devices were skipped as busy and as failed.
+    ///
+    /// Refusing and replacing settle the lock before the task starts (so a device held
+    /// elsewhere is merely skipped); waiting happens inside the task, so the other
+    /// devices start meanwhile.
+    async fn start(
+        &mut self,
+        assignments: Vec<(u8, Mapping, HidDeviceInfo)>,
+    ) -> (Vec<tokio::sync::oneshot::Receiver<Started>>, usize, usize) {
+        let (mut busy, mut failed) = (0usize, 0usize);
+        let mut started = Vec::new();
+        let log = self.log;
+        let conflict = self.options.conflict;
+        for (device_number, definition, device_info) in assignments {
+            let key = device_key(&device_info);
+            if self.live.values().any(|name| *name == key.file_name()) {
+                continue;
             }
-            Ok(Err(TaskError::Reported(status))) => status,
+            if conflict != Conflict::Wait {
+                let signal = self.generation.signal();
+                match self
+                    .locks
+                    .ensure(&self.lock_dir, &key, conflict, &signal, log, None)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(LockError::Busy(_)) => {
+                        busy += 1;
+                        continue;
+                    }
+                    Err(LockError::Cancelled) => break,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                }
+            }
+            let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+            started.push(start_rx);
+            let start = Arc::new(StartSignal::new(start_tx));
+            let config = self.config.clone();
+            let variables = self.variables.clone();
+            let signal = self.generation.signal();
+            let locks = self.locks.clone();
+            let lock_dir = self.lock_dir.clone();
+            let park = Park {
+                number: device_number,
+                key: key.clone(),
+                locks: locks.clone(),
+                lock_dir: lock_dir.clone(),
+                conflict,
+                controller: self.controller.clone(),
+                events: self.events.0.clone(),
+            };
+            self.live.insert(device_number, key.file_name());
+            self.tasks.spawn(async move {
+                if let Err(error) = locks
+                    .ensure(&lock_dir, &key, conflict, &signal, log, Some(&start))
+                    .await
+                {
+                    return match error {
+                        LockError::Cancelled => (device_number, Ok(())),
+                        _ => (device_number, Err(TaskError::Reported(exit::FAILURE))),
+                    };
+                }
+                let result = run_device(
+                    device_number,
+                    definition,
+                    device_info,
+                    config.scenes.clone(),
+                    log,
+                    config.defaults.clone(),
+                    variables,
+                    config.fonts.clone(),
+                    signal,
+                    start,
+                    park,
+                )
+                .await
+                .map_err(TaskError::Device);
+                if result.is_err() {
+                    locks.release(&key);
+                }
+                (device_number, result)
+            });
+        }
+        (started, busy, failed)
+    }
+
+    /// Waits until every task in `started` has reported (or ended) and summarizes
+    /// how many connected and how many wait for a lock.
+    async fn wait_started(&self, started: Vec<tokio::sync::oneshot::Receiver<Started>>) -> String {
+        let (mut connected, mut waiting) = (0usize, 0usize);
+        for start in started {
+            match start.await {
+                Ok(Started::Connected) => connected += 1,
+                Ok(Started::Waiting) => waiting += 1,
+                Err(_) => {}
+            }
+        }
+        startup_summary(connected, waiting)
+    }
+
+    /// Records how a finished task ended.
+    fn finished(&mut self, joined: Result<(u8, Result<(), TaskError>), tokio::task::JoinError>) {
+        let failure = match joined {
+            Ok((number, outcome)) => {
+                self.live.remove(&number);
+                self.parked.remove(&number);
+                match outcome {
+                    Ok(()) => return,
+                    Err(TaskError::Device(error)) => {
+                        self.log
+                            .error(format!("device task ended with an error: {error}"));
+                        device_error_status(&error)
+                    }
+                    Err(TaskError::Reported(status)) => status,
+                }
+            }
             Err(error) => {
-                log.error(format!("device task failed unexpectedly: {error}"));
+                self.log
+                    .error(format!("device task failed unexpectedly: {error}"));
                 exit::FAILURE
             }
         };
-        if status == exit::SUCCESS {
-            status = failure;
+        if self.status == exit::SUCCESS {
+            self.status = failure;
         }
     }
-    status
+
+    /// Stops this generation and waits for every task, recording their outcomes when
+    /// `record` is set (a reload discards them).
+    async fn stop_all(&mut self, record: bool) {
+        self.generation.stop();
+        while let Some(joined) = self.tasks.join_next().await {
+            if record {
+                self.finished(joined);
+            } else if let Ok((number, _)) = joined {
+                self.live.remove(&number);
+            }
+        }
+        self.live.clear();
+        self.parked.clear();
+    }
+
+    /// Whether nothing is being driven: no task runs, or every running one gave up.
+    fn idle(&self) -> bool {
+        self.live.keys().all(|number| self.parked.contains(number))
+    }
+
+    /// Reacts to signals and task ends until the program should exit; returns the
+    /// exit status.
+    async fn run(&mut self) -> u8 {
+        let mut reload_seen = self.controller.state().reload;
+        let mut rescan_seen = self.controller.state().rescan;
+        loop {
+            if self.idle() {
+                if !self.service {
+                    // Nothing left to drive in the foreground: end like before parking
+                    // existed, with the "no device" status when devices were given up.
+                    let gave_up = !self.parked.is_empty();
+                    self.stop_all(false).await;
+                    if gave_up && self.status == exit::SUCCESS {
+                        return exit::NO_DEVICE;
+                    }
+                    return self.status;
+                }
+                daemon::notify(&daemon::status_line(
+                    "waiting for devices (send SIGUSR1 to rescan)",
+                ));
+            }
+            let controller = self.controller.clone();
+            tokio::select! {
+                _ = controller.quit_requested() => {
+                    daemon::notify("STOPPING=1");
+                    self.stop_all(true).await;
+                    return self.status;
+                }
+                seen = controller.reload_after(reload_seen) => {
+                    reload_seen = seen;
+                    self.reload().await;
+                }
+                seen = controller.rescan_after(rescan_seen) => {
+                    rescan_seen = seen;
+                    self.rescan().await;
+                }
+                Some(joined) = self.tasks.join_next(), if !self.tasks.is_empty() => {
+                    self.finished(joined);
+                }
+                Some(event) = self.events.1.recv() => match event {
+                    TaskEvent::Parked(number) => { self.parked.insert(number); }
+                    TaskEvent::Resumed(number) => { self.parked.remove(&number); }
+                },
+            }
+        }
+    }
+
+    /// `SIGUSR1`: starts tasks for configured devices that have none (never found, or
+    /// skipped as busy). Parked tasks react to the same request on their own.
+    async fn rescan(&mut self) {
+        let log = self.log;
+        let missing: std::collections::BTreeMap<u8, Mapping> = self
+            .config
+            .devices
+            .by_id
+            .iter()
+            .filter(|(number, _)| !self.live.contains_key(number))
+            .map(|(number, definition)| (*number, definition.clone()))
+            .collect();
+        if missing.is_empty() {
+            if self.parked.is_empty() {
+                log.debug(
+                    Subsystem::Device,
+                    "rescan: every configured device is running",
+                );
+            }
+            return;
+        }
+        let devices = match discover().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                log.warn(format!("rescan: device discovery failed: {error}"));
+                return;
+            }
+        };
+        let assignments = match_devices(&missing, &devices, log, false);
+        if assignments.is_empty() {
+            log.info("rescan: no missing device was found");
+            return;
+        }
+        let (started, _, _) = self.start(assignments).await;
+        let summary = self.wait_started(started).await;
+        log.info(format!("rescan: {summary}"));
+        daemon::notify(&daemon::status_line(&summary));
+    }
+
+    /// `SIGHUP`: re-reads the config. An invalid one is reported and the running one
+    /// kept (with the log file reopened); a valid one replaces logging, then every
+    /// device task is stopped cleanly and restarted from its `on_start` scene with
+    /// fresh variables, keeping the locks of devices that stay in use.
+    async fn reload(&mut self) {
+        let path = self.options.config_path;
+        daemon::notify(&format!("RELOADING=1\nMONOTONIC_USEC={}", monotonic_usec()));
+        self.log
+            .info(format!("reloading configuration from {}", path.display()));
+        let config = match actions::load_config_from_path(&path.to_string_lossy()) {
+            Ok(config) => config,
+            Err(errors) => {
+                for error in &errors {
+                    self.log.error(error);
+                }
+                self.log
+                    .error("configuration not reloaded; still running the previous one");
+                reopen_log_file(self.log);
+                daemon::notify("READY=1");
+                return;
+            }
+        };
+        match open_logging(&config, self.options.cli, self.options.detached) {
+            Ok((settings, sinks)) => {
+                dak::log::install(sinks);
+                self.log = settings.log;
+            }
+            Err(error) => {
+                self.log
+                    .error(format!("{error}; keeping the previous log outputs"));
+                reopen_log_file(self.log);
+            }
+        }
+        let log = self.log;
+        for warning in &config.warnings {
+            log.warn(warning);
+        }
+
+        self.stop_all(false).await;
+        self.quit_watch.abort();
+        let (generation, quit_watch) = new_generation(&self.controller);
+        self.generation = generation;
+        self.quit_watch = quit_watch;
+        self.variables = Arc::new(std::sync::Mutex::new(Variables::new(
+            config.variables.clone(),
+            &config.defaults,
+        )));
+        self.config = Arc::new(config);
+
+        let devices = match discover().await {
+            Ok(devices) => devices,
+            Err(error) => {
+                log.error(format!("device discovery failed: {error}"));
+                Vec::new()
+            }
+        };
+        let assignments = match_devices(&self.config.devices.by_id, &devices, log, true);
+        let keep = assignments
+            .iter()
+            .map(|(_, _, info)| device_key(info).file_name())
+            .collect();
+        self.locks.retain(&keep);
+        let (started, _, _) = self.start(assignments).await;
+        let summary = self.wait_started(started).await;
+        log.info(format!("configuration reloaded: {summary}"));
+        daemon::notify(&format!("READY=1\n{}", daemon::status_line(&summary)));
+    }
+}
+
+/// A fresh generation stop source, plus the task that stops it on a quit request (so
+/// lock waits and device loops end even while the supervisor is busy, e.g. starting
+/// devices).
+fn new_generation(controller: &Arc<Controller>) -> (Arc<StopSource>, tokio::task::JoinHandle<()>) {
+    let generation = Arc::new(StopSource::new());
+    let watch = {
+        let (controller, generation) = (controller.clone(), generation.clone());
+        tokio::spawn(async move {
+            controller.quit_requested().await;
+            generation.stop();
+        })
+    };
+    (generation, watch)
+}
+
+/// Reopens the installed log file (after logrotate moved it), logging a failure.
+fn reopen_log_file(log: Log) {
+    if let Some(sinks) = dak::log::installed() {
+        if let Err(error) = sinks.reopen() {
+            log.error(format!("cannot reopen the log file: {error}"));
+        }
+    }
+}
+
+/// `CLOCK_MONOTONIC` in microseconds, as systemd wants with `RELOADING=1`.
+fn monotonic_usec() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime only writes into `now`.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    now.tv_sec as u64 * 1_000_000 + now.tv_nsec as u64 / 1_000
 }
 
 /// How far a device task got by the end of startup (see [`StartSignal`]).
@@ -421,6 +845,9 @@ impl StartSignal {
     }
 }
 
+/// The startup summary of a service that found nothing to drive yet.
+const NO_DEVICE_YET: &str = "no configured device available yet; send SIGUSR1 to rescan";
+
 /// The one-line startup summary, e.g. "2 devices connected, 1 waiting for another dak".
 fn startup_summary(connected: usize, waiting: usize) -> String {
     let devices = |n: usize| {
@@ -431,6 +858,7 @@ fn startup_summary(connected: usize, waiting: usize) -> String {
         }
     };
     match (connected, waiting) {
+        (0, 0) => NO_DEVICE_YET.to_string(),
         (c, 0) => format!("{} connected", devices(c)),
         (0, w) => format!("{} waiting for another dak to release it", devices(w)),
         (c, w) => format!("{} connected, {w} waiting for another dak", devices(c)),
@@ -512,15 +940,17 @@ fn device_error_status(error: &MirajazzError) -> u8 {
     }
 }
 
-/// Pairs each config device definition with the discovered device it describes,
-/// warning about definitions without hardware and hardware without a definition.
+/// Pairs each of `definitions` with the discovered device it describes, warning about
+/// definitions without hardware and (when `warn_undefined`) hardware without a
+/// definition.
 fn match_devices(
-    config: &actions::LoadedConfig,
+    definitions: &std::collections::BTreeMap<u8, Mapping>,
     devices: &[HidDevice],
     log: Log,
+    warn_undefined: bool,
 ) -> Vec<(u8, Mapping, HidDeviceInfo)> {
     let mut assignments: Vec<(u8, Mapping, HidDeviceInfo)> = Vec::new();
-    for (device_id, definition) in &config.devices.by_id {
+    for (device_id, definition) in definitions {
         match devices.iter().position(|dev| {
             actions::discovered_device_matches(
                 definition,
@@ -543,7 +973,7 @@ fn match_devices(
         }
     }
 
-    for dev in devices {
+    for dev in devices.iter().filter(|_| warn_undefined) {
         if !assignments.iter().any(|(_, _, info)| info.id == dev.id) {
             log.warn(format!(
                 "device found but not defined in config; ignoring: {}",
@@ -582,6 +1012,7 @@ async fn run_device(
     fonts: Arc<dak::text::FontSet>,
     stop: StopSignal,
     start: Arc<StartSignal>,
+    park: Park,
 ) -> Result<(), MirajazzError> {
     log.debug(
         Subsystem::Device,
@@ -783,12 +1214,12 @@ async fn run_device(
                 "device lost while reconnecting",
                 reconnect_policy,
                 &stop,
+                &park,
             )
             .await
             {
                 Reconnect::Reconnected => continue 'connection,
                 Reconnect::Cancelled => return Ok(()),
-                Reconnect::GaveUp => return Err(MirajazzError::DeviceNotFoundError),
             }
         };
         let end = loop {
@@ -1021,15 +1452,14 @@ async fn run_device(
                     &reason,
                     reconnect_policy,
                     &stop,
+                    &park,
                 )
                 .await
                 {
                     Reconnect::Reconnected => continue 'connection,
-                    // Stopped while waiting: nothing left to restore on a missing device.
+                    // Stopped while waiting (possibly parked after giving up): nothing
+                    // left to restore on a missing device.
                     Reconnect::Cancelled => return Ok(()),
-                    // Only this device's task ends; the others keep running, and the
-                    // program's exit status reports the failure once they are done.
-                    Reconnect::GaveUp => return Err(MirajazzError::DeviceNotFoundError),
                 }
             }
         }
@@ -1095,10 +1525,9 @@ enum SessionEnd {
 enum Reconnect {
     /// A new connection is attached and the screen was repainted.
     Reconnected,
-    /// A stop signal arrived while waiting; the program should end.
+    /// A stop signal arrived while waiting (or while parked after giving up); the
+    /// session should end.
     Cancelled,
-    /// The allowed attempts ran out; this device is no longer driven.
-    GaveUp,
 }
 
 /// Connects to `device_info` with the key/encoder counts from `definition` and
@@ -1166,6 +1595,7 @@ async fn await_reconnect(
     reason: &str,
     policy: reconnect::ReconnectPolicy,
     stop: &StopSignal,
+    park: &Park,
 ) -> Reconnect {
     device.mark_disconnected();
     log.warn(reconnect::disconnected_message(device_number, reason));
@@ -1221,15 +1651,21 @@ async fn await_reconnect(
             }
         }
     };
-    let (connection, info) = match reconnect::wait_until(policy, attempt, stop.stopped()).await {
-        reconnect::WaitOutcome::Found(found) => found,
-        reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
-        reconnect::WaitOutcome::GaveUp => {
-            log.error(reconnect::gave_up_message(
-                device_number,
-                policy.max_attempts,
-            ));
-            return Reconnect::GaveUp;
+    let (connection, info) = loop {
+        match reconnect::wait_until(policy, attempt, stop.stopped()).await {
+            reconnect::WaitOutcome::Found(found) => break found,
+            reconnect::WaitOutcome::Cancelled => return Reconnect::Cancelled,
+            reconnect::WaitOutcome::GaveUp => {
+                log.error(format!(
+                    "{}; send SIGUSR1 to look for it again",
+                    reconnect::gave_up_message(device_number, policy.max_attempts)
+                ));
+                // Parked: another dak may have the keypad meanwhile. A rescan starts a
+                // fresh round of attempts, once the lock is ours again.
+                if !park_until_rescan(park, stop, log).await {
+                    return Reconnect::Cancelled;
+                }
+            }
         }
     };
     let name = if info.name.is_empty() {
@@ -1250,6 +1686,34 @@ async fn await_reconnect(
         ));
     }
     Reconnect::Reconnected
+}
+
+/// Parks a device that gave up reconnecting: releases its lock, tells the supervisor,
+/// and waits for a rescan request, then takes the lock back (per the conflict policy;
+/// a device taken over by another dak meanwhile stays parked). Returns `false` when
+/// `stop` fired instead.
+async fn park_until_rescan(park: &Park, stop: &StopSignal, log: Log) -> bool {
+    loop {
+        let seen = park.controller.state().rescan;
+        park.locks.release(&park.key);
+        let _ = park.events.send(TaskEvent::Parked(park.number));
+        tokio::select! {
+            _ = park.controller.rescan_after(seen) => {}
+            _ = stop.stopped() => return false,
+        }
+        let _ = park.events.send(TaskEvent::Resumed(park.number));
+        log.info(format!("device #{}: looking for it again", park.number));
+        match park
+            .locks
+            .ensure(&park.lock_dir, &park.key, park.conflict, stop, log, None)
+            .await
+        {
+            Ok(()) => return true,
+            Err(LockError::Cancelled) => return false,
+            // Logged by `ensure`; wait for the next rescan.
+            Err(_) => continue,
+        }
+    }
 }
 
 /// A delayed short-press confirmation for one pressable control (a button or a
@@ -2184,6 +2648,150 @@ mod tests {
             super::startup_summary(2, 1),
             "2 devices connected, 1 waiting for another dak"
         );
+    }
+
+    /// A parking fixture: a lock table holding the lock of a test key in a fresh
+    /// directory, and the park itself with its event receiver.
+    fn park_fixture(
+        conflict: dak::lock::Conflict,
+    ) -> (
+        super::Park,
+        tokio::sync::mpsc::UnboundedReceiver<super::TaskEvent>,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "dak_park_{}_{}",
+            std::process::id(),
+            PARK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dak::lock::DeviceKey::new(0x0300, 0x3002, Some("PARKTEST"), "");
+        let locks = super::LockTable::default();
+        locks.insert(&key, dak::lock::try_lock(&dir, &key).unwrap());
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        let park = super::Park {
+            number: 1,
+            key,
+            locks,
+            lock_dir: dir.clone(),
+            conflict,
+            controller: std::sync::Arc::new(dak::control::Controller::new()),
+            events,
+        };
+        (park, rx, dir)
+    }
+
+    /// Distinguishes the parking fixtures' directories.
+    static PARK_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A parked device releases its lock (another dak could take the keypad), and a
+    /// rescan takes the lock back and resumes it.
+    #[tokio::test]
+    async fn parking_releases_the_lock_until_a_rescan() {
+        let (park, mut events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let park = std::sync::Arc::new(park);
+        let stop = dak::control::StopSource::new();
+        let task = {
+            let (park, signal) = (park.clone(), stop.signal());
+            tokio::spawn(async move {
+                super::park_until_rescan(&park, &signal, dak::log::Log::default()).await
+            })
+        };
+        assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
+        assert!(!park.locks.holds(&park.key));
+        drop(dak::lock::try_lock(&dir, &park.key).expect("the lock is free while parked"));
+
+        park.controller.handle(dak::control::SignalAction::Rescan);
+        assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
+        assert!(task.await.unwrap(), "resumed");
+        assert!(park.locks.holds(&park.key), "the lock is ours again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device another dak took while it was parked stays parked (with the default
+    /// policy) until a later rescan finds it free.
+    #[tokio::test]
+    async fn parked_device_taken_elsewhere_stays_parked() {
+        let (park, mut events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let park = std::sync::Arc::new(park);
+        let stop = dak::control::StopSource::new();
+        let task = {
+            let (park, signal) = (park.clone(), stop.signal());
+            tokio::spawn(async move {
+                super::park_until_rescan(&park, &signal, dak::log::Log::default()).await
+            })
+        };
+        assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
+        let other = dak::lock::try_lock(&dir, &park.key).unwrap();
+        park.controller.handle(dak::control::SignalAction::Rescan);
+        assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
+        assert_eq!(
+            events.recv().await,
+            Some(super::TaskEvent::Parked(1)),
+            "busy: parked again"
+        );
+        drop(other);
+        park.controller.handle(dak::control::SignalAction::Rescan);
+        assert_eq!(events.recv().await, Some(super::TaskEvent::Resumed(1)));
+        assert!(task.await.unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stop ends the parking without taking the lock back.
+    #[tokio::test]
+    async fn parking_ends_on_stop() {
+        let (park, mut events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let stop = dak::control::StopSource::new();
+        let signal = stop.signal();
+        let parked = super::park_until_rescan(&park, &signal, dak::log::Log::default());
+        let stopper = async {
+            assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
+            stop.stop();
+        };
+        let (resumed, ()) = tokio::join!(parked, stopper);
+        assert!(!resumed);
+        assert!(!park.locks.holds(&park.key));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lock table keeps only the locks it is told to keep.
+    #[test]
+    fn lock_table_retain_releases_the_rest() {
+        let dir = std::env::temp_dir().join(format!("dak_table_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dak::lock::DeviceKey::new(1, 2, Some("A"), "");
+        let b = dak::lock::DeviceKey::new(1, 2, Some("B"), "");
+        let table = super::LockTable::default();
+        table.insert(&a, dak::lock::try_lock(&dir, &a).unwrap());
+        table.insert(&b, dak::lock::try_lock(&dir, &b).unwrap());
+        table.retain(&[a.file_name()].into_iter().collect());
+        assert!(table.holds(&a) && !table.holds(&b));
+        drop(dak::lock::try_lock(&dir, &b).expect("b was released"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A service with nothing to drive says how to get it going.
+    #[test]
+    fn startup_summary_without_devices_mentions_the_rescan() {
+        assert_eq!(super::startup_summary(0, 0), super::NO_DEVICE_YET);
+        assert!(super::NO_DEVICE_YET.contains("SIGUSR1"));
+    }
+
+    /// Detached or under systemd the program stays up without devices; in a terminal
+    /// it does not.
+    #[test]
+    fn service_mode_detection() {
+        assert!(!super::service_mode(false, false));
+        assert!(super::service_mode(true, false));
+        assert!(super::service_mode(false, true));
+    }
+
+    /// `CLOCK_MONOTONIC` only moves forward.
+    #[test]
+    fn monotonic_usec_increases() {
+        let first = super::monotonic_usec();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(super::monotonic_usec() > first);
     }
 
     /// Only the first startup report is delivered.

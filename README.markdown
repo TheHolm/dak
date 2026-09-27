@@ -557,7 +557,7 @@ A device that disappears while dak is running - the computer goes to sleep, the 
 "1": { "device_id": "0300:3002", "serial": "unknown", "device_reconnect_interval": 5, "device_reconnect_max_attempts": 60, "...": "..." }
 ```
 
-When the attempts run out, dak prints `error: device #N did not come back after M attempts; giving up on it` and stops driving that device; other devices keep running, and once none is left dak exits with status 4 (so a service manager can restart it). Once the device is back, dak prints `device #N reconnected (...)`, reapplies the current brightness and repaints exactly what was on the buttons before: the current scene, buttons inherited from earlier scenes, and variables are all kept, refreshing buttons resume, and `text_exec`/`image_exec` programs run again. A key held down at the moment of the disconnect is treated as released. Ctrl-C or `SIGTERM` still stops dak while waiting. Only the very first connection at startup failing is fatal for a device; other devices keep running either way.
+When the attempts run out, dak prints `error: device #N did not come back after M attempts; giving up on it; send SIGUSR1 to look for it again` and stops driving that device, releasing its lock; other devices keep running. `SIGUSR1` (`pkill -USR1 -x dak`, `systemctl --user kill -s USR1 dak`) starts a fresh round of attempts. Once no device is left, dak exits with status 4 when run from a terminal; as a service (`--detach`, or under systemd) it keeps running and waits for `SIGUSR1`. Once the device is back, dak prints `device #N reconnected (...)`, reapplies the current brightness and repaints exactly what was on the buttons before: the current scene, buttons inherited from earlier scenes, and variables are all kept, refreshing buttons resume, and `text_exec`/`image_exec` programs run again. A key held down at the moment of the disconnect is treated as released. Ctrl-C or `SIGTERM` still stops dak while waiting. Only the very first connection at startup failing is fatal for a device; other devices keep running either way.
 
 **FreeBSD:** reconnecting may be flaky there and needs more troubleshooting. It worked reliably when the keypad was reset from inside a FreeBSD 15.1 VM (`usbconfig power_off`/`power_on`, `usbconfig reset`), but after unplugging and re-plugging it through VM USB passthrough the keypad once stopped answering and the kernel could not re-enumerate it (`USB_ERR_TIMEOUT`), leaving dak waiting for a device that never came back. It has not been tried on bare-metal FreeBSD yet.
 
@@ -653,6 +653,18 @@ tells systemd when it is ready (`READY=1`, with a `STATUS=` line) and when it is
 stopping. Commands started by actions and `text_exec`/`image_exec` always get
 `/dev/null` as stdin, so a program waiting for input can never hang on the terminal,
 and a failing `text_exec`/`image_exec` program's stderr is quoted in the error.
+
+### Signals
+
+| Signal | Effect |
+|---|---|
+| `SIGINT` (Ctrl-C), `SIGTERM` | stop cleanly: clear the changed buttons, shut the keypads down, exit 0; a second one exits at once |
+| `SIGHUP` | reload: reopen the log file, re-read the config; an invalid one is reported and the running one kept, a valid one replaces logging and restarts every keypad from `on_start` with fresh variables (locks of keypads still used are kept, new ones are picked up) |
+| `SIGUSR1` | rescan: keypads that gave up reconnecting try again, configured keypads that were missing or busy are looked for again; running ones are left alone |
+
+When no configured keypad is available, dak exits with status 4 from a terminal but
+keeps running (waiting for `SIGUSR1`) as a service, so a keypad plugged in later can be
+picked up without a restart loop.
 
 ### One dak per keypad
 

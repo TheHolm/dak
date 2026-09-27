@@ -1019,8 +1019,15 @@ seconds, for up to
 .B device_reconnect_max_attempts
 attempts (0 means forever). When they run out it reports
 \(lqdevice #\fIN\fR did not come back after \fIM\fR attempts; giving up on it\(rq
-and stops driving that device; the others keep running, and once none is left
-dak exits with status 4. When the device is back dak prints
+and stops driving that device, releasing its lock; the others keep running.
+Sending
+.B SIGUSR1
+starts a fresh round of attempts. Once no device is left, dak exits with
+status 4 when run from a terminal, and keeps waiting for
+.B SIGUSR1
+when running as a service (see
+.BR dak (1)).
+When the device is back dak prints
 \(lqdevice #\fIN\fR reconnected ...\(rq. It then reapplies the current brightness and repaints what
 the buttons showed before: the current scene, buttons inherited from earlier
 scenes and all variables are kept, refreshing buttons resume, and
@@ -1090,8 +1097,10 @@ is expanded. Defaults to
 else
 .IR ~/.local/state/dak/dak.log .
 Missing directories are created (mode 0700) and the file is created with mode
-0600. A file that cannot be opened stops the program at startup. Setting it
-without the
+0600. A file that cannot be opened stops the program at startup. It is
+reopened on
+.BR SIGHUP ,
+so it can be rotated. Setting it without the
 .B file
 output only produces a warning.
 .TP

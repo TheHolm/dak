@@ -23,7 +23,7 @@ bindings distinguish short presses, long presses and double clicks, encoders bin
 per rotation notch, and each scene may run a timer. See dak-config(5) for the configuration \
 file format.\n\n\
 dak is a command-line-only tool: a config file plus a binary, with no GUI. It runs until it \
-is told to stop (Ctrl-C, SIGTERM or SIGHUP) or its devices are gone, then restores the button \
+is told to stop (Ctrl-C or SIGTERM) or its devices are gone, then restores the button \
 images it changed and shuts the devices down."
 )]
 pub struct Cli {
@@ -69,7 +69,8 @@ also need their subsystem enabled with -d or logging.debug"
         value_name = "PATH",
         help = "Also append log lines to PATH",
         long_help = "Also append log lines, each with a timestamp, to PATH (created with its \
-directory when missing), in addition to the configured outputs; replaces logging.file"
+directory when missing), in addition to the configured outputs; replaces logging.file. The file \
+is reopened on SIGHUP, for log rotation"
     )]
     pub log_file: Option<PathBuf>,
 

@@ -101,8 +101,15 @@ under other platforms.
   in `main.rs` counts each device task's `StartSignal` (connected / waiting for a lock)
   and reports READY once all have reported or ended. `tests/daemon.rs` runs the binary
 - `src/control.rs` — signal handling: one task (`spawn_signal_handler`) owns the
-  SIGINT/SIGTERM/SIGHUP listeners for the program's whole life and records requests
-  in a `Controller` (a second quit exits at once); device tasks get a level-triggered
+  SIGINT/SIGTERM/SIGHUP/SIGUSR1 listeners for the program's whole life and records
+  requests in a `Controller` (quit flag; reload and rescan counters, so bursts
+  collapse; a second quit exits at once). `main.rs`'s `Supervisor` owns the device
+  tasks (a `JoinSet`), a `LockTable` of held device locks, and a per-generation
+  `StopSource`: SIGHUP validates the config, reinstalls logging, stops and restarts
+  every task (keeping locks still needed); SIGUSR1 starts tasks for missing devices,
+  while a task that gave up reconnecting parks (`park_until_rescan`: releases its lock,
+  waits for a rescan, relocks). Foreground exits 4 when idle; `--detach`/systemd
+  (`service_mode`) keep waiting. Device tasks get a level-triggered
   `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
   themselves, so a signal arriving mid-event is never lost. `main` is a plain
   function that loads the config before building the tokio runtime by hand
@@ -183,8 +190,10 @@ under other platforms.
 
 Work in progress. Current known issues:
 
-- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop) is
-  only unit-tested through its pieces (`SwappableDevice`, `wait_until`,
+- `run_device`'s reconnect path (`await_reconnect`, the `'connection` loop,
+  parking after giving up) and a SIGHUP reload restarting a live device session are
+  only tested through their pieces (`park_until_rescan`, `LockTable`, the
+  device-less reload/rescan runs in `tests/daemon.rs`) and (`SwappableDevice`, `wait_until`,
   `SceneRunner::redraw_all`, `current_brightness`); the end-to-end
   disconnect/rediscover/repaint sequence needs real hardware being unplugged
 - `main.rs`'s scene/action dispatch loop (`run_device`) and the `--map` wizard's

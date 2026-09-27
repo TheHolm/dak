@@ -171,8 +171,34 @@ device down and exit with status 0. A second one while that cleanup is
 still running exits at once with status 1.
 .TP
 .B SIGHUP
-Stops cleanly, like
-.BR SIGTERM .
+Reload: reopen the log file (for log rotation) and re\-read the
+configuration. When it is invalid the errors are logged and the running
+configuration is kept. When it is valid, logging is set up from it again and
+every device is restarted with it, from its
+.B on_start
+scene with the variables at their initial values; devices still in use keep
+their lock, and newly defined or plugged\-in ones are picked up.
+.TP
+.B SIGUSR1
+Rescan: devices that gave up reconnecting (see
+.B device_reconnect_max_attempts
+in
+.BR dak\-config (5))
+start a fresh round of attempts, and configured devices that were not found
+or were in use by another instance are looked for again. Running devices are
+left alone. A device that has given up releases its lock, so another
+instance may take it in the meantime.
+.PP
+When no configured device is attached (at startup, or once every device has
+given up),
+.B dak
+exits with status 4 when run from a terminal, but keeps running and waits for
+.B SIGUSR1
+when it runs as a service: with
+.BR \-\-detach ,
+or under systemd
+.RB ( NOTIFY_SOCKET
+set).
 .SH "EXIT STATUS"
 .TP
 .B 0
@@ -192,7 +218,8 @@ validation. Restarting will not help until it is fixed.
 .TP
 .B 4
 No configured device found: no device defined in the configuration is
-attached, or every one was lost and given up on.
+attached, or every one was lost and given up on (in the foreground only; see
+.BR SIGNALS ).
 .TP
 .B 5
 Every configured device that was found is held by another running
