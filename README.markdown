@@ -29,6 +29,8 @@ Options:
   -c, --config <CONFIG>   Path to the config file; when omitted, `config.json` is
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
+                          (skipping one there that is not yours or that others
+                          can write to)
   -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action, fonts
       --log-level <LEVEL> Log level: error, warning, info or debug
       --log-file <PATH>   Also append log lines (timestamped) to PATH
@@ -447,7 +449,7 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
 - `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background`, `text_color` and `markup`:
   - `{"type":"image","params":"path"}` — load an image from `path` onto the button. PNG, JPEG, GIF, BMP, ICO, WebP and PNM are read; an image may be at most 4096 pixels wide and high (larger ones are refused, big ones scaled down first). The same applies to `image_exec` output.
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
-  - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied
+  - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied. As for `image`, `path` must be a regular file (a device or FIFO is refused) and is read within 5 seconds.
   - `{"type":"text_value","params":"text"}` — display `text` directly (after `$` references are expanded), without reading a file or running a program. This is the simplest way to show a variable's value, e.g. `{"type":"text_value","params":"$defaults.button_brightness%"}`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 columns of its first 3 lines, with markup); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
@@ -662,7 +664,7 @@ never need it:
 | Key | Meaning | Default |
 |---|---|---|
 | `output` | one or more of `console`, `journal` (stderr with `<N>` priority prefixes), `syslog`, `file`; or `auto` alone | `"auto"` |
-| `file` | log file for the `file` output; `~` is expanded, the directory is created | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
+| `file` | log file for the `file` output; `~` is expanded, the directory is created; a symlink, hard link, other user's file or non-regular file is refused | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
 | `syslog_facility` | syslog facility | `user` |
 | `level` | most detailed level written; errors are always written, `warning` also hides the banner and connect lines | `info` |
 | `debug` | debug subsystems (`device`, `scene`, `actions`, `fonts`); written only at level `debug` | none |

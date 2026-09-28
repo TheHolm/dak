@@ -56,11 +56,36 @@ pub fn decode_as(bytes: &[u8], format: ImageFormat) -> ImageResult<DynamicImage>
 
 /// Opens and decodes the image file at `path` (format from its content, else its
 /// extension), within the limits, and shrinks it to at most [`WORKING_SIZE`]. Blocking:
-/// call it off the async runtime's worker threads.
+/// call it off the async runtime's worker threads. Only regular files are read (see
+/// [`open_regular_file`]).
 pub fn open(path: &Path) -> ImageResult<DynamicImage> {
-    let mut reader = ImageReader::open(path)?.with_guessed_format()?;
+    let file = std::io::BufReader::new(open_regular_file(path)?);
+    let mut reader = ImageReader::new(file);
+    if let Ok(format) = ImageFormat::from_path(path) {
+        reader.set_format(format);
+    }
+    let mut reader = reader.with_guessed_format()?;
     reader.limits(limits());
     Ok(shrink(reader.decode()?))
+}
+
+/// Opens `path` for reading if it is a regular file. The open does not block (a FIFO
+/// without a writer, or a device, would otherwise hang it) and anything that is not a
+/// regular file is refused, so a path that comes from a variable cannot make dak wait
+/// forever on it.
+pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 /// `image` unchanged when it fits in [`WORKING_SIZE`], else scaled down (keeping its
@@ -179,6 +204,25 @@ mod tests {
         assert!(!ImageFormat::Tiff.reading_enabled());
         assert!(!ImageFormat::OpenExr.reading_enabled());
         assert!(!ImageFormat::Avif.reading_enabled());
+    }
+
+    /// Only regular files are opened: a FIFO (which would block a plain open until a
+    /// writer appears) and a directory are refused at once.
+    #[test]
+    fn only_regular_files_are_opened() {
+        let dir = std::env::temp_dir().join(format!("dak_regular_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo.png");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let error = open_regular_file(&fifo).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(open(&fifo).is_err());
+        assert!(open_regular_file(&dir).is_err());
+        let file = dir.join("f");
+        std::fs::write(&file, "x").unwrap();
+        assert!(open_regular_file(&file).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `decode_as` and `open` apply the same limits and shrinking.

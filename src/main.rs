@@ -90,7 +90,11 @@ fn run(cli: Cli, log: Log) -> u8 {
         };
     }
 
-    let config_path = absolute_config_path(&actions::resolve_config_path(cli.config.as_deref()));
+    let choice = actions::resolve_config_path(cli.config.as_deref());
+    for warning in &choice.warnings {
+        log.warn(warning);
+    }
+    let config_path = absolute_config_path(&choice.path);
     log.info(format!("Using config: {}", config_path.display()));
     let config = match actions::load_config_from_path(&config_path.to_string_lossy()) {
         Ok(config) => config,

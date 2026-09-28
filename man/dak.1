@@ -14,7 +14,7 @@ dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It 
 .SH OPTIONS
 .TP
 \fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR
-Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory
+Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory. A config runs commands as you, so one in the current or the binary directory is skipped (with a warning) when it is not owned by you or it or its directory can be written by other users; a doubtful one in `~/.config/dak/` or given here is loaded with a warning
 .TP
 \fB\-d\fR, \fB\-\-debug\fR \fI<DEBUG>...\fR
 Debug subsystems to enable: device, scene, action, fonts (the fonts in use and the characters configured fonts cannot draw; silent without defaults.fonts). The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive

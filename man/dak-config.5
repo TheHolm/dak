@@ -702,7 +702,8 @@ and
 .TP
 .B image
 .IB params " is a path"
-to an image file to load onto the button. The formats read are PNG, JPEG, GIF,
+to an image file to load onto the button. It must be a regular file (a device
+or FIFO is refused), read within 5 seconds. The formats read are PNG, JPEG, GIF,
 BMP, ICO, WebP and PNM (the netpbm formats). An image may be at most 4096
 pixels wide and high; larger ones are refused as an error, and big ones are
 scaled down before they are drawn.
@@ -1164,7 +1165,9 @@ is expanded. Defaults to
 else
 .IR ~/.local/state/dak/dak.log .
 Missing directories are created (mode 0700) and the file is created with mode
-0600. A file that cannot be opened stops the program at startup. It is
+0600. A symlink, a file with more than one hard link, a file owned by another
+user or anything that is not a regular file is refused. A file that cannot be
+opened stops the program at startup. It is
 reopened on
 .BR SIGHUP ,
 so it can be rotated. Setting it without the

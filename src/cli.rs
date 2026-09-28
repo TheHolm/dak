@@ -34,7 +34,10 @@ pub struct Cli {
         long,
         help = "Path to the config file",
         long_help = "Path to the config file. When omitted, `config.json` is searched for in \
-`~/.config/dak/`, then the current directory, then the binary directory"
+`~/.config/dak/`, then the current directory, then the binary directory. A config runs \
+commands as you, so one in the current or the binary directory is skipped (with a \
+warning) when it is not owned by you or it or its directory can be written by other \
+users; a doubtful one in `~/.config/dak/` or given here is loaded with a warning"
     )]
     pub config: Option<PathBuf>,
 

@@ -222,6 +222,46 @@ fn config_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Why the config file at `path` might have been written by someone other than the user
+/// running dak (`euid`), or `None` when it cannot have been: the file is not owned by
+/// `euid`, or the file or its directory is writable by group or others (then anyone in
+/// that group, or anybody, could have replaced it). A file that cannot be inspected is
+/// not a problem here; loading reports it.
+pub fn config_file_problem(path: &Path, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let file = fs::metadata(path).ok()?;
+    if file.uid() != euid {
+        return Some(format!("it is owned by uid {}, not by you", file.uid()));
+    }
+    if file.mode() & 0o022 != 0 {
+        return Some(format!(
+            "it can be written by other users (mode {:o})",
+            file.mode() & 0o777
+        ));
+    }
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let dir = dir.unwrap_or(Path::new("."));
+    if let Ok(meta) = fs::metadata(dir) {
+        if meta.mode() & 0o022 != 0 {
+            return Some(format!(
+                "its directory {} can be written by other users (mode {:o})",
+                dir.display(),
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    None
+}
+
+/// The config file to load, plus warnings about the choice.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfigChoice {
+    /// The file to load.
+    pub path: PathBuf,
+    /// Warnings: loose permissions on the chosen file, or candidates that were skipped.
+    pub warnings: Vec<String>,
+}
+
 /// Picks the config file to load.
 ///
 /// An explicitly provided `explicit` path wins as-is. Otherwise the first existing
@@ -229,29 +269,70 @@ fn config_search_dirs() -> Vec<PathBuf> {
 /// them contains a config, the first directory's candidate is returned so loading
 /// reports the missing file instead of guessing a location, and an empty directory
 /// list falls back to a bare `config.json` in the current directory.
-pub fn pick_config_path(explicit: Option<&Path>, dirs: &[PathBuf]) -> PathBuf {
+///
+/// A config runs commands as the user, so where it comes from matters
+/// ([`config_file_problem`]): the explicit path and the first directory (the user's own
+/// `~/.config/dak`) are loaded with a warning when their ownership or permissions are
+/// loose, while a later directory's file (the current directory's, the binary's) is
+/// skipped with a warning then - running dak in someone else's directory must not run
+/// their commands.
+pub fn pick_config_path(explicit: Option<&Path>, dirs: &[PathBuf], euid: u32) -> ConfigChoice {
+    let mut warnings = Vec::new();
+    let loose = |path: &Path, problem: String| {
+        format!(
+            "config {} may have been written by someone else: {problem}",
+            path.display()
+        )
+    };
     if let Some(path) = explicit {
-        return path.to_path_buf();
-    }
-    for dir in dirs {
-        let candidate = dir.join(DEFAULT_CONFIG_FILE);
-        if candidate.exists() {
-            return candidate;
+        if let Some(problem) = config_file_problem(path, euid) {
+            warnings.push(loose(path, problem));
         }
+        return ConfigChoice {
+            path: path.to_path_buf(),
+            warnings,
+        };
     }
-    dirs.first()
-        .map(|dir| dir.join(DEFAULT_CONFIG_FILE))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE))
+    for (index, dir) in dirs.iter().enumerate() {
+        let candidate = dir.join(DEFAULT_CONFIG_FILE);
+        if !candidate.exists() {
+            continue;
+        }
+        match config_file_problem(&candidate, euid) {
+            None => {}
+            Some(problem) if index == 0 => warnings.push(loose(&candidate, problem)),
+            Some(problem) => {
+                warnings.push(format!(
+                    "ignoring config {}: {problem} (use --config to load it anyway)",
+                    candidate.display()
+                ));
+                continue;
+            }
+        }
+        return ConfigChoice {
+            path: candidate,
+            warnings,
+        };
+    }
+    ConfigChoice {
+        path: dirs
+            .first()
+            .map(|dir| dir.join(DEFAULT_CONFIG_FILE))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE)),
+        warnings,
+    }
 }
 
 /// Resolves the config file the program should load.
 ///
 /// An explicitly passed path (from `-c`/`--config`) is used as-is; without one the
-/// first existing `config.json` wins from the [`config_search_dirs`] order —
-/// `~/.config/dak/`, then the current directory, then the binary's directory. See
-/// [`pick_config_path`] for the no-match behaviour.
-pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
-    pick_config_path(explicit, &config_search_dirs())
+/// first existing, trustworthy `config.json` wins from the [`config_search_dirs`] order
+/// — `~/.config/dak/`, then the current directory, then the binary's directory. See
+/// [`pick_config_path`] for the checks and the no-match behaviour.
+pub fn resolve_config_path(explicit: Option<&Path>) -> ConfigChoice {
+    // SAFETY: geteuid cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    pick_config_path(explicit, &config_search_dirs(), euid)
 }
 
 /// Loads, parses and validates the config file at `path`.
@@ -3779,11 +3860,20 @@ async fn load_image_file(
     path: &str,
 ) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
     let path = PathBuf::from(path);
-    let result = tokio::task::spawn_blocking(move || crate::imaging::open(&path))
+    let shown = path.display().to_string();
+    let task = tokio::task::spawn_blocking(move || crate::imaging::open(&path));
+    let result = tokio::time::timeout(FILE_READ_TIMEOUT, task)
         .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("reading {shown} took longer than {FILE_READ_TIMEOUT:?}").into()
+        })?
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
 }
+
+/// How long reading an `image` or `text` entry's file may take before it is given up
+/// (the device loop waits for it; a stalled network file system must not freeze it).
+pub const FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Decodes `image_exec` output (see [`crate::imaging::decode`]) off the async runtime's
 /// worker thread, since decoding is CPU-bound.
@@ -3796,8 +3886,9 @@ async fn decode_image_output(
     result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
 }
 
-/// Reads at most [`MAX_TEXT_FILE_BYTES`] from `path`, using `tokio::fs` so a large or
-/// slow read never blocks a worker thread; a source with more data than the cap (e.g.
+/// Reads at most [`MAX_TEXT_FILE_BYTES`] from the regular file `path` (see
+/// [`crate::imaging::open_regular_file`]) within [`FILE_READ_TIMEOUT`], using `tokio::fs`
+/// so a large or slow read never blocks a worker thread; a source with more data than the cap (e.g.
 /// `/dev/zero`) simply stops there instead of reading forever. Bytes are decoded
 /// lossily, since a `text` entry only ever shows the first few lines, so invalid UTF-8
 /// anywhere in a large file is not worth failing the whole read over.
@@ -3805,9 +3896,17 @@ async fn read_text_file_bounded(
     path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path).await?;
+    let owned = PathBuf::from(path);
+    let file =
+        tokio::task::spawn_blocking(move || crate::imaging::open_regular_file(&owned)).await??;
+    let file = tokio::fs::File::from_std(file);
     let mut buf = Vec::new();
-    file.take(MAX_TEXT_FILE_BYTES).read_to_end(&mut buf).await?;
+    tokio::time::timeout(
+        FILE_READ_TIMEOUT,
+        file.take(MAX_TEXT_FILE_BYTES).read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| format!("reading {path} took longer than {FILE_READ_TIMEOUT:?}"))??;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -4863,6 +4962,98 @@ mod tests {
         PathBuf::from(dir)
     }
 
+    /// This process's effective uid.
+    fn euid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    /// A private file in a private directory has no problem; a file owned by someone
+    /// else, or writable by others, or in a directory writable by others, has one.
+    #[test]
+    fn config_file_problems() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::config_file_problem(&file, euid()), None);
+        let other = super::config_file_problem(&file, euid().wrapping_add(1)).unwrap();
+        assert!(other.contains("not by you"), "{other}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let writable = super::config_file_problem(&file, euid()).unwrap();
+        assert!(writable.contains("mode 664"), "{writable}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let open_dir = super::config_file_problem(&file, euid()).unwrap();
+        assert!(open_dir.contains("directory"), "{open_dir}");
+        assert_eq!(
+            super::config_file_problem(&dir.join("missing.json"), euid()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A doubtful config in a later search directory (the current or the binary's
+    /// directory) is skipped with a warning, so a trustworthy one after it - or the
+    /// missing-file fallback - is used instead.
+    #[test]
+    fn pick_config_path_skips_doubtful_later_configs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir();
+        let shared = temp_dir();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::write(shared.join("config.json"), "{}").unwrap();
+        let picked = super::pick_config_path(None, &[home.clone(), shared.clone()], euid());
+        assert_eq!(picked.path, home.join("config.json"));
+        assert_eq!(picked.warnings.len(), 1);
+        assert!(
+            picked.warnings[0].contains("ignoring config"),
+            "{:?}",
+            picked.warnings
+        );
+
+        // Owned by someone else: skipped too.
+        let other = temp_dir();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(other.join("config.json"), "{}").unwrap();
+        std::fs::set_permissions(
+            other.join("config.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let picked =
+            super::pick_config_path(None, &[home.clone(), other.clone()], euid().wrapping_add(1));
+        assert_eq!(picked.path, home.join("config.json"));
+        assert!(picked.warnings[0].contains("not by you"));
+        // ...while the same file is fine for its owner.
+        let picked = super::pick_config_path(None, &[home.clone(), other.clone()], euid());
+        assert_eq!(picked.path, other.join("config.json"));
+        assert!(picked.warnings.is_empty(), "{:?}", picked.warnings);
+        for dir in [home, shared, other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The user's own directory and an explicit path are loaded even when doubtful,
+    /// with a warning.
+    #[test]
+    fn pick_config_path_warns_about_doubtful_own_configs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = home.join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let picked = super::pick_config_path(None, std::slice::from_ref(&home), euid());
+        assert_eq!(picked.path, config);
+        assert!(picked.warnings[0].contains("may have been written by someone else"));
+        let picked = super::pick_config_path(Some(&config), &[], euid());
+        assert_eq!(picked.path, config);
+        assert_eq!(picked.warnings.len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// An explicitly given config path wins as-is, even if the search directories
     /// hold a config or are completely unrelated.
     #[test]
@@ -4872,8 +5063,8 @@ mod tests {
         std::fs::write(&config, "{}").unwrap();
         let explicit = Path::new("/some/elsewhere/custom.json");
 
-        let picked = super::pick_config_path(Some(explicit), std::slice::from_ref(&dir));
-        assert_eq!(picked, explicit);
+        let picked = super::pick_config_path(Some(explicit), std::slice::from_ref(&dir), euid());
+        assert_eq!(picked.path, explicit);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4885,8 +5076,8 @@ mod tests {
         std::fs::write(first.join("config.json"), "{}").unwrap();
         std::fs::write(second.join("config.json"), "{}").unwrap();
 
-        let picked = super::pick_config_path(None, &[first.clone(), second.clone()]);
-        assert_eq!(picked, first.join("config.json"));
+        let picked = super::pick_config_path(None, &[first.clone(), second.clone()], euid());
+        assert_eq!(picked.path, first.join("config.json"));
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -4894,12 +5085,21 @@ mod tests {
     /// Directories without a config are skipped, so a later directory with one wins.
     #[test]
     fn pick_config_path_skips_dirs_without_config() {
+        use std::os::unix::fs::PermissionsExt;
         let empty_dir = temp_dir();
         let with_config = temp_dir();
         std::fs::write(with_config.join("config.json"), "{}").unwrap();
+        // Private whatever the umask, so the later directory's config is trusted.
+        std::fs::set_permissions(&with_config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            with_config.join("config.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
-        let picked = super::pick_config_path(None, &[empty_dir.clone(), with_config.clone()]);
-        assert_eq!(picked, with_config.join("config.json"));
+        let picked =
+            super::pick_config_path(None, &[empty_dir.clone(), with_config.clone()], euid());
+        assert_eq!(picked.path, with_config.join("config.json"));
         let _ = std::fs::remove_dir_all(&empty_dir);
         let _ = std::fs::remove_dir_all(&with_config);
     }
@@ -4911,8 +5111,8 @@ mod tests {
         let first = temp_dir();
         let second = temp_dir();
 
-        let picked = super::pick_config_path(None, &[first.clone(), second.clone()]);
-        assert_eq!(picked, first.join("config.json"));
+        let picked = super::pick_config_path(None, &[first.clone(), second.clone()], euid());
+        assert_eq!(picked.path, first.join("config.json"));
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -4921,7 +5121,7 @@ mod tests {
     #[test]
     fn pick_config_path_falls_back_to_bare_name() {
         assert_eq!(
-            super::pick_config_path(None, &[]),
+            super::pick_config_path(None, &[], euid()).path,
             PathBuf::from("config.json")
         );
     }
@@ -4931,7 +5131,7 @@ mod tests {
     fn resolve_config_path_passes_explicit_path_through() {
         let explicit = Path::new("/opt/custom/settings.json");
         assert_eq!(
-            super::resolve_config_path(Some(explicit)),
+            super::resolve_config_path(Some(explicit)).path,
             explicit.to_path_buf()
         );
     }
@@ -4948,7 +5148,7 @@ mod tests {
 
         let picked = super::resolve_config_path(None);
 
-        assert_eq!(picked, home_config);
+        assert_eq!(picked.path, home_config);
         let _ = std::fs::remove_dir_all(&home);
     }
 

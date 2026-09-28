@@ -805,12 +805,40 @@ fn open_log_file(path: &Path) -> Result<File, String> {
                 format!("cannot create log directory {}: {error}", parent.display())
             })?;
     }
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
+        // A symlink planted at the path (in a shared directory, say) must not make dak
+        // append to - or create - a file somewhere else.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
-        .map_err(|error| format!("cannot open log file {}: {error}", path.display()))
+        .map_err(|error| format!("cannot open log file {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot open log file {}: {error}", path.display()))?;
+    // SAFETY: geteuid cannot fail.
+    check_log_file(&metadata, unsafe { libc::geteuid() })
+        .map_err(|problem| format!("refusing log file {}: {problem}", path.display()))?;
+    Ok(file)
+}
+
+/// Why an opened log file must not be written to, if at all: it is not a regular file
+/// (a FIFO or device), has more than one hard link (someone may have linked another
+/// file of yours to the log's name), or belongs to someone else (who could then read
+/// it, or had it prepared).
+fn check_log_file(metadata: &std::fs::Metadata, euid: u32) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.file_type().is_file() {
+        return Err("not a regular file".to_string());
+    }
+    if metadata.nlink() != 1 {
+        return Err(format!("it has {} hard links", metadata.nlink()));
+    }
+    if metadata.uid() != euid {
+        return Err(format!("it is owned by uid {}, not by you", metadata.uid()));
+    }
+    Ok(())
 }
 
 /// The set of open outputs every line is written to.
@@ -1396,6 +1424,59 @@ mod tests {
     fn unopenable_log_file_is_an_error() {
         let error = FileSink::open(Path::new("/proc/definitely/not/here.log")).unwrap_err();
         assert!(error.contains("/proc/definitely"), "{error}");
+    }
+
+    /// A symlink, a hard link or a FIFO planted at the log path is refused, and the
+    /// file a link points to is left untouched; reopening applies the same checks.
+    #[test]
+    fn planted_log_files_are_refused() {
+        let dir = scratch_dir("planted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+
+        let symlink = dir.join("symlink.log");
+        std::os::unix::fs::symlink(&victim, &symlink).unwrap();
+        assert!(FileSink::open(&symlink).is_err());
+        let dangling = dir.join("dangling.log");
+        std::os::unix::fs::symlink(dir.join("created-elsewhere"), &dangling).unwrap();
+        assert!(FileSink::open(&dangling).is_err());
+        assert!(!dir.join("created-elsewhere").exists());
+
+        let hardlink = dir.join("hardlink.log");
+        std::fs::hard_link(&victim, &hardlink).unwrap();
+        let error = FileSink::open(&hardlink).unwrap_err();
+        assert!(error.contains("hard links"), "{error}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+
+        let fifo = dir.join("fifo.log");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // Without a reader the non-blocking open itself fails (ENXIO); with one the
+        // regular-file check would. Either way it is refused without hanging.
+        assert!(FileSink::open(&fifo).is_err());
+
+        let path = dir.join("ok.log");
+        let sink = FileSink::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&victim, &path).unwrap();
+        assert!(sink.reopen().is_err(), "reopen checks too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A log file owned by someone else is refused.
+    #[test]
+    fn foreign_log_files_are_refused() {
+        let dir = scratch_dir("foreign");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.log");
+        std::fs::write(&path, "").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(check_log_file(&metadata, euid), Ok(()));
+        let error = check_log_file(&metadata, euid.wrapping_add(1)).unwrap_err();
+        assert!(error.contains("not by you"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A log directory that cannot be created (a regular file is in the way) is

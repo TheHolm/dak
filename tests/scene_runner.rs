@@ -646,13 +646,61 @@ async fn text_op_renders_button_text_and_flushes() {
     let _ = std::fs::remove_file(&text_path);
 }
 
-/// A `text` operation reading from an infinite source (`/dev/zero`) does not hang or
-/// grow memory without bound: the read is capped at `MAX_TEXT_FILE_BYTES`, so it
-/// completes quickly and successfully (null bytes are valid UTF-8; there is nothing
-/// here to fail on) instead of blocking forever waiting for an EOF `/dev/zero` never
-/// produces.
+/// A `text` or `image` entry naming something that is not a regular file - a device
+/// that never ends (`/dev/zero`) or a FIFO no one writes to, which a plain open would
+/// wait on forever - is refused at once: the button shows the error label and the
+/// scene carries on.
 #[tokio::test]
-async fn text_op_from_dev_zero_completes_quickly_instead_of_hanging() {
+async fn text_and_image_ops_refuse_non_regular_files_without_hanging() {
+    let fifo = std::env::temp_dir().join(format!("dak_runner_fifo_{}", std::process::id()));
+    let _ = std::fs::remove_file(&fifo);
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    for (kind, path) in [
+        ("text", "/dev/zero"),
+        ("text", fifo.to_str().unwrap()),
+        ("image", "/dev/zero"),
+        ("image", fifo.to_str().unwrap()),
+    ] {
+        let mock = MockButtonDevice::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+        let mut runner = SceneRunner::new(
+            1,
+            &mock,
+            FORMAT,
+            tx,
+            refresh_tx,
+            Log::default(),
+            &HashSet::new(),
+            Defaults::default().background,
+            Defaults::default().text_color,
+        );
+        let scenes = scenes_with_buttons(json!({
+            "1b01": { "type": kind, "params": path }
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runner.enter_scene("main", &scenes),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{kind} {path} hung"))
+        .unwrap();
+        // The error label (SetImage + Flush), then the scene's own flush.
+        let calls = mock.calls();
+        assert_eq!(
+            mock.kinds(&calls),
+            ["SetImage", "Flush", "Flush"],
+            "{kind} {path}"
+        );
+    }
+    let _ = std::fs::remove_file(&fifo);
+}
+
+/// A huge regular `text` file is read only up to `MAX_TEXT_FILE_BYTES`, quickly.
+#[tokio::test]
+async fn text_op_reads_a_huge_file_only_partly() {
+    let path = write_temp_text(&"x".repeat(4 * 1024 * 1024));
     let mock = MockButtonDevice::default();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
@@ -667,22 +715,18 @@ async fn text_op_from_dev_zero_completes_quickly_instead_of_hanging() {
         Defaults::default().background,
         Defaults::default().text_color,
     );
-
     let scenes = scenes_with_buttons(json!({
-        "1b01": { "type": "text", "params": "/dev/zero" }
+        "1b01": { "type": "text", "params": path.to_str().unwrap() }
     }));
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         runner.enter_scene("main", &scenes),
     )
     .await
-    .expect("reading /dev/zero must not hang past MAX_TEXT_FILE_BYTES")
+    .expect("a large file is read only partly")
     .unwrap();
-
-    // A capped read of null bytes is not a failure - the button draws (a boring,
-    // effectively blank) image rather than the red "Error" label.
-    let calls = mock.calls();
-    assert_eq!(mock.kinds(&calls), ["SetImage", "Flush"]);
+    assert_eq!(mock.kinds(&mock.calls()), ["SetImage", "Flush"]);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A `clear` operation stages the empty image under the 0-based key and flushes.
