@@ -1182,6 +1182,9 @@ async fn run_device(
         refresh_rx,
     };
 
+    // Counts recent disconnects so a device that keeps dropping off is slowed down.
+    let flapping = std::sync::Mutex::new(reconnect::Flapping::new());
+
     // One pass per connection: the input loop runs until the program is told to stop
     // (a stop signal, a closed channel) or the device goes away; then this waits for the
     // device to come back, swaps the new connection in, repaints and loops again.
@@ -1206,6 +1209,7 @@ async fn run_device(
                 reconnect_policy,
                 &stop,
                 &park,
+                &flapping,
             )
             .await
             {
@@ -1238,6 +1242,7 @@ async fn run_device(
                     reconnect_policy,
                     &stop,
                     &park,
+                    &flapping,
                 )
                 .await
                 {
@@ -1388,7 +1393,14 @@ struct Session<'r, D: ButtonDevice> {
     timer_handle: Option<tokio::task::JoinHandle<()>>,
     /// Where the scene timer delivers its actions.
     timer_tx: mpsc::Sender<Vec<String>>,
+    /// Drops input beyond [`dak::limits::MAX_EVENTS_PER_SECOND`] per control, so a
+    /// misbehaving device cannot fire actions at the USB polling rate.
+    limiter: dak::limits::EventLimiter,
 }
+
+/// Throttles the "dropping input" warning of every device.
+static FLOOD_WARNING: dak::limits::Throttle =
+    dak::limits::Throttle::new(std::time::Duration::from_secs(10));
 
 impl<'r, D: ButtonDevice> Session<'r, D> {
     /// A session in the `on_start` scene (not yet drawn, see
@@ -1422,6 +1434,7 @@ impl<'r, D: ButtonDevice> Session<'r, D> {
             pending_shorts: HashMap::new(),
             timer_handle: None,
             timer_tx,
+            limiter: dak::limits::EventLimiter::new(),
         }
     }
 
@@ -1470,7 +1483,11 @@ impl<'r, D: ButtonDevice> Session<'r, D> {
                 if pressed { "pressed" } else { "released" }
             ),
         );
-        match route(&self.definition, self.device_number, code, pressed, log) {
+        let dispatch = route(&self.definition, self.device_number, code, pressed, log);
+        if !self.allowed(&dispatch, pressed) {
+            return;
+        }
+        match dispatch {
             Some(Dispatch::Edge(reference)) => {
                 run_pressable_edge(
                     log,
@@ -1496,6 +1513,27 @@ impl<'r, D: ButtonDevice> Session<'r, D> {
             }
             None => {}
         }
+    }
+
+    /// Whether `dispatch` is within the per-control input rate limit; a dropped event is
+    /// reported by a warning at most every few seconds.
+    fn allowed(&mut self, dispatch: &Option<Dispatch>, pressed: bool) -> bool {
+        let now = std::time::Instant::now();
+        let allowed = match dispatch {
+            Some(Dispatch::Edge(reference)) => self.limiter.allow_edge(*reference, pressed, now),
+            Some(Dispatch::Turn(reference, _)) => self.limiter.allow_turn(*reference, now),
+            None => true,
+        };
+        if !allowed && FLOOD_WARNING.ready(now) {
+            self.log.warn(format!(
+                "device #{}: ignoring input beyond {} events per second per control ({} \
+                 dropped); the keypad may be misbehaving",
+                self.device_number,
+                dak::limits::MAX_EVENTS_PER_SECOND,
+                self.limiter.take_dropped()
+            ));
+        }
+        allowed
     }
 
     /// Runs the actions `reference` has bound to `event` in the current scene.
@@ -1736,9 +1774,24 @@ async fn await_reconnect<R: Reopen>(
     policy: reconnect::ReconnectPolicy,
     stop: &StopSignal,
     park: &Park,
+    flapping: &std::sync::Mutex<reconnect::Flapping>,
 ) -> Reconnect {
     device.mark_disconnected();
     log.warn(reconnect::disconnected_message(device_number, reason));
+    let pause = flapping
+        .lock()
+        .expect("flapping lock poisoned")
+        .on_disconnect(std::time::Instant::now());
+    if !pause.is_zero() {
+        log.warn(format!(
+            "device #{device_number} keeps disconnecting; waiting {}s before reconnecting",
+            pause.as_secs()
+        ));
+        tokio::select! {
+            _ = tokio::time::sleep(pause) => {}
+            _ = stop.stopped() => return Reconnect::Cancelled,
+        }
+    }
     let attempt = |number: u64| async move {
         let of = if policy.max_attempts == 0 {
             format!("attempt {number}")
@@ -2124,10 +2177,21 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
 
 /// Runs an action command on its own task, so a running program never blocks the device
 /// input loop or the scene timer; its outcome is only logged.
+///
+/// Takes one of the shared [`dak::limits::command_slots`] for as long as the program
+/// runs; when none is free the command is not started (with a throttled warning), so a
+/// flood of events cannot start processes without bound.
 fn spawn_action_command(spec: actions::CommandSpec, log: Log) {
     let display = spec.display();
+    let Some(slot) = dak::limits::command_slots().try_take() else {
+        if dak::limits::BUSY_WARNING.ready(std::time::Instant::now()) {
+            log.warn(dak::limits::busy_message(&format!("command \"{display}\"")));
+        }
+        return;
+    };
     log.debug(Subsystem::Actions, format!("run command \"{display}\""));
     tokio::spawn(async move {
+        let _slot = slot;
         match actions::run_action_command(spec).await {
             Ok(()) => log.debug(
                 Subsystem::Actions,
@@ -5658,6 +5722,29 @@ mod tests {
         assert_eq!(session.current_scene, "CW");
     }
 
+    /// A device flooding one control with events gets only
+    /// [`dak::limits::MAX_EVENTS_PER_SECOND`] of them through per second: the rest are
+    /// dropped before any action runs (here: the encoder's scene switches stop).
+    #[tokio::test]
+    async fn session_drops_input_floods() {
+        let mock = MockButtonDevice::default();
+        let (mut session, _channels) = new_session(&mock, Defaults::default());
+        for _ in 0..dak::limits::MAX_EVENTS_PER_SECOND {
+            session.current_scene = "on_start".to_string();
+            session.on_report(&encode_report(81, 0)).await;
+            assert_eq!(session.current_scene, "CW");
+        }
+        session.current_scene = "on_start".to_string();
+        session.on_report(&encode_report(81, 0)).await;
+        assert_eq!(
+            session.current_scene, "on_start",
+            "the flood was not dropped"
+        );
+        // Other controls are not affected.
+        session.on_report(&encode_report(1, 1)).await;
+        assert_eq!(session.current_scene, "P");
+    }
+
     /// The timer, click, exec and refresh events each reach their handler: timer
     /// actions run, a confirmed short press runs `short_press` (none bound here, so
     /// nothing changes), an exec result for a button without a running program is
@@ -5894,6 +5981,7 @@ mod tests {
             quick_policy(0),
             &stop.signal(),
             &park,
+            &std::sync::Mutex::new(super::reconnect::Flapping::new()),
         )
         .await;
         assert_eq!(outcome, Reconnect::Reconnected);
@@ -5912,6 +6000,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A device that keeps disconnecting is made to wait before it is reconnected, and a
+    /// stop during that wait cancels the reconnect.
+    #[tokio::test]
+    async fn await_reconnect_slows_down_a_flapping_device() {
+        let device = SwappableDevice::new(MockButtonDevice::default(), |_| false);
+        let (mut session, _channels) = new_session(&device, Defaults::default());
+        let reopen = ScriptedReopen::new(Vec::new());
+        let (park, _events, dir) = park_fixture(dak::lock::Conflict::Refuse);
+        let stop = dak::control::StopSource::new();
+        let variables = session.variables.clone();
+        let flapping = std::sync::Mutex::new(super::reconnect::Flapping::new());
+        for _ in 0..super::reconnect::FLAP_TOLERANCE {
+            flapping
+                .lock()
+                .unwrap()
+                .on_disconnect(std::time::Instant::now());
+        }
+        let signal = stop.signal();
+        let waiting = super::await_reconnect(
+            1,
+            &reopen,
+            "keypad",
+            &device,
+            &mut session.runner,
+            &variables,
+            Log::default(),
+            "unplugged",
+            quick_policy(0),
+            &signal,
+            &park,
+            &flapping,
+        );
+        let stopper = async {
+            // The pause is at least 1 s.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            stop.stop();
+        };
+        let (outcome, ()) = tokio::join!(waiting, stopper);
+        assert_eq!(outcome, Reconnect::Cancelled);
+        assert!(
+            reopen.brightness.lock().unwrap().is_empty(),
+            "no reconnect attempt during the pause"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// After its last allowed attempt the device task gives up and parks; a stop while
     /// parked ends it as cancelled.
     #[tokio::test]
@@ -5923,6 +6057,7 @@ mod tests {
         let stop = dak::control::StopSource::new();
         let variables = session.variables.clone();
         let signal = stop.signal();
+        let flapping = std::sync::Mutex::new(super::reconnect::Flapping::new());
         let waiting = super::await_reconnect(
             1,
             &reopen,
@@ -5935,6 +6070,7 @@ mod tests {
             quick_policy(2),
             &signal,
             &park,
+            &flapping,
         );
         let stopper = async {
             assert_eq!(events.recv().await, Some(super::TaskEvent::Parked(1)));
@@ -5969,6 +6105,7 @@ mod tests {
             quick_policy(0),
             &stop.signal(),
             &park,
+            &std::sync::Mutex::new(super::reconnect::Flapping::new()),
         )
         .await;
         assert_eq!(outcome, Reconnect::Cancelled);

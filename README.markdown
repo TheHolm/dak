@@ -401,6 +401,20 @@ assignment runs on its own task. So
 assigns the **old** value of `$b` to `$a`, because both commands read `$b` before either
 finishes. Do not rely on the order of independent assignments in one action list.
 
+#### Limits
+
+Keypad input and program output come from outside dak, so its work is bounded:
+
+- at most 50 input events (presses or encoder notches) per control per second are acted
+  on; the rest are dropped with a warning (a dropped press together with its release);
+- at most 32 action commands and `$(command)` assignments run at the same time, across
+  all keypads; an action that would start another is skipped with a warning;
+- `image_exec`/`text_exec`/`$(command)` programs run in their own process group, killed
+  as a whole when the program times out, fails or is no longer needed, so what it started
+  does not outlive it (a program that succeeded may leave background jobs running);
+- a keypad that disconnects more than 5 times within a minute is reconnected only after
+  a pause, from 1 s doubling up to 1 minute.
+
 See `examples/EXAMPLES.md` for complete worked examples, including an encoder that
 changes screen brightness using `bc`.
 
@@ -442,7 +456,7 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `text_color` (optional, colour, default: `defaults.text_color`) — override the glyph colour for this button. Allowed on `text`, `text_value` and `text_exec` only.
   - `markup` (optional, `tmux` or `none`, default: `defaults.markup`) — how this button's text is parsed (see [Text markup](#text-markup)). Allowed on `text`, `text_value` and `text_exec` only; written literally, not `$`-expanded.
   - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `text_value`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
-- `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene. The seconds must be at least `1` (a variable holding less counts as `1`).
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 

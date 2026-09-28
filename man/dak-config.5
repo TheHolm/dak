@@ -858,7 +858,31 @@ value is an action:
 "timer": { "5": "@Main" }
 .RE
 .fi
-The action runs once that many seconds after the scene is entered.
+The action runs once that many seconds after the scene is entered. The
+seconds must be at least 1; a variable that holds less is treated as 1.
+.SS "Limits"
+Keypad input and program output come from outside dak, so its work is
+bounded:
+.IP \(bu 2
+At most 50 input events (presses, or encoder notches) per control per second
+are acted on; the rest are dropped with a warning, a dropped press together
+with its release.
+.IP \(bu 2
+At most 32 action commands and
+.B $(command)
+assignments run at the same time, across all keypads; an action that would
+start another is skipped with a warning.
+.IP \(bu 2
+.BR image_exec ,
+.B text_exec
+and
+.B $(command)
+programs run in their own process group, which is killed as a whole when the
+program times out, fails or is no longer needed, so the programs it started do
+not outlive it. A program that succeeded may leave background jobs running.
+.IP \(bu 2
+A keypad that disconnects more than 5 times within a minute is reconnected
+only after a pause, from 1 second doubling up to 1 minute.
 .SS "Action values"
 An action value is one of:
 .IP \(bu 2

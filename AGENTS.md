@@ -122,6 +122,13 @@ under other platforms.
   `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
   themselves, so a signal arriving mid-event is never lost. `main` is a plain
   function that loads the config before building the tokio runtime by hand
+- `src/limits.rs` — brakes on outside input: `EventLimiter` (per-control events per
+  second, used by `Session::on_report`; a release follows its press's fate),
+  `CommandSlots`/`command_slots()` (concurrent action commands and `$(...)`
+  assignments), `MIN_TIMER_SECONDS`, `Throttle` for repeated warnings. Exec children
+  run in their own process group (`GroupKill` in `actions.rs`), `launch` children are
+  reaped by a waiter thread, and `reconnect::Flapping` slows down a device that keeps
+  disconnecting
 - `src/lock.rs` — one dak per keypad: an `flock(2)` lock file per device
   (`DeviceKey::file_name`, `dak-<vid>-<pid>-<serial>.lock`) in `lock_dir()`
   (`$DAK_LOCK_DIR`, else `/run/lock`, else `/tmp`), holding a `Holder` record (pid,

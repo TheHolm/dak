@@ -1190,10 +1190,15 @@ fn check_timer(
     let (seconds, value) = entries.iter().next().unwrap();
     let seconds_refs = check_references(scene_name, "actions.timer", seconds, variables, errors);
     if seconds_refs.is_empty() {
-        if seconds.parse::<u64>().is_err() {
-            errors.push(format!(
+        match seconds.parse::<u64>() {
+            Err(_) => errors.push(format!(
                 "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
-            ));
+            )),
+            Ok(value) if value < crate::limits::MIN_TIMER_SECONDS => errors.push(format!(
+                "scene \"{scene_name}\": actions.timer key \"{seconds}\" is below the minimum of {} second",
+                crate::limits::MIN_TIMER_SECONDS
+            )),
+            Ok(_) => {}
         }
     } else {
         for reference in &seconds_refs {
@@ -2012,9 +2017,11 @@ pub fn scene_operations_with(
 }
 
 /// Spawns `command` fully detached from this program: its own process group (so terminal
-/// Ctrl-C / SIGHUP never reach it), null stdio, and the child handle is dropped without
-/// waiting or killing — the child keeps running and gets re-parented to the OS init when
-/// this program terminates, so it outlives us.
+/// Ctrl-C / SIGHUP never reach it), null stdio, and never killed — the child keeps
+/// running and gets re-parented to the OS init when this program terminates, so it
+/// outlives us. While we run, a small waiter thread reaps it when it exits, so finished
+/// programs do not pile up as zombies (a scene with a `launch` entered again and again
+/// would otherwise leave one per entry).
 ///
 /// Only implemented for unix (the project's only supported platform family, Linux and
 /// FreeBSD): `process_group` is a unix-only `Command` extension.
@@ -2028,11 +2035,21 @@ pub fn spawn_detached(command: &CommandSpec, log: Log) {
         .stderr(std::process::Stdio::null())
         .spawn();
     match result {
-        Ok(child) => {
-            // Dropping the handle detaches the child from us: it runs on its own,
-            // reparented to init, and is never killed when this program exits.
+        Ok(mut child) => {
             let pid = child.id();
-            drop(child);
+            // Only waits: the child is never killed, and if this program exits first the
+            // thread simply ends with it and init adopts the child.
+            let reaper = std::thread::Builder::new()
+                .name(format!("reap-{pid}"))
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            if let Err(error) = reaper {
+                log.warn(format!(
+                    "\"{display}\" (pid {pid}) will stay a zombie after it exits: {error}"
+                ));
+            }
             log.debug(
                 Subsystem::Actions,
                 format!("launched detached \"{display}\" (pid {pid})"),
@@ -3533,6 +3550,9 @@ pub async fn run_command_with_timeout(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Its own process group, so everything it starts (an `sh -c` pipeline, a
+        // background job) can be killed along with it - see `GroupKill`.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("command \"{display}\" failed to start: {error}"))?;
@@ -3541,7 +3561,10 @@ pub async fn run_command_with_timeout(
     // and blocks on its own write until the timeout. The first bytes are kept for the
     // failure message.
     let stderr = child.stderr.take().expect("stderr pipe was requested");
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
+    let mut stderr_task = AbortOnDrop(tokio::spawn(drain_stderr(stderr)));
+    // Declared after `child`, so when this future is dropped mid-run (the button was
+    // reassigned) the group is killed before the child is reaped.
+    let mut group = GroupKill(child.id().map(|pid| pid as i32));
 
     // Drain stdout *before* waiting for exit, not after: a program producing more than
     // one OS pipe buffer's worth of output blocks on its own `write()` once that buffer
@@ -3573,11 +3596,13 @@ pub async fn run_command_with_timeout(
     let (status, bytes) = match tokio::time::timeout(timeout, run).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(error);
         }
         Err(_) => {
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(format!(
@@ -3587,13 +3612,64 @@ pub async fn run_command_with_timeout(
     };
 
     if !status.success() {
-        let stderr = stderr_task.await.unwrap_or_default();
+        // Something the program started may still hold stderr open: wait for the
+        // excerpt only briefly, then kill what is left of the group.
+        let stderr = match tokio::time::timeout(STDERR_GRACE, &mut stderr_task.0).await {
+            Ok(result) => result.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        group.kill();
         return Err(with_stderr(
             format!("command \"{display}\" exited with {status}"),
             &stderr,
         ));
     }
+    // A program that succeeded may leave background jobs running on purpose.
+    group.disarm();
     Ok(bytes)
+}
+
+/// How long a failed command's stderr is still read after it exited.
+pub const STDERR_GRACE: Duration = Duration::from_millis(500);
+
+/// Aborts the task when dropped, so a helper task never outlives its command.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    /// Aborts the task (a no-op when it already finished).
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Kills a command's whole process group (`SIGKILL`) when dropped or told to, unless
+/// disarmed: `kill_on_drop` only reaches the direct child, not the programs of an
+/// `sh -c` pipeline or background jobs it started.
+///
+/// Safe against pid reuse because it is used before the child is reaped (a pid stays
+/// taken until then), or while other members keep the group alive.
+struct GroupKill(Option<i32>);
+
+impl GroupKill {
+    /// Kills the group now (at most once).
+    fn kill(&mut self) {
+        if let Some(group) = self.0.take() {
+            // SAFETY: killpg on a process group we created; failure (already gone) is fine.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+    }
+
+    /// Leaves the group alone from now on.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    /// Kills the group unless disarmed or already killed.
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 /// How much of a failed command's stderr is quoted in its error message.
@@ -4450,7 +4526,9 @@ fn prepare_command_assignment(
 ///
 /// The command is expanded and built here (reading the current values of any referenced
 /// variables), then the task runs it, converts its output, and reports the result through
-/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply.
+/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply. The task holds one
+/// of the shared [`crate::limits::command_slots`]; with none free the assignment is
+/// skipped with a (throttled) warning.
 pub fn start_command_assignment(
     target: AssignTarget,
     op: AssignOp,
@@ -4470,7 +4548,16 @@ pub fn start_command_assignment(
             return;
         }
     };
+    let Some(slot) = crate::limits::command_slots().try_take() else {
+        if crate::limits::BUSY_WARNING.ready(std::time::Instant::now()) {
+            log.warn(crate::limits::busy_message(&format!(
+                "the command of the assignment to {label}"
+            )));
+        }
+        return;
+    };
     tokio::spawn(async move {
+        let _slot = slot;
         let outcome = match run_command_with_timeout(&spec, EXEC_TIMEOUT).await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(output) => convert_output(&output, &conversion, op, &label, log),
@@ -4666,7 +4753,9 @@ pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, 
 ///
 /// The seconds key is either a number or a single int variable reference. Returns
 /// `Ok(None)` when the scene has no timer (or an unrecognizable one, matching
-/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable.
+/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable. The
+/// seconds are at least [`crate::limits::MIN_TIMER_SECONDS`]: validation rejects a
+/// smaller literal, and a variable's smaller value is raised to it.
 pub fn timer_for_scene_with<'a>(
     scene_name: &str,
     scenes: &'a Value,
@@ -4705,7 +4794,12 @@ pub fn timer_for_scene_with<'a>(
             }
         }
     };
-    Ok(Some((seconds, action_values(action))))
+    // A value from a variable is only known now; it may still be 0 (e.g. set from a
+    // program's output), which would re-run the timer in a busy loop.
+    Ok(Some((
+        seconds.max(crate::limits::MIN_TIMER_SECONDS),
+        action_values(action),
+    )))
 }
 
 #[cfg(test)]
@@ -6333,6 +6427,143 @@ mod tests {
         assert_eq!(clipped.len(), super::MAX_LOGGED_WARNING_CHARS + 3);
     }
 
+    use std::time::Duration;
+
+    /// A unique path in the temp dir for a test's pid file.
+    fn temp_path(name: &str) -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("dak_{name}_{}_{n}", std::process::id()))
+    }
+
+    /// Whether `pid` is a running (not zombie) process, via the portable `ps`.
+    fn running(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
+            .unwrap_or(false)
+    }
+
+    /// Polls until `pid` is no longer running, for up to 5 s.
+    async fn wait_gone(pid: i32) -> bool {
+        for _ in 0..500 {
+            if !running(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Reads the pid a test command wrote to `path`, polling for up to 5 s.
+    async fn read_pid(path: &Path) -> i32 {
+        for _ in 0..500 {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no pid in {path:?}");
+    }
+
+    /// A shell command's background job is killed with it on timeout: the whole process
+    /// group goes, not only the direct child.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let pid_file = temp_path("group-timeout");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display()),
+            ],
+        };
+        let error = super::run_command_with_timeout(&spec, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(error.contains("killed"), "{error}");
+        let pid = read_pid(&pid_file).await;
+        assert!(wait_gone(pid).await, "background job {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// A command that failed while something it started keeps stderr open returns its
+    /// error promptly (not when that program ends), and the leftover is killed.
+    #[tokio::test]
+    async fn failed_command_does_not_wait_for_leftover_stderr() {
+        let pid_file = temp_path("group-stderr");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 30 >/dev/null & echo $! > {}; echo oops >&2; exit 3",
+                    pid_file.display()
+                ),
+            ],
+        };
+        let started = std::time::Instant::now();
+        let error = super::run_command_with_timeout(&spec, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("exited with"), "{error}");
+        let pid = read_pid(&pid_file).await;
+        assert!(wait_gone(pid).await, "leftover {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// Dropping a running command (its button was reassigned) kills its process group.
+    #[tokio::test]
+    async fn dropping_a_command_kills_its_process_group() {
+        let pid_file = temp_path("group-drop");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display()),
+            ],
+        };
+        let task = tokio::spawn(async move {
+            super::run_command_with_timeout(&spec, Duration::from_secs(60)).await
+        });
+        let pid = read_pid(&pid_file).await;
+        task.abort();
+        let _ = task.await;
+        assert!(wait_gone(pid).await, "background job {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// A successful command may leave a background job running on purpose.
+    #[tokio::test]
+    async fn successful_command_keeps_its_background_jobs() {
+        let pid_file = temp_path("group-ok");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 2 >/dev/null 2>&1 & echo $! > {}; echo hi",
+                    pid_file.display()
+                ),
+            ],
+        };
+        let output = super::run_command_with_timeout(&spec, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(output, b"hi\n");
+        let pid = read_pid(&pid_file).await;
+        assert!(running(pid), "the background job was killed");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
     /// Variables for the injection tests: `$v` holds `value`, `$n` an int.
     fn hostile_variables(value: &str) -> crate::variables::Variables {
         let mut defs = std::collections::BTreeMap::new();
@@ -6975,5 +7206,22 @@ mod tests {
         let malformed = json!({ "main": { "actions": { "timer": { "${period": "@Main" } } } });
         let error = super::timer_for_scene_with("main", &malformed, &variables).unwrap_err();
         assert!(error.contains("actions.timer"), "{error}");
+    }
+
+    /// A timer period of 0 from a variable (say, set from a program's output) is raised
+    /// to the minimum, so a timer re-entering its own scene cannot spin.
+    #[test]
+    fn timer_seconds_from_a_variable_have_a_minimum() {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::int(0, 10, 0),
+        );
+        let zero = crate::variables::Variables::new(defs, &crate::press::Defaults::default());
+        let scenes = json!({ "main": { "actions": { "timer": { "$period": "@" } } } });
+        let (seconds, _) = super::timer_for_scene_with("main", &scenes, &zero)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seconds, crate::limits::MIN_TIMER_SECONDS);
     }
 }

@@ -26,6 +26,7 @@ pub mod exit;
 pub mod hardware;
 pub mod imaging;
 pub mod input;
+pub mod limits;
 pub mod lock;
 pub mod log;
 pub mod map;

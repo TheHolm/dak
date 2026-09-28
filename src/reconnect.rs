@@ -22,6 +22,53 @@ use tokio::sync::watch;
 
 use crate::actions::ButtonDevice;
 
+/// How long [`Flapping`] looks back when counting disconnects.
+pub const FLAP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Disconnects within [`FLAP_WINDOW`] tolerated before reconnecting is slowed down.
+pub const FLAP_TOLERANCE: usize = 5;
+
+/// The longest pause [`Flapping`] imposes before reconnecting.
+pub const MAX_FLAP_DELAY: Duration = Duration::from_secs(60);
+
+/// Notices a device that keeps disconnecting and coming straight back (a flaky cable,
+/// or firmware that drops off the bus on purpose), which would otherwise mean a full
+/// reconnect, repaint and re-run of every `*_exec` program each time, plus log lines.
+///
+/// After [`FLAP_TOLERANCE`] disconnects within [`FLAP_WINDOW`], each further one waits
+/// before reconnecting: 1 s, then doubling up to [`MAX_FLAP_DELAY`].
+#[derive(Debug, Default)]
+pub struct Flapping {
+    /// When the recent disconnects happened, oldest first.
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl Flapping {
+    /// No disconnects seen yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a disconnect at `now` and returns how long to wait before reconnecting
+    /// (zero while the device is not flapping).
+    pub fn on_disconnect(&mut self, now: std::time::Instant) -> Duration {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= FLAP_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        let excess = self.recent.len().saturating_sub(FLAP_TOLERANCE);
+        if excess == 0 {
+            return Duration::ZERO;
+        }
+        let seconds = 1u64 << (excess - 1).min(16);
+        Duration::from_secs(seconds).min(MAX_FLAP_DELAY)
+    }
+}
+
 /// How often a lost device is looked for again, and how many times, after the
 /// `defaults`/per-device `device_reconnect_*` settings are combined (see
 /// [`ReconnectPolicy::resolve`]).
@@ -344,6 +391,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// A few disconnects cost nothing; beyond the tolerance each one waits longer, up
+    /// to the maximum, and old ones age out of the window.
+    #[test]
+    fn flapping_devices_are_slowed_down() {
+        let mut flapping = Flapping::new();
+        let start = std::time::Instant::now();
+        for _ in 0..FLAP_TOLERANCE {
+            assert_eq!(flapping.on_disconnect(start), Duration::ZERO);
+        }
+        assert_eq!(flapping.on_disconnect(start), Duration::from_secs(1));
+        assert_eq!(flapping.on_disconnect(start), Duration::from_secs(2));
+        assert_eq!(flapping.on_disconnect(start), Duration::from_secs(4));
+        for _ in 0..40 {
+            assert!(flapping.on_disconnect(start) <= MAX_FLAP_DELAY);
+        }
+        assert_eq!(flapping.on_disconnect(start), MAX_FLAP_DELAY);
+        // A minute later the old disconnects no longer count.
+        let later = start + FLAP_WINDOW;
+        assert_eq!(flapping.on_disconnect(later), Duration::ZERO);
+    }
 
     /// A test error: `gone` marks it as a disconnect for [`is_gone`].
     #[derive(Debug)]

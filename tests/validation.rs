@@ -1239,6 +1239,15 @@ fn rejects_invalid_timer_seconds() {
     assert!(errors.contains("not a valid number of seconds"), "{errors}");
 }
 
+/// A timer of 0 seconds is rejected: re-entering its own scene it would be a busy loop.
+#[test]
+fn rejects_zero_timer_seconds() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"timer": {"0": "@"}}}}"#,
+        "below the minimum of 1 second",
+    );
+}
+
 /// `timer` must be a single-entry object.
 #[test]
 fn rejects_timer_not_an_object() {
