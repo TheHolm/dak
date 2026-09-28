@@ -2627,10 +2627,19 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         background: &Color,
         text_color: &Color,
     ) -> Result<DynamicImage, String> {
-        let parsed = crate::markup::parse(text, markup.unwrap_or(self.markup));
-        for warning in &parsed.warnings {
-            self.log
-                .warn(format!("button {key}: {warning}; shown as written"));
+        let text = clip_button_text(text);
+        let parsed = crate::markup::parse(&text, markup.unwrap_or(self.markup));
+        for warning in parsed.warnings.iter().take(MAX_MARKUP_WARNINGS) {
+            self.log.warn(format!(
+                "button {key}: {}; shown as written",
+                clip_for_log(warning)
+            ));
+        }
+        if parsed.warnings.len() > MAX_MARKUP_WARNINGS {
+            self.log.warn(format!(
+                "button {key}: {} more markup warnings not shown",
+                parsed.warnings.len() - MAX_MARKUP_WARNINGS
+            ));
         }
         crate::text::render_lines(
             &parsed.lines,
@@ -3136,7 +3145,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                             }
                         }
                     }
-                    ExecOutputKind::Image => match image::load_from_memory(&stdout) {
+                    ExecOutputKind::Image => match decode_image_output(stdout).await {
                         Ok(image) => crate::color::flatten(image, &background),
                         Err(error) => {
                             self.log.error(format!(
@@ -3645,6 +3654,42 @@ pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// Most characters of one line of button text passed to the markup parser: plenty for
+/// six columns plus their tags, while a line of megabytes of program output is not
+/// parsed (and warned about) in full.
+pub const MAX_TEXT_LINE_CHARS: usize = 1024;
+
+/// Most markup warnings logged for one drawing of a button; the rest are counted.
+pub const MAX_MARKUP_WARNINGS: usize = 3;
+
+/// Most characters of a warning about button text written to the log.
+const MAX_LOGGED_WARNING_CHARS: usize = 200;
+
+/// The part of `text` a button can show before markup is parsed: its first
+/// [`crate::text::MAX_LINES`] lines, each cut to [`MAX_TEXT_LINE_CHARS`] characters.
+/// Text from programs and files can be megabytes long; only this much of it can ever
+/// be drawn.
+pub fn clip_button_text(text: &str) -> String {
+    let mut clipped = String::new();
+    for (index, line) in text.lines().take(crate::text::MAX_LINES).enumerate() {
+        if index > 0 {
+            clipped.push('\n');
+        }
+        clipped.extend(line.chars().take(MAX_TEXT_LINE_CHARS));
+    }
+    clipped
+}
+
+/// `text` cut to [`MAX_LOGGED_WARNING_CHARS`] characters, with `...` when it was cut.
+fn clip_for_log(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut clipped: String = chars.by_ref().take(MAX_LOGGED_WARNING_CHARS).collect();
+    if chars.next().is_some() {
+        clipped.push_str("...");
+    }
+    clipped
+}
+
 /// Maximum bytes read from a `text` setup entry's file - far more than the 3x6
 /// characters ever shown on a button, but a hard bound: without one, a huge or
 /// infinite source (e.g. `/dev/zero`) would be read until EOF, which such a source
@@ -3657,8 +3702,19 @@ pub const MAX_TEXT_FILE_BYTES: u64 = 64 * 1024;
 async fn load_image_file(
     path: &str,
 ) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
-    let path = path.to_string();
-    let result = tokio::task::spawn_blocking(move || image::open(path))
+    let path = PathBuf::from(path);
+    let result = tokio::task::spawn_blocking(move || crate::imaging::open(&path))
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+    result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+}
+
+/// Decodes `image_exec` output (see [`crate::imaging::decode`]) off the async runtime's
+/// worker thread, since decoding is CPU-bound.
+async fn decode_image_output(
+    bytes: Vec<u8>,
+) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
+    let result = tokio::task::spawn_blocking(move || crate::imaging::decode(&bytes))
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
@@ -6247,6 +6303,34 @@ mod tests {
             matches!(received, Ok(None)),
             "an undeclared target must not spawn a command: {received:?}"
         );
+    }
+
+    /// Button text is cut to the lines and characters a button can show before markup
+    /// is parsed.
+    #[test]
+    fn clip_button_text_keeps_what_a_button_can_show() {
+        assert_eq!(super::clip_button_text("a\nb\nc\nd\ne"), "a\nb\nc");
+        assert_eq!(super::clip_button_text("a\r\nb"), "a\nb");
+        assert_eq!(super::clip_button_text(""), "");
+        let long = "é".repeat(5000);
+        let clipped = super::clip_button_text(&long);
+        assert_eq!(clipped.chars().count(), super::MAX_TEXT_LINE_CHARS);
+        // Megabytes of output are clipped without trouble.
+        let huge = "#[x]".repeat(2_000_000);
+        assert_eq!(
+            super::clip_button_text(&huge).chars().count(),
+            super::MAX_TEXT_LINE_CHARS
+        );
+    }
+
+    /// Log text is cut with an ellipsis only when it is too long.
+    #[test]
+    fn clip_for_log_marks_cut_text() {
+        assert_eq!(super::clip_for_log("short"), "short");
+        let long = "x".repeat(super::MAX_LOGGED_WARNING_CHARS + 1);
+        let clipped = super::clip_for_log(&long);
+        assert!(clipped.ends_with("..."));
+        assert_eq!(clipped.len(), super::MAX_LOGGED_WARNING_CHARS + 3);
     }
 
     /// Variables for the injection tests: `$v` holds `value`, `$n` an int.

@@ -431,7 +431,7 @@ Rules for the program:
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
 - `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background`, `text_color` and `markup`:
-  - `{"type":"image","params":"path"}` — load an image from `path` onto the button
+  - `{"type":"image","params":"path"}` — load an image from `path` onto the button. PNG, JPEG, GIF, BMP, ICO, WebP and PNM are read; an image may be at most 4096 pixels wide and high (larger ones are refused, big ones scaled down first). The same applies to `image_exec` output.
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
   - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied
   - `{"type":"text_value","params":"text"}` — display `text` directly (after `$` references are expanded), without reading a file or running a program. This is the simplest way to show a variable's value, e.g. `{"type":"text_value","params":"$defaults.button_brightness%"}`

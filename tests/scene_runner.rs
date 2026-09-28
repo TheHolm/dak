@@ -2822,3 +2822,56 @@ async fn redraw_all_skips_buttons_that_no_longer_resolve() {
     assert_eq!(mock.kinds(&calls), ["SetImage", "Flush"]);
     assert_eq!(mock.keys(&calls), [1], "only the resolvable button");
 }
+
+/// `image_exec` output declaring a side past `imaging::MAX_DIMENSION` is refused (the
+/// button shows the error label instead of dak decoding a picture of any size), and a
+/// large but allowed one is drawn.
+#[tokio::test]
+async fn image_exec_output_size_is_bounded() {
+    let mock = MockButtonDevice::default();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let (refresh_tx, mut _refresh_rx) = tokio::sync::mpsc::channel(4);
+    let mut runner = SceneRunner::new(
+        1,
+        &mock,
+        FORMAT,
+        tx,
+        refresh_tx,
+        Log::default(),
+        &HashSet::new(),
+        Defaults::default().background,
+        Defaults::default().text_color,
+    );
+    let scenes =
+        scenes_with_buttons(json!({ "1b02": { "type": "image_exec", "params": "sleep 10" } }));
+    runner.enter_scene("main", &scenes).await.unwrap();
+
+    let png = |width: u32, height: u32| {
+        let mut png = Vec::new();
+        RgbImage::from_pixel(width, height, Rgb([10, 200, 30]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    };
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: png(dak::imaging::MAX_DIMENSION + 1, 1),
+        })
+        .await;
+    let image = mock.last_image(1).expect("the error label is drawn");
+    assert_ne!(image.to_rgb8().get_pixel(30, 30).0, [10, 200, 30]);
+
+    runner
+        .handle_exec_event(ExecEvent::Output {
+            key: 2,
+            generation: 2,
+            kind: ExecOutputKind::Image,
+            stdout: png(2000, 2000),
+        })
+        .await;
+    let image = mock.last_image(1).unwrap();
+    assert_eq!(image.to_rgb8().get_pixel(30, 30).0, [10, 200, 30]);
+}

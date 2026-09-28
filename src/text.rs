@@ -48,6 +48,10 @@ pub const MAX_LINE_CHARS: usize = 6;
 /// Matches the config documentation for the `text` and `text_exec` commands.
 pub const MAX_LINES: usize = 3;
 
+/// Most characters drawn for one grapheme cluster (a base character and its combining
+/// marks). Real text needs a handful; the rest of a longer cluster is dropped.
+pub const MAX_CLUSTER_CHARS: usize = 8;
+
 /// The keys `defaults.fonts` may contain, in documentation order: the four text styles,
 /// the emoji fallback and the last-resort extra font (e.g. CJK). Also the vocabulary
 /// `tests/man_pages.rs` requires `dak-config.5` to document.
@@ -570,14 +574,17 @@ fn drawable_glyph(font: &FontArc, ch: char) -> Option<(GlyphId, bool)> {
 fn decode_bitmap(font: &FontArc, id: GlyphId) -> Option<RgbaImage> {
     let image = font.glyph_raster_image2(id, u16::MAX)?;
     match image.format {
-        GlyphImageFormat::Png => {
-            image::load_from_memory_with_format(image.data, image::ImageFormat::Png)
-                .ok()
-                .map(|decoded| decoded.to_rgba8())
-        }
+        GlyphImageFormat::Png => crate::imaging::decode_as(image.data, image::ImageFormat::Png)
+            .ok()
+            .map(|decoded| decoded.to_rgba8()),
         GlyphImageFormat::BitmapPremulBgra32 => {
             let (width, height) = (u32::from(image.width), u32::from(image.height));
-            if image.data.len() < (width * height * 4) as usize {
+            // u64: 65535 x 65535 x 4 overflows u32. Bounded like any other picture.
+            let needed = u64::from(width) * u64::from(height) * 4;
+            if width > crate::imaging::MAX_DIMENSION
+                || height > crate::imaging::MAX_DIMENSION
+                || (image.data.len() as u64) < needed
+            {
                 return None;
             }
             let mut rgba = RgbaImage::new(width, height);
@@ -1072,7 +1079,14 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                 });
                 laid.width += target;
             } else {
-                for (index, ch) in std::iter::once(first).chain(chars).enumerate() {
+                // A cluster is one cell however many combining marks it has; draw at
+                // most MAX_CLUSTER_CHARS of them, so a cluster of millions of marks
+                // (program output can be megabytes) cannot keep the renderer busy.
+                for (index, ch) in std::iter::once(first)
+                    .chain(chars)
+                    .take(MAX_CLUSTER_CHARS)
+                    .enumerate()
+                {
                     let (font, id) = if index == 0 {
                         (font, id)
                     } else {
@@ -1300,6 +1314,24 @@ mod tests {
             rotation: mirajazz::types::ImageRotation::Rot0,
             mirror: mirajazz::types::ImageMirroring::None,
         }
+    }
+
+    /// A grapheme cluster with a huge number of combining marks is one cell, and only
+    /// [`MAX_CLUSTER_CHARS`] of its characters are laid out and drawn.
+    #[test]
+    fn huge_clusters_are_capped() {
+        let text = format!("a{}b", "\u{301}".repeat(100_000));
+        let parsed = parse(&text, Markup::None);
+        let laid = lay_out(&parsed.lines[0], &FontSet::embedded());
+        assert_eq!(laid.glyphs.len(), MAX_CLUSTER_CHARS + 1);
+        render_lines(
+            &parsed.lines,
+            &default_background(),
+            &default_text_color(),
+            &FontSet::embedded(),
+            format(),
+        )
+        .unwrap();
     }
 
     /// Renders tmux-markup `text` white on black with the embedded fonts.

@@ -24,6 +24,7 @@ pub mod control;
 pub mod daemon;
 pub mod exit;
 pub mod hardware;
+pub mod imaging;
 pub mod input;
 pub mod lock;
 pub mod log;

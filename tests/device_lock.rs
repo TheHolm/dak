@@ -26,6 +26,22 @@ fn lock_dir() -> PathBuf {
     common::temp_dir()
 }
 
+/// Takes the lock for [`key`] in `dir`, retrying for a moment while it looks held: a
+/// child that another test is forking right now briefly holds a copy of every fd until
+/// its exec closes the close-on-exec ones (see NOTES.md section 10), so a just-released
+/// lock can look taken for an instant.
+fn relock(dir: &Path) -> Result<lock::DeviceLock, LockError> {
+    let mut result = lock::try_lock(dir, &key());
+    for _ in 0..200 {
+        if !matches!(result, Err(LockError::Busy(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        result = lock::try_lock(dir, &key());
+    }
+    result
+}
+
 /// A second lock attempt fails as busy and names this process as the holder; once the
 /// first lock is dropped the lock can be taken again.
 #[test]
@@ -51,7 +67,7 @@ fn second_lock_is_busy_until_released() {
         std::process::id() as i32
     );
     drop(first);
-    lock::try_lock(&dir, &key()).expect("free again after the holder dropped it");
+    relock(&dir).expect("free again after the holder dropped it");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -80,7 +96,7 @@ fn lock_files_are_shared_and_reused() {
         "garbage that is much longer than any real holder record ".repeat(10),
     )
     .unwrap();
-    let _lock = lock::try_lock(&dir, &key()).unwrap();
+    let _lock = relock(&dir).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.starts_with("pid="), "{text}");
     assert!(

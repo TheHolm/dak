@@ -75,6 +75,11 @@ under other platforms.
 - `src/color.rs` — button colours: parsing the `background`/`text_color` config
   values (hex or CSS colour names) and alpha-compositing transparent images onto
   an opaque background
+- `src/imaging.rs` — bounded image decoding (`decode`/`decode_as`/`open`: at most
+  `MAX_DIMENSION` px a side and `MAX_ALLOC` bytes, then `shrink` to `WORKING_SIZE`)
+  for `image` files, `image_exec` output and font colour bitmaps; only the formats in
+  `FORMATS` are compiled in (`image` has `default-features = false`), checked against
+  `dak-config.5` by `tests/man_pages.rs`
 - `src/markup.rs` — button text markup: parses a `text`/`text_value`/`text_exec`
   entry's text into lines of styled spans (`Line`/`Span`/`Style`/`Align`) per its
   `markup` (`none`, or the default `tmux`: `#[bold,fg=red,align=left]` tags, `##`
@@ -224,7 +229,8 @@ under other platforms.
 - `QUERY` in `main.rs` (vendor 0x0300, product 0x3002) filters the device list
 - Images are 60x60 JPEG; the `image` crate computes them on the fly
 - Button text: at most 3 lines x 6 display columns, scaled to fit; embedding the fonts
-  and colour-bitmap decoding grew the release binary by about 3.7 MB (5.6 MB to 9.4 MB stripped)
+  and colour-bitmap decoding grew the release binary by about 3.7 MB (5.6 MB to 9.4 MB stripped);
+  trimming `image` to the documented formats in v0.15.0 brought it back to 7.8 MB
 - The device supports distinct press/release key and encoder states
 
 ## Status / known gaps

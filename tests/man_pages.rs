@@ -18,6 +18,7 @@ use dak::actions::{
     CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
 };
 use dak::cli::Cli;
+use dak::imaging::FORMATS as IMAGE_FORMATS;
 use dak::log::{LOGGING_KEYS, LOG_LEVELS, LOG_OUTPUTS, SYSLOG_FACILITIES, TIMESTAMP_VALUES};
 use dak::markup::MARKUP_VALUES;
 use dak::text::FONT_KEYS;
@@ -585,13 +586,14 @@ fn dak_config_5_documents_the_config_vocabulary() {
     let text = canonical_text(
         &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
     );
-    let groups: [(&str, &[&str]); 15] = [
+    let groups: [(&str, &[&str]); 16] = [
         ("top-level key", TOP_LEVEL_KEYS),
         ("defaults key", DEFAULTS_KEYS),
         ("setup type", SETUP_KINDS),
         ("setup entry field", SETUP_ENTRY_FIELDS),
         ("markup value", MARKUP_VALUES),
         ("defaults.fonts key", FONT_KEYS),
+        ("image format", IMAGE_FORMATS),
         ("button event", CONTROL_EVENTS),
         ("encoder event", ENCODER_EVENTS),
         ("variable key", VARIABLE_KEYS),

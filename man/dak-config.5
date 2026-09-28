@@ -702,11 +702,17 @@ and
 .TP
 .B image
 .IB params " is a path"
-to an image file to load onto the button.
+to an image file to load onto the button. The formats read are PNG, JPEG, GIF,
+BMP, ICO, WebP and PNM (the netpbm formats). An image may be at most 4096
+pixels wide and high; larger ones are refused as an error, and big ones are
+scaled down before they are drawn.
 .TP
 .B image_exec
 .I params
-is a command run asynchronously whose stdout must be a valid image file. If it
+is a command run asynchronously whose stdout must be a valid image file, in
+one of the formats and within the size limit of
+.BR image .
+If it
 does not finish within 5 seconds, or the button is changed in the meantime,
 the process is killed, an error is logged, and the button shows the text
 .B Error
