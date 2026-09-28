@@ -341,7 +341,7 @@ fn render_dak_1() -> Vec<u8> {
     let man = clap_mangen::Man::new(Cli::command())
         .title("DAK")
         .section("1")
-        .date("2026-09-27")
+        .date("2026-09-28")
         .source(format!("dak {}", env!("CARGO_PKG_VERSION")))
         .manual("User Commands");
     let mut page = Vec::new();
