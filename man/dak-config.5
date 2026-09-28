@@ -914,12 +914,10 @@ and so on, quoted for where the reference appears. The shell never parses the
 value itself. The script therefore sees these values as its positional
 parameters.
 .IP \(bu 2
-An action that is just
-.B $name
-runs the value as one program name; it is never read as a scene switch or an
-assignment.
+A value never changes what kind of action runs:
 .B @$name
-still switches to the scene the value names.
+switches to the scene the value names, and a command stays a command whatever
+its values contain.
 .PP
 .B $!name
 (and

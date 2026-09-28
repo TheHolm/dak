@@ -2246,3 +2246,28 @@ fn timer_key_rejects_non_int_variable() {
     let errors = error_texts(config.unwrap_err());
     assert!(errors.contains("timer seconds must be an int"), "{errors}");
 }
+
+/// `$!name` references validate like `$name` ones: in a command, as a whole action and
+/// as a scene name; an undeclared `$!name` is an error.
+#[test]
+fn raw_references_validate_like_plain_ones() {
+    let path = write_variables_config(
+        r#"{ "v": { "type": "str", "value": "@Main" } }"#,
+        r#"{ "Main": { "actions": {
+            "1b01": { "pressed": "$!v", "released": "echo $!v | cat" },
+            "1b02": { "pressed": "@$!v", "released": "echo $v" }
+        } } }"#,
+    );
+    let result = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(result.is_ok(), "{:?}", result.err());
+
+    let path = write_variables_config(
+        r#"{ "v": { "type": "str", "value": "x" } }"#,
+        r#"{ "Main": { "actions": { "1b01": { "pressed": "echo $!missing" } } } }"#,
+    );
+    let result = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(result.unwrap_err());
+    assert!(errors.contains("missing"), "{errors}");
+}

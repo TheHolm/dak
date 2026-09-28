@@ -1303,7 +1303,9 @@ fn check_action_value(
         }
         return;
     }
-    if value.starts_with('$') {
+    // `$!name ...` is a raw reference, not an assignment: validated as a command (its
+    // value, and so what it does, is only known when it fires).
+    if value.starts_with('$') && !value.starts_with("$!") {
         check_set_config_action(variables, scene_name, path, value, errors, warnings);
         return;
     }
@@ -5388,7 +5390,10 @@ mod tests {
         let dir = temp_dir();
         write_file_with_mode(&dir.join("dak-test-tool"), 0o755);
         let old = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
+        // Prepended, not replacing PATH: other tests spawn programs meanwhile.
+        let mut paths = vec![dir.clone()];
+        paths.extend(std::env::split_paths(old.as_deref().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
 
         let mut found = Vec::new();
         super::check_executable("s", "p", "dak-test-tool", &mut found);
@@ -6282,6 +6287,8 @@ mod tests {
     /// shell appears, it is not split, unquoted, unescaped or tilde-expanded.
     #[test]
     fn value_is_one_literal_argument_in_a_plain_command() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
         for value in HOSTILE_VALUES {
             let spec = command_with("notify-send $v", value);
             assert_eq!(spec.program, "notify-send", "{value:?}");
@@ -6344,6 +6351,8 @@ mod tests {
     /// Shell syntax in a value never turns a plain command into a shell command.
     #[test]
     fn value_never_makes_a_command_use_a_shell() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
         for value in HOSTILE_VALUES {
             assert_ne!(command_with("echo $v", value).program, "sh", "{value:?}");
         }
@@ -6353,6 +6362,8 @@ mod tests {
     /// so it may add arguments and shell syntax.
     #[test]
     fn raw_reference_is_pasted_as_config_text() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
         let spec = command_with("echo $!v", "a b");
         assert_eq!(spec.args, ["a", "b"]);
         let spec = command_with("echo $!v", "a | wc -c");

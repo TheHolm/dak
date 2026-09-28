@@ -380,9 +380,8 @@ a window title, a web page). So inside a command, a `$name` value is always **da
   for where the reference appears; the shell never parses the value, so
   `echo $title | wc -c` counts the characters of any title. The script therefore sees
   those values as its positional parameters.
-- An action that is just `$name` runs the value as one program name; it is never read as
-  a scene switch (`@...`) or an assignment. `@$name` still switches to the scene the
-  value names.
+- A value never changes what kind of action runs: `@$name` switches to the scene the
+  value names, and a command stays a command whatever its values contain.
 
 `$!name` (and `$!scope.name`) pastes the value in as if you had typed it into the config
 instead: it is split into words, may add shell syntax (so the command may start using a
