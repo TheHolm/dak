@@ -276,6 +276,10 @@ Work in progress. Current known issues:
   buttons and encoders, encoder turns, scene switches, SIGHUP reload, and unplug/
   re-plug with repaint. Config actions should use bare program names (`expr`,
   `date`), not `/usr/bin/...`: FreeBSD keeps several of them in `/bin`
+- v0.15.0's security hardening is covered by tests but not yet re-run against
+  hardware. Not yet verified on real systems at all: the FreeBSD branch of
+  `lock::process_identity` (cross-compiled only), the FreeBSD devd permission rule and
+  the Linux `uaccess`-only udev rule in `INSTALL.md`
 - A keypad that is enumerable but cannot be opened (e.g. a container that sees
   the host's sysfs but has no `/dev/hidraw*` node) makes the hardware tests skip,
   but `dak --map` still lists it; `tests/exit_status.rs`'s `--map` test accepts
