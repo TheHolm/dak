@@ -370,7 +370,9 @@ picks face
 (from 0) of a
 .B .ttc
 font collection. Files are loaded once at startup; a missing, unreadable,
-larger than 256 MiB or invalid font file is a config error, and fonts cannot be
+larger than 256 MiB or invalid font file (including one whose line height,
+.B M
+width or units per em make no sense) is a config error, and fonts cannot be
 changed at runtime.
 .PP
 Each character is looked up in the configured font of its style, then the

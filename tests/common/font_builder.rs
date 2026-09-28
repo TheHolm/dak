@@ -121,6 +121,16 @@ pub fn build_font_with_metrics(
     colour: ColourTables,
     metrics: VerticalMetrics,
 ) -> Vec<u8> {
+    build_font_with_advance(glyphs, colour, metrics, 1000)
+}
+
+/// [`build_font_with_metrics`] with every glyph `advance` units wide (1000 elsewhere).
+pub fn build_font_with_advance(
+    glyphs: &[(char, Glyph)],
+    colour: ColourTables,
+    metrics: VerticalMetrics,
+    advance: u16,
+) -> Vec<u8> {
     let num_glyphs = glyphs.len() as u16 + 1;
     let mut tables: Vec<([u8; 4], Vec<u8>)> = Vec::new();
 
@@ -171,10 +181,10 @@ pub fn build_font_with_metrics(
     maxp.extend_from_slice(&[0; 26]);
     tables.push((*b"maxp", maxp));
 
-    // hmtx: every glyph 1000 units wide
+    // hmtx: every glyph `advance` units wide
     let mut hmtx = Vec::new();
     for _ in 0..num_glyphs {
-        u16be(&mut hmtx, 1000);
+        u16be(&mut hmtx, advance);
         i16be(&mut hmtx, 0);
     }
     tables.push((*b"hmtx", hmtx));

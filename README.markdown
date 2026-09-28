@@ -236,7 +236,7 @@ Button text is drawn with fonts embedded in the binary: DejaVu Sans Mono in regu
 - `emoji` — the fallback for characters none of the text fonts have (emoji, symbols).
 - `extra` — a last-resort font tried after the emoji fonts, meant for a script the others lack, typically Chinese/Japanese/Korean.
 
-Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
+Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file (including one with nonsensical metrics: no line height, an `M` without width, a units-per-em outside 16-16384) is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
 
 Each character is drawn from the first of these fonts that has it:
 

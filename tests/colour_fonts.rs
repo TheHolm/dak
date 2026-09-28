@@ -449,3 +449,57 @@ fn premultiplied_bgra_bitmap_is_drawn_straight() {
     // The transparent half leaves pure highlight blue.
     assert!(image.pixels().any(|p| p.0 == [0, 0, 255]));
 }
+
+/// Loads a config whose regular font is `bytes`, returning the load errors as text (or
+/// an empty string when it loads).
+fn load_regular_font(name: &str, bytes: &[u8]) -> String {
+    let path = write_font(name, bytes);
+    let config_path = write_config_with_defaults(
+        &format!(r#"{{"fonts": {{"regular": "{}"}}}}"#, path.display()),
+        r#"{"on_start": {"actions": {}}}"#,
+    );
+    let config = load_config_from_path(config_path.to_str().unwrap());
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&path);
+    match config {
+        Ok(_) => String::new(),
+        Err(errors) => error_texts(errors),
+    }
+}
+
+/// Fonts whose metrics would make the text scale zero, negative or infinite - no line
+/// height, a line box upside down, an `M` without width - are refused at load; a
+/// normal one loads.
+#[test]
+fn fonts_with_broken_metrics_are_refused() {
+    use common::font_builder::{build_font_with_advance, build_font_with_metrics, VerticalMetrics};
+    let glyphs = [('M', Glyph::Square), ('a', Glyph::Square)];
+    let ok = build_font_with_metrics(&glyphs, ColourTables::default(), VerticalMetrics::default());
+    assert_eq!(load_regular_font("ok.ttf", &ok), "");
+
+    for (ascender, descender) in [(0, 0), (-200, 800)] {
+        let flat = build_font_with_metrics(
+            &glyphs,
+            ColourTables::default(),
+            VerticalMetrics {
+                ascender,
+                descender,
+                typo: None,
+            },
+        );
+        let errors = load_regular_font("flat.ttf", &flat);
+        assert!(
+            errors.contains("invalid line height"),
+            "{ascender}/{descender}: {errors}"
+        );
+    }
+
+    let thin = build_font_with_advance(
+        &glyphs,
+        ColourTables::default(),
+        VerticalMetrics::default(),
+        0,
+    );
+    let errors = load_regular_font("thin.ttf", &thin);
+    assert!(errors.contains("invalid advance"), "{errors}");
+}
