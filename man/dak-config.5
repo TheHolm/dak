@@ -1032,6 +1032,10 @@ devices apart. A definition whose serial is
 .B unknown
 falls back to comparing
 .BR device_id .
+When more than one attached device matches a definition, none of them is used
+and a warning is printed: serial numbers are not secret, so a second device
+reporting the same one may be impersonating the keypad. A lost keypad is only
+reconnected to a device with the same serial it had.
 .TP
 .B key_count ", " encoder_count
 The number of buttons and encoders the device has.

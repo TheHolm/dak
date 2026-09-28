@@ -589,6 +589,7 @@ At startup each definition is matched against the discovered hardware:
 
 - A definition whose serial is anything but `"unknown"` matches only the device reporting that exact serial, which tells identical devices apart.
 - A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
+- When more than one attached device matches a definition, none of them is used and a warning says so: USB serial numbers are neither secret nor authenticated, so a second device with the same serial may be impersonating your keypad (it would see everything drawn on the buttons, and its "presses" would run your actions). A lost keypad is only reconnected to a device with the serial it had.
 
 Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with status 4 (see "Exit status" in `dak(1)`).
 

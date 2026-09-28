@@ -955,9 +955,48 @@ fn device_error_status(error: &MirajazzError) -> u8 {
     }
 }
 
+/// How many items matched, see [`unique_match`].
+#[derive(Debug, PartialEq, Eq)]
+enum Match {
+    /// None did.
+    None,
+    /// Exactly one did, at this index.
+    One(usize),
+    /// This many (more than one) did.
+    Many(usize),
+}
+
+/// Which of `items` satisfy `matches`: none, exactly one (and where), or several.
+fn unique_match<T>(items: &[T], matches: impl Fn(&T) -> bool) -> Match {
+    let mut found = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches(item))
+        .map(|(index, _)| index);
+    match (found.next(), found.count()) {
+        (None, _) => Match::None,
+        (Some(index), 0) => Match::One(index),
+        (Some(_), others) => Match::Many(others + 1),
+    }
+}
+
+/// The warning for a definition that `count` attached devices match. USB serial numbers
+/// are not secret and not authenticated, so a second device reporting the same serial
+/// (a copy, or one pretending to be the keypad) must not be driven by guesswork: it
+/// would get everything drawn on the buttons and its input would run the actions.
+fn ambiguous_device_message(device_id: u8, definition: &Mapping, count: usize) -> String {
+    format!(
+        "device #{device_id} ({} s/n {}): {count} attached devices match its definition; \
+         not using any of them (a device may be impersonating it, or the definition needs a \
+         serial number)",
+        definition.device_name, definition.serial
+    )
+}
+
 /// Pairs each of `definitions` with the discovered device it describes, warning about
-/// definitions without hardware and (when `warn_undefined`) hardware without a
-/// definition.
+/// definitions without hardware, definitions more than one device matches (those are
+/// skipped, see [`ambiguous_device_message`]) and (when `warn_undefined`) hardware
+/// without a definition.
 fn match_devices(
     definitions: &std::collections::BTreeMap<u8, Mapping>,
     devices: &[HidDevice],
@@ -966,22 +1005,24 @@ fn match_devices(
 ) -> Vec<(u8, Mapping, HidDeviceInfo)> {
     let mut assignments: Vec<(u8, Mapping, HidDeviceInfo)> = Vec::new();
     for (device_id, definition) in definitions {
-        match devices.iter().position(|dev| {
+        let found = unique_match(devices, |dev| {
             actions::discovered_device_matches(
                 definition,
                 &dev.serial_number,
                 dev.vendor_id,
                 dev.product_id,
             )
-        }) {
-            Some(index) => {
+        });
+        match found {
+            Match::Many(count) => log.warn(ambiguous_device_message(*device_id, definition, count)),
+            Match::One(index) => {
                 log.debug(
                     Subsystem::Device,
                     format!("device {device_id}: matched config definition to discovered hardware"),
                 );
                 assignments.push((*device_id, definition.clone(), devices[index].clone()));
             }
-            None => log.warn(format!(
+            Match::None => log.warn(format!(
                 "device #{device_id} ({} s/n {}, expecting {}) defined in config was not found",
                 definition.device_name, definition.serial, definition.device_id
             )),
@@ -1186,6 +1227,9 @@ async fn run_device(
         refresh_rx,
     };
 
+    // The lock this task holds is for this device; reconnects must find the same one.
+    let lock_key = device_key(&device_info);
+
     // Counts recent disconnects so a device that keeps dropping off is slowed down.
     let flapping = std::sync::Mutex::new(reconnect::Flapping::new());
 
@@ -1203,6 +1247,7 @@ async fn run_device(
                 &ReopenDevice {
                     definition: &session.definition,
                     protocol_version,
+                    key: &lock_key,
                 },
                 &device_info.name,
                 &device,
@@ -1236,6 +1281,7 @@ async fn run_device(
                     &ReopenDevice {
                         definition: &session.definition,
                         protocol_version,
+                        key: &lock_key,
                     },
                     &device_info.name,
                     &device,
@@ -1902,13 +1948,24 @@ trait Reopen: Sync {
     ) -> Result<Option<Reopened<Self::Connection>>, ReopenError>;
 }
 
-/// Reopens a real keypad: the first discovered device matching `definition`, connected
-/// like at startup (see [`connect_device`]).
+/// Reopens a real keypad: the one discovered device matching `definition` (and, when
+/// the lock is keyed by a serial number, `key`), connected like at startup (see
+/// [`connect_device`]).
 struct ReopenDevice<'a> {
     /// The lost device's config definition.
     definition: &'a Mapping,
     /// The protocol version it was connected with.
     protocol_version: usize,
+    /// The key of the device lock this task holds: only a device with the same key may
+    /// be reconnected, or two dak instances could end up driving one keypad.
+    key: &'a DeviceKey,
+}
+
+/// Whether a rediscovered device with lock key `found` is the one whose lock `held` is
+/// held. A key made from the OS device path (a keypad without a serial number) is not
+/// compared, since the path changes when the device comes back.
+fn same_locked_device(held: &DeviceKey, found: &DeviceKey) -> bool {
+    held.identity.starts_with("path-") || held == found
 }
 
 impl Reopen for ReopenDevice<'_> {
@@ -1922,15 +1979,23 @@ impl Reopen for ReopenDevice<'_> {
         let devices = list_devices(&hardware::QUERIES)
             .await
             .map_err(|error| ReopenError::Discovery(error.to_string()))?;
-        let Some(info) = devices.into_iter().find(|dev| {
+        let devices: Vec<_> = devices.into_iter().collect();
+        let found = unique_match(&devices, |dev| {
             actions::discovered_device_matches(
                 self.definition,
                 &dev.serial_number,
                 dev.vendor_id,
                 dev.product_id,
-            )
-        }) else {
-            return Ok(None);
+            ) && same_locked_device(self.key, &device_key(dev))
+        });
+        let info = match found {
+            Match::One(index) => devices.into_iter().nth(index).expect("index from the list"),
+            Match::None => return Ok(None),
+            Match::Many(count) => {
+                return Err(ReopenError::Discovery(format!(
+                    "{count} attached devices match its definition; not guessing which one it is"
+                )))
+            }
         };
         let connection = connect_device(
             &info,
@@ -5164,6 +5229,47 @@ mod tests {
             "encoders": []
         }))
         .unwrap()
+    }
+
+    /// `unique_match` tells none, one (with its index) and several matches apart.
+    #[test]
+    fn unique_match_counts_matches() {
+        let items = [1, 2, 3, 2];
+        assert_eq!(super::unique_match(&items, |&n| n == 9), super::Match::None);
+        assert_eq!(
+            super::unique_match(&items, |&n| n == 3),
+            super::Match::One(2)
+        );
+        assert_eq!(
+            super::unique_match(&items, |&n| n == 2),
+            super::Match::Many(2)
+        );
+        assert_eq!(super::unique_match(&items, |_| true), super::Match::Many(4));
+    }
+
+    /// The ambiguity warning names the definition and says why nothing is used.
+    #[test]
+    fn ambiguous_device_message_explains_the_skip() {
+        let text = super::ambiguous_device_message(1, &session_mapping(), 2);
+        assert!(
+            text.contains("device #1") && text.contains("s/n S"),
+            "{text}"
+        );
+        assert!(text.contains("2 attached devices") && text.contains("not using"));
+    }
+
+    /// Reconnecting only takes the device whose lock is held, compared by serial; a
+    /// path-keyed lock (no serial) cannot be compared, since the path changes.
+    #[test]
+    fn reconnect_only_takes_the_locked_device() {
+        let held = super::DeviceKey::new(0x0300, 0x3002, Some("S1"), "/dev/hidraw1");
+        let same = super::DeviceKey::new(0x0300, 0x3002, Some("S1"), "/dev/hidraw5");
+        let other = super::DeviceKey::new(0x0300, 0x3002, Some("S2"), "/dev/hidraw1");
+        assert!(super::same_locked_device(&held, &same));
+        assert!(!super::same_locked_device(&held, &other));
+        let by_path = super::DeviceKey::new(0x0300, 0x3002, None, "/dev/hidraw1");
+        let moved = super::DeviceKey::new(0x0300, 0x3002, None, "/dev/hidraw7");
+        assert!(super::same_locked_device(&by_path, &moved));
     }
 
     /// A defined device with no hardware found is left out (and warned about) rather
