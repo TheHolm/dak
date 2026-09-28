@@ -64,6 +64,28 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
     keypad, replacing the old rule that gave the `operator` group every HID
     device (keyboards included).
   - Linux: `uaccess` only, without the raw USB device node or `plugdev`.
+- **Nothing from outside can drive your terminal or forge log lines.**
+  Control characters (escape sequences, `\r`, bidi overrides) in anything
+  dak logs or prints are shown as `\u{..}`, and device names and serials,
+  lock file records, program error output and variable values in messages
+  also have their newlines escaped.
+- **Short input reports are ignored.** A truncated report from the keypad no
+  longer reads as "button code 0 released", and code 0 never counts as a
+  knob push.
+- **Device definitions the device library cannot handle are config
+  errors:** `protocol_version` outside 1-3 (0 used to crash dak) and more
+  than 254 keys or encoders. `dak --map` no longer offers version 0.
+- **Programs dak starts no longer see `NOTIFY_SOCKET`**, so they cannot
+  report to systemd as dak. `image_exec`/`text_exec`/`$(command)` programs
+  also lose `JOURNAL_STREAM`.
+- **Fonts with nonsensical metrics are refused** (no line height, an `M`
+  without width), and text scaling is bounded, so a broken font can no
+  longer make drawing blow up.
+- **Release downloads are verified.** The FreeBSD `base.txz` is checked
+  against the release `MANIFEST`, confirmed by independent mirrors, and
+  `rustup-init` against its published checksum. Only `vX.Y.Z` tags are
+  released, `cargo audit` gates the release, and each release carries a
+  `SHA256SUMS` file.
 
 ### Details
 - **Command building (`src/variables.rs`, `src/actions.rs`).**
@@ -133,12 +155,41 @@ See `AGENTS.md`'s conventions section for how this file is maintained.
   and `pick_config_path(explicit, dirs, euid)`. The log file
   (`src/log.rs`) opens with `O_NOFOLLOW|O_NONBLOCK`, and `check_log_file`
   checks it, on reopen too.
+- **Control characters (`src/log.rs`).** `escape_controls` runs in
+  `Sinks::write` (C0/C1, DEL, bidi embeddings/overrides/isolates/marks,
+  keeping tab and newline). `escape_text` also escapes newline and tab and
+  is used for outside text inside messages: `DeviceKey::describe`,
+  `Holder::describe`, the device summary lines, "Connected to",
+  `reconnected_message`, `CommandSpec::display`, `with_stderr`, markup
+  warning excerpts, colour errors. `map::Console` escapes its output.
+- **Input reports (`src/input.rs`).** `read_trimmed` reads through
+  `DeviceStateReader.reader` and truncates to the length read (mirajazz's
+  `raw_read_data` discards it). `Mapping::control_event` never matches a
+  push code of 0.
+- **Device ranges (`src/actions.rs`).** `check_mapping_ranges` with
+  `PROTOCOL_VERSIONS` (1..=3) and `MAX_CONTROL_COUNT` (254). mirajazz's
+  16-bit image length is unreachable (NOTES.md section 13).
+- **Child environment.** `NOTIFY_SOCKET` is removed for all children
+  (`CHILD_ONLY_DAK_ENV`), `JOURNAL_STREAM` for exec children.
+- **Fonts (`src/text.rs`).** `check_font_metrics` at load, `sane_scale` for
+  the text scale (at most 4x the button size), glyph and fit scales
+  (`MAX_FIT_SCALE` 8), bitmaps at most the button's size, saturating
+  `blend_picture`.
+- **CI (`.woodpecker/release.yaml`, `scripts/`).**
+  `verify-freebsd-dist.sh` (MANIFEST from download.freebsd.org plus
+  ftp.de.freebsd.org and mirror.aarnet.edu.au, all reachable copies
+  identical, at least one mirror), `fetch-verified.sh` (rustup-init against
+  its `.sha256`), `check-release-tag.sh`, `cargo-deb` 3.8.0 and
+  `cargo-audit` 0.22.2 pinned by version, `SHA256SUMS`. No checksum is
+  stored in the repository, and base images stay referenced by tag.
+  Tested offline by `tests/ci_scripts.rs` (fake `curl`); see NOTES.md
+  section 14.
 - **Test fixes found along the way.**
   - `check_executable_searches_path_for_bare_names` replaced `PATH` while
     other tests spawned programs. It now prepends.
   - Two `device_lock` tests now poll when re-taking a lock that was just
     released.
-- **Coverage.** 95.6% of lines. The new modules are at 99% or above; what
+- **Coverage.** 95.7% of lines. The new modules are at 99% or above; what
   is left needs a non-root user (the `--replace` permission path) or a real
   keypad.
 - **Not yet verified on hardware:** the FreeBSD `process_identity`, the

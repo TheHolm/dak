@@ -1025,7 +1025,7 @@ never drive the same device. Things learned while building it:
 
 Environment: `cargo-llvm-cov` 0.9.x with the `llvm-tools` rustup component, on
 Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg's
-`rust` has no llvm-tools). Last measured for v0.15.0: 95.6% of lines on Linux (v0.14.1: 95.6%).
+`rust` has no llvm-tools). Last measured for v0.15.0: 95.7% of lines on Linux (v0.14.1: 95.6%).
 
 - Run `cargo llvm-cov --summary-only` (`--show-missing-lines` for line numbers,
   `--no-fail-fast` to get a report despite a failing test). Point
