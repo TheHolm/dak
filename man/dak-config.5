@@ -891,7 +891,46 @@ through
 when it contains one of
 .B "| & ; < > ` ( )"
 or a newline. Pipelines and redirection therefore work when written, while a
-plain command never grows a shell.
+plain command never grows a shell. Only the config text decides this, never the
+value of a variable.
+.SS "Values in commands"
+A variable may hold any text, including shell syntax, and that text often
+comes from other programs. Inside a command, a
+.B $name
+value is therefore always data:
+.IP \(bu 2
+In a plain command it is exactly one argument, or part of one, as written: it
+is not split at spaces, its quotes and backslashes are kept, and a leading
+.B ~
+in it is not expanded. An empty value is an empty argument.
+.IP \(bu 2
+In a command that runs through
+.BR "sh \-c" ,
+each value is passed to the shell as a separate argument and the script only
+expands it, as
+.BR \(dq${1}\(dq ,
+.BR \(dq${2}\(dq ,
+and so on, quoted for where the reference appears. The shell never parses the
+value itself. The script therefore sees these values as its positional
+parameters.
+.IP \(bu 2
+An action that is just
+.B $name
+runs the value as one program name; it is never read as a scene switch or an
+assignment.
+.B @$name
+still switches to the scene the value names.
+.PP
+.B $!name
+(and
+.BR $!scope.name )
+pastes the value in as if it were config text: it is split into words, may add
+shell syntax, and as a whole action may be
+.B @scene
+or an assignment. This is how
+.B $name
+behaved before version 0.15.0. Use it only for values you control, never for
+text another program produced.
 .PP
 A leading
 .B ~

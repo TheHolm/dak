@@ -53,7 +53,11 @@ under other platforms.
   `set_text_settings` together with `defaults.markup`
 - `src/variables.rs` — declared variables and their validation, `$` reference
   expansion/substitution, and the runtime variable/default state
-  (`VariableStore`/`Variables`) shared by every device
+  (`VariableStore`/`Variables`) shared by every device. `expand_pieces` keeps config
+  text, `$name` values (`Piece::Value`) and `$!name` values (`Piece::Raw`) apart, so
+  `actions::build_command_pieces` can treat a `$name` value as one literal argument (or,
+  in an `sh -c` script, a positional parameter `"${N}"`) and never let it add words or
+  shell syntax - values often come from other programs' output
 - `src/baseplane.rs` — device addressing: the `Reference`/`Kind` model (device N,
   button B, encoder E) that scene configs and control references use
 - `src/reconnect.rs` — surviving the keypad disappearing (host suspend, unplug,

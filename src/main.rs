@@ -2122,6 +2122,22 @@ async fn run_pressable_edge<D: actions::ButtonDevice>(
     }
 }
 
+/// Runs an action command on its own task, so a running program never blocks the device
+/// input loop or the scene timer; its outcome is only logged.
+fn spawn_action_command(spec: actions::CommandSpec, log: Log) {
+    let display = spec.display();
+    log.debug(Subsystem::Actions, format!("run command \"{display}\""));
+    tokio::spawn(async move {
+        match actions::run_action_command(spec).await {
+            Ok(()) => log.debug(
+                Subsystem::Actions,
+                format!("command \"{display}\" finished"),
+            ),
+            Err(error) => log.error(format!("command \"{display}\" failed: {error}")),
+        }
+    });
+}
+
 /// Executes a scene action: stays (re-applying the current scene), switches scene,
 /// or runs a command on its own background task.
 ///
@@ -2183,27 +2199,13 @@ async fn run_action<D: actions::ButtonDevice>(
             .await;
         }
         Action::Command { command } => {
-            // Commands run on their own task so a running program never blocks the
-            // device input loop or the scene timer, and they are not awaited inline.
-            log.debug(Subsystem::Actions, format!("run command \"{command}\""));
+            // `resolve_action` builds every command itself; kept for completeness.
             match actions::build_command(&command) {
-                Ok(spec) => {
-                    let display = spec.display();
-                    tokio::spawn(async move {
-                        match actions::run_action_command(spec).await {
-                            Ok(()) => log.debug(
-                                Subsystem::Actions,
-                                format!("command \"{display}\" finished"),
-                            ),
-                            Err(error) => {
-                                log.error(format!("command \"{display}\" failed: {error}"))
-                            }
-                        }
-                    });
-                }
+                Ok(spec) => spawn_action_command(spec, log),
                 Err(error) => log.warn(format!("could not run command \"{command}\": {error}")),
             }
         }
+        Action::Run { spec } => spawn_action_command(spec, log),
         Action::SwitchScene { scene } => {
             log.debug(Subsystem::Actions, format!("switch to scene \"{scene}\""));
             log.debug(

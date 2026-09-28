@@ -13,8 +13,8 @@ use crate::markup::Markup;
 use crate::press::Defaults;
 use crate::text::{FontPaths, FontReport, FontSet, FONT_KEYS};
 use crate::variables::{
-    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
-    VarRef, VarType, VarValue, Variables,
+    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, Piece,
+    VarDef, VarRef, VarType, VarValue, Variables,
 };
 use image::DynamicImage;
 use mirajazz::device::Device;
@@ -1915,9 +1915,10 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
     let scene_name = raw.scene.as_str();
     let reference = raw.reference;
     let key = reference.to_string();
-    let params = variables
-        .expand(&raw.params)
+    let pieces = variables
+        .expand_pieces(&raw.params)
         .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))?;
+    let params = pieces_display(&pieces);
     // Colour texts are expanded here but parsed at draw time (see `SceneRunner`), so a
     // value a reference resolves to that is not a colour falls back to the default with
     // a warning instead of failing the whole scene.
@@ -1958,7 +1959,7 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
         },
         "text_exec" => SceneOp::TextExec {
             reference,
-            command: params_command(scene_name, &key, "text_exec", &params)?,
+            command: params_command(scene_name, &key, "text_exec", &pieces)?,
             refresh_seconds: raw.refresh_seconds,
             background,
             text_color,
@@ -1966,13 +1967,13 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
         },
         "image_exec" => SceneOp::ImageExec {
             reference,
-            command: params_command(scene_name, &key, "image_exec", &params)?,
+            command: params_command(scene_name, &key, "image_exec", &pieces)?,
             refresh_seconds: raw.refresh_seconds,
             background,
         },
         "launch" => SceneOp::Launch {
             reference,
-            command: params_command(scene_name, &key, "launch", &params)?,
+            command: params_command(scene_name, &key, "launch", &pieces)?,
         },
         "clear" => SceneOp::Clear { reference },
         other => SceneOp::Unsupported {
@@ -2039,21 +2040,155 @@ pub fn spawn_detached(command: &CommandSpec, log: Log) {
     }
 }
 
-/// Parses an `*_exec`/`image_exec`/`text_exec` command specification from the collapsed
-/// `params` command line. The `scene_name`, physical `key`, and `kind` label are only used
+/// Builds an `image_exec`/`text_exec`/`launch` command specification from the expanded
+/// `params` command line (see [`build_command_pieces`]). The `scene_name`, physical `key`, and `kind` label are only used
 /// for error messages. An empty `params` is an error.
 fn params_command(
     scene_name: &str,
     key: &str,
     kind: &str,
-    params: &str,
+    pieces: &[Piece],
 ) -> Result<CommandSpec, String> {
-    if params.is_empty() {
+    if pieces_display(pieces).is_empty() {
         return Err(format!(
             "scene \"{scene_name}\": key \"{key}\": {kind} params must be a program command line"
         ));
     }
-    build_command(params).map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+    build_command_pieces(pieces)
+        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+}
+
+/// One unit of a command line being tokenised: a character of config text (including
+/// the text of a `$!name` reference), or the whole value of a `$name` reference, which
+/// is never looked into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit<'a> {
+    /// A character of config text.
+    Char(char),
+    /// A `$name` value: literal data.
+    Value(&'a str),
+}
+
+/// Flattens expansion pieces into [`Unit`]s: config text and `$!name` values become
+/// characters, `$name` values stay whole.
+fn command_units(pieces: &[Piece]) -> Vec<Unit<'_>> {
+    let mut units = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Text(text) | Piece::Raw(text) => units.extend(text.chars().map(Unit::Char)),
+            Piece::Value(value) => units.push(Unit::Value(value)),
+        }
+    }
+    units
+}
+
+/// The command line as one string, for messages.
+fn pieces_display(pieces: &[Piece]) -> String {
+    pieces.iter().map(Piece::text).collect()
+}
+
+/// A word of a command line being collected by [`parse_units`].
+#[derive(Default)]
+struct Word {
+    /// The word's text so far, quotes and escapes removed.
+    text: String,
+    /// Whether a `$name` value is part of the word: such a word is kept even when empty,
+    /// so a value always makes exactly one argument.
+    has_value: bool,
+    /// Whether anything has been added yet.
+    started: bool,
+    /// Whether the word started with config text (only then is a leading `~` expanded:
+    /// a value that begins with `~` stays as written).
+    tilde: bool,
+}
+
+impl Word {
+    /// Adds a config-text character.
+    fn push_char(&mut self, c: char) {
+        if !self.started {
+            self.started = true;
+            self.tilde = true;
+        }
+        self.text.push(c);
+    }
+
+    /// Adds a `$name` value, verbatim.
+    fn push_value(&mut self, value: &str) {
+        self.started = true;
+        self.has_value = true;
+        self.text.push_str(value);
+    }
+
+    /// Whether the word should become an argument.
+    fn is_word(&self) -> bool {
+        !self.text.is_empty() || self.has_value
+    }
+
+    /// The finished argument, with a leading config-text `~` expanded.
+    fn finish(self) -> String {
+        if self.tilde {
+            expand_tilde(&self.text)
+        } else {
+            self.text
+        }
+    }
+}
+
+/// Splits command-line units into words: [`parse_command_line`]'s rules for config text,
+/// while each `$name` value is appended verbatim to the word it is in (never split,
+/// unquoted or escaped, never tilde-expanded).
+fn parse_units(units: &[Unit], display: &str) -> Result<CommandSpec, String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = Word::default();
+    let mut quote: Option<char> = None;
+    let mut units = units.iter();
+
+    while let Some(unit) = units.next() {
+        let c = match unit {
+            Unit::Value(value) => {
+                current.push_value(value);
+                continue;
+            }
+            Unit::Char(c) => *c,
+        };
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            } else {
+                current.push_char(c);
+            }
+            continue;
+        }
+        match c {
+            ' ' | '\t' => {
+                if current.is_word() {
+                    words.push(std::mem::take(&mut current).finish());
+                }
+                current = Word::default();
+            }
+            '"' | '\'' => quote = Some(c),
+            '\\' => match units.next() {
+                Some(Unit::Char(next)) => current.push_char(*next),
+                Some(Unit::Value(value)) => current.push_value(value),
+                None => {}
+            },
+            _ => current.push_char(c),
+        }
+    }
+    if quote.is_some() {
+        return Err(format!("unbalanced quotes in \"{display}\""));
+    }
+    if current.is_word() {
+        words.push(current.finish());
+    }
+    let mut words = words.into_iter();
+    match words.next() {
+        Some(program) if !program.is_empty() => Ok(CommandSpec {
+            program,
+            args: words.collect(),
+        }),
+        _ => Err(format!("empty command in \"{display}\"")),
+    }
 }
 
 /// Splits a whitespace-separated command line into a program and its arguments.
@@ -2067,50 +2202,36 @@ fn params_command(
 /// is expanded to `$HOME` via [`expand_tilde`], so `~/scripts/foo.sh --config
 /// ~/my.json` resolves both paths.
 pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = params.chars();
-    let mut quote: Option<char> = None;
+    let units: Vec<Unit> = params.chars().map(Unit::Char).collect();
+    parse_units(&units, params)
+}
 
-    while let Some(c) = chars.next() {
+/// Whether command-line units need a shell: an unquoted shell operator in the config
+/// text. `$name` values are never looked into, so a value cannot make a command run
+/// through a shell.
+fn units_need_shell(units: &[Unit]) -> bool {
+    let mut quote: Option<char> = None;
+    let mut units = units.iter();
+    while let Some(unit) = units.next() {
+        let Unit::Char(c) = *unit else {
+            continue;
+        };
         if let Some(open) = quote {
             if c == open {
                 quote = None;
-            } else {
-                current.push(c);
             }
             continue;
         }
         match c {
-            ' ' | '\t' => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
             '"' | '\'' => quote = Some(c),
             '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
+                units.next();
             }
-            _ => current.push(c),
+            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
+            _ => {}
         }
     }
-    if quote.is_some() {
-        return Err(format!("unbalanced quotes in \"{params}\""));
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    if words.is_empty() {
-        return Err(format!("empty command in \"{params}\""));
-    }
-
-    let mut words = words.into_iter();
-    Ok(CommandSpec {
-        program: expand_tilde(&words.next().unwrap()),
-        args: words.map(|arg| expand_tilde(&arg)).collect(),
-    })
+    false
 }
 
 /// Whether an already-expanded command line needs a shell to run: it contains an
@@ -2122,38 +2243,94 @@ pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
 /// quotes, exactly as [`parse_command_line`] treats them. A command without any operator
 /// runs directly, so no shell is involved.
 pub fn command_needs_shell(text: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if let Some(open) = quote {
-            if c == open {
-                quote = None;
+    let units: Vec<Unit> = text.chars().map(Unit::Char).collect();
+    units_need_shell(&units)
+}
+
+/// The `sh -c` script for command-line units, plus the `$name` values it reads.
+///
+/// Config text is copied as written. Each `$name` value becomes a positional parameter
+/// (`${1}`, `${2}`, ...) passed to `sh` as a separate argument, quoted for where it
+/// appears: `"${N}"` outside quotes, `${N}` inside double quotes, `'"${N}"'` inside single
+/// quotes. The shell never parses the text of an expansion, so a value can hold `;`, `|`,
+/// `$(...)` or quotes and still only be data. A backslash in the config text directly
+/// before a value is doubled, so it stays a literal backslash instead of escaping the
+/// quoting added here.
+fn shell_script(units: &[Unit]) -> (String, Vec<String>) {
+    #[derive(PartialEq)]
+    enum Context {
+        Unquoted,
+        Single,
+        Double,
+    }
+    let mut script = String::new();
+    let mut values: Vec<String> = Vec::new();
+    let mut context = Context::Unquoted;
+    let mut escaped = false;
+    for unit in units {
+        match *unit {
+            Unit::Value(value) => {
+                if escaped {
+                    script.push('\\');
+                    escaped = false;
+                }
+                values.push(value.to_string());
+                let parameter = format!("${{{}}}", values.len());
+                match context {
+                    Context::Unquoted => script.push_str(&format!("\"{parameter}\"")),
+                    Context::Double => script.push_str(&parameter),
+                    Context::Single => script.push_str(&format!("'\"{parameter}\"'")),
+                }
             }
-            continue;
-        }
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '\\' => {
-                chars.next();
+            Unit::Char(c) => {
+                script.push(c);
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match (&context, c) {
+                    (Context::Unquoted, '\\') | (Context::Double, '\\') => escaped = true,
+                    (Context::Unquoted, '\'') => context = Context::Single,
+                    (Context::Unquoted, '"') => context = Context::Double,
+                    (Context::Single, '\'') | (Context::Double, '"') => context = Context::Unquoted,
+                    _ => {}
+                }
             }
-            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
-            _ => {}
         }
     }
-    false
+    (script, values)
 }
 
 /// Builds the command to run for an already-expanded command line: `sh -c "<text>"` when
 /// the line contains shell syntax (so pipes and redirection work), or a direct
 /// [`parse_command_line`] program plus arguments otherwise.
 pub fn build_command(text: &str) -> Result<CommandSpec, String> {
-    if command_needs_shell(text) {
+    build_command_pieces(&[Piece::Text(text.to_string())])
+}
+
+/// Builds the command to run for an expanded command line (see
+/// [`Variables::expand_pieces`]).
+///
+/// Whether it runs through a shell is decided by the config text (and `$!name` values)
+/// only. Without a shell, each `$name` value is exactly one argument (or part of one);
+/// with a shell it is passed as a positional parameter the script only expands (see
+/// [`shell_script`]). Either way program output stored in a variable can never inject
+/// commands or extra arguments; `$!name` pastes a value in as config text instead.
+pub fn build_command_pieces(pieces: &[Piece]) -> Result<CommandSpec, String> {
+    let units = command_units(pieces);
+    if units_need_shell(&units) {
+        let (script, values) = shell_script(&units);
+        let mut args = vec!["-c".to_string(), script];
+        if !values.is_empty() {
+            args.push("dak".to_string());
+            args.extend(values);
+        }
         Ok(CommandSpec {
             program: "sh".to_string(),
-            args: vec!["-c".to_string(), text.to_string()],
+            args,
         })
     } else {
-        parse_command_line(text)
+        parse_units(&units, &pieces_display(pieces))
     }
 }
 
@@ -3787,8 +3964,14 @@ pub enum Action {
     SwitchScene {
         scene: String,
     },
+    /// A command as written in the config, unexpanded (what [`parse_action`] returns).
     Command {
         command: String,
+    },
+    /// A command ready to run, built by [`resolve_action`] from the expanded action
+    /// (see [`build_command_pieces`]).
+    Run {
+        spec: CommandSpec,
     },
     Assign {
         target: AssignTarget,
@@ -3842,13 +4025,49 @@ pub fn parse_action(value: &str) -> Action {
 /// current state first.
 ///
 /// An assignment is parsed structurally without expanding its left-hand side (only the
-/// assignment's own right-hand side is resolved, when it fires); every other value -
-/// a scene switch target, a command - is expanded as a whole.
+/// assignment's own right-hand side is resolved, when it fires). Otherwise the action is
+/// classified by its config text, never by a `$name` value: text starting with `@` is a
+/// scene switch (a value may name the scene), and anything else is a command, returned
+/// as [`Action::Run`] and built by [`build_command_pieces`], so a `$name` value is always
+/// data. `$!name` values count as config text: an action made of just `$!name` is
+/// re-read as a whole action, so its value may be `@scene` or an assignment.
 pub fn resolve_action(value: &str, variables: &Variables) -> Result<Action, String> {
     if value.starts_with('$') && parse_assignment(value).is_some() {
         return Ok(parse_action(value));
     }
-    Ok(parse_action(&variables.expand(value)?))
+    let pieces = merge_raw_pieces(variables.expand_pieces(value)?);
+    if let Some(Piece::Text(first)) = pieces.first() {
+        if first.starts_with('@') {
+            return Ok(parse_action(&pieces_display(&pieces)));
+        }
+        if first.starts_with('$') && pieces.len() == 1 {
+            // Only reachable through `$!name` (or an escaped `\$`): re-read as an
+            // action, the pre-v0.15.0 behaviour.
+            let action = parse_action(first);
+            if !matches!(action, Action::Command { .. }) {
+                return Ok(action);
+            }
+        }
+    }
+    Ok(Action::Run {
+        spec: build_command_pieces(&pieces)?,
+    })
+}
+
+/// Turns every [`Piece::Raw`] into config text, merging it with its neighbours, so only
+/// [`Piece::Value`]s stay apart.
+fn merge_raw_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut merged: Vec<Piece> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Value(value) => merged.push(Piece::Value(value)),
+            Piece::Text(text) | Piece::Raw(text) => match merged.last_mut() {
+                Some(Piece::Text(last)) => last.push_str(&text),
+                _ => merged.push(Piece::Text(text)),
+            },
+        }
+    }
+    merged
 }
 
 /// One scalar value on its way into an assignment, kept in its source precision until it
@@ -4164,8 +4383,7 @@ fn prepare_command_assignment(
             ),
         },
     };
-    let expanded = state.expand(inner)?;
-    let spec = build_command(&expanded)?;
+    let spec = build_command_pieces(&state.expand_pieces(inner)?)?;
     Ok((conversion, spec, label))
 }
 
@@ -5779,18 +5997,20 @@ mod tests {
     #[test]
     fn resolve_action_expands_values_but_not_assignment_targets() {
         let variables = scene_variables();
+        let run = |program: &str, args: &[&str]| super::Action::Run {
+            spec: super::CommandSpec {
+                program: program.to_string(),
+                args: args.iter().map(|arg| arg.to_string()).collect(),
+            },
+        };
         assert_eq!(
             super::resolve_action("/bin/echo $dir", &variables).unwrap(),
-            super::Action::Command {
-                command: "/bin/echo a".to_string()
-            }
+            run("/bin/echo", &["a"])
         );
         // A value that is exactly one reference expands to just its value.
         assert_eq!(
             super::resolve_action("$dir", &variables).unwrap(),
-            super::Action::Command {
-                command: "a".to_string()
-            }
+            run("a", &[])
         );
         assert!(super::resolve_action("/bin/echo $missing", &variables).is_err());
         assert_eq!(
@@ -6022,6 +6242,240 @@ mod tests {
             matches!(received, Ok(None)),
             "an undeclared target must not spawn a command: {received:?}"
         );
+    }
+
+    /// Variables for the injection tests: `$v` holds `value`, `$n` an int.
+    fn hostile_variables(value: &str) -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "v".to_string(),
+            crate::variables::VarDef::string(65535, value.to_string()),
+        );
+        defs.insert("n".to_string(), crate::variables::VarDef::int(0, 100, 7));
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
+    }
+
+    /// Builds the command for `template` with `$v` set to `value`.
+    fn command_with(template: &str, value: &str) -> super::CommandSpec {
+        let variables = hostile_variables(value);
+        super::build_command_pieces(&variables.expand_pieces(template).unwrap()).unwrap()
+    }
+
+    /// Values a program might print to attack a command it is substituted into.
+    const HOSTILE_VALUES: &[&str] = &[
+        "x; touch /tmp/pwned",
+        "x | sh",
+        "x && id",
+        "$(id)",
+        "`id`",
+        "a b c",
+        "it's \"quoted\"",
+        "back\\slash",
+        "line\nnext",
+        "--output=/etc/passwd",
+        "~/secret",
+        "",
+        "${1} $0 \"$@\"",
+    ];
+
+    /// In a plain command a `$name` value is always exactly one argument, verbatim: no
+    /// shell appears, it is not split, unquoted, unescaped or tilde-expanded.
+    #[test]
+    fn value_is_one_literal_argument_in_a_plain_command() {
+        for value in HOSTILE_VALUES {
+            let spec = command_with("notify-send $v", value);
+            assert_eq!(spec.program, "notify-send", "{value:?}");
+            assert_eq!(spec.args, [value.to_string()], "{value:?}");
+            // Inside a word and inside quotes it is still just part of that one word.
+            let spec = command_with("printf pre-$v-post '[$v]'", value);
+            assert_eq!(
+                spec.args,
+                [format!("pre-{value}-post"), format!("[{value}]")],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// A value can be the program itself, but still as one word.
+    #[test]
+    fn value_as_program_is_one_word() {
+        let spec = command_with("$v --flag", "my prog; rm -rf /");
+        assert_eq!(spec.program, "my prog; rm -rf /");
+        assert_eq!(spec.args, ["--flag"]);
+    }
+
+    /// An empty value as the program is an error, not an empty program name.
+    #[test]
+    fn empty_value_as_program_is_an_error() {
+        let variables = hostile_variables("");
+        let pieces = variables.expand_pieces("$v").unwrap();
+        assert!(super::build_command_pieces(&pieces)
+            .unwrap_err()
+            .contains("empty command"));
+    }
+
+    /// When the config text needs a shell, each value is passed to `sh` as a positional
+    /// parameter that the script only expands, quoted for where it appears.
+    #[test]
+    fn value_is_a_positional_parameter_in_a_shell_command() {
+        let spec = command_with("echo $v \"in $v\" 'lit $v' | wc -c", "x; id");
+        assert_eq!(spec.program, "sh");
+        assert_eq!(
+            spec.args,
+            [
+                "-c",
+                "echo \"${1}\" \"in ${2}\" 'lit '\"${3}\"'' | wc -c",
+                "dak",
+                "x; id",
+                "x; id",
+                "x; id"
+            ]
+        );
+    }
+
+    /// A backslash in the config text right before a value stays a literal backslash
+    /// instead of escaping the quote dak adds around the value.
+    #[test]
+    fn backslash_before_a_value_in_a_shell_command_is_literal() {
+        let spec = command_with("echo a\\\\$v | cat", "x");
+        assert_eq!(spec.args[1], "echo a\\\\\"${1}\" | cat");
+    }
+
+    /// Shell syntax in a value never turns a plain command into a shell command.
+    #[test]
+    fn value_never_makes_a_command_use_a_shell() {
+        for value in HOSTILE_VALUES {
+            assert_ne!(command_with("echo $v", value).program, "sh", "{value:?}");
+        }
+    }
+
+    /// `$!name` keeps the pre-v0.15.0 behaviour: the value is pasted in as config text,
+    /// so it may add arguments and shell syntax.
+    #[test]
+    fn raw_reference_is_pasted_as_config_text() {
+        let spec = command_with("echo $!v", "a b");
+        assert_eq!(spec.args, ["a", "b"]);
+        let spec = command_with("echo $!v", "a | wc -c");
+        assert_eq!(spec.program, "sh");
+        assert_eq!(spec.args, ["-c", "echo a | wc -c"]);
+        let spec = command_with("echo $!v", "~/x");
+        assert_eq!(spec.args, [super::expand_tilde("~/x")]);
+    }
+
+    /// Runs `sh` for real: the hostile values reach the program byte for byte and no
+    /// injected command runs.
+    #[tokio::test]
+    async fn shell_command_passes_hostile_values_through_unchanged() {
+        let marker = std::env::temp_dir().join(format!("dak-injection-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let attack = format!(
+            "x; touch {0} $(touch {0}) `touch {0}` '\"",
+            marker.display()
+        );
+        let spec = command_with("printf %s $v | cat", &attack);
+        let output = super::run_command_with_timeout(&spec, super::EXEC_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), attack);
+        assert!(!marker.exists(), "an injected command ran");
+    }
+
+    /// An action made of a `$name` value runs it as a single command word; it is never
+    /// re-read as a scene switch or an assignment.
+    #[test]
+    fn resolve_action_never_reinterprets_a_value() {
+        for value in ["@Main", "@", "$v := $(id)", "$n = 5"] {
+            let variables = hostile_variables(value);
+            match super::resolve_action("$v", &variables).unwrap() {
+                super::Action::Run { spec } => {
+                    assert_eq!(spec.program, value);
+                    assert!(spec.args.is_empty());
+                }
+                other => panic!("{value:?} became {other:?}"),
+            }
+        }
+    }
+
+    /// `$!name` as a whole action is re-read as an action, as before v0.15.0.
+    #[test]
+    fn resolve_action_rereads_a_raw_value() {
+        let variables = hostile_variables("@Main");
+        assert_eq!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::SwitchScene {
+                scene: "Main".to_string()
+            }
+        );
+        let variables = hostile_variables("$n = 5");
+        assert!(matches!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::Assign { .. }
+        ));
+        let variables = hostile_variables("echo a b");
+        assert_eq!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::Run {
+                spec: super::CommandSpec {
+                    program: "echo".to_string(),
+                    args: vec!["a".to_string(), "b".to_string()],
+                }
+            }
+        );
+    }
+
+    /// A scene switch may still take its scene name from a value.
+    #[test]
+    fn resolve_action_switches_to_a_scene_named_by_a_value() {
+        let variables = hostile_variables("Main");
+        assert_eq!(
+            super::resolve_action("@$v", &variables).unwrap(),
+            super::Action::SwitchScene {
+                scene: "Main".to_string()
+            }
+        );
+    }
+
+    /// `text_exec`/`image_exec`/`launch` params get the same treatment.
+    #[test]
+    fn scene_commands_keep_values_literal() {
+        let scenes = json!({
+            "main": { "setup": {
+                "1b01": { "type": "text_exec", "params": "echo $v" },
+                "1b02": { "type": "launch", "params": "echo $v | cat" },
+                "1b03": { "type": "image_exec", "params": "echo $!v" }
+            } }
+        });
+        let variables = hostile_variables("a; id");
+        let operations = super::scene_operations_with("main", &scenes, &variables).unwrap();
+        let commands: Vec<&super::CommandSpec> = operations
+            .iter()
+            .map(|op| match op {
+                super::SceneOp::TextExec { command, .. }
+                | super::SceneOp::ImageExec { command, .. }
+                | super::SceneOp::Launch { command, .. } => command,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(commands[0].args, ["a; id"]);
+        assert_eq!(
+            commands[1].args,
+            ["-c", "echo \"${1}\" | cat", "dak", "a; id"]
+        );
+        assert_eq!(commands[2].args, ["-c", "echo a; id"]);
+    }
+
+    /// A `$(command)` assignment's command keeps values literal too.
+    #[test]
+    fn command_assignment_keeps_values_literal() {
+        let variables = hostile_variables("x; id");
+        let (_, spec, _) = super::prepare_command_assignment(
+            &super::AssignTarget::Variable("v".to_string()),
+            "echo $v",
+            &variables,
+        )
+        .unwrap();
+        assert_eq!(spec.program, "echo");
+        assert_eq!(spec.args, ["x; id"]);
     }
 
     /// A variable store for scene/param tests: `dir` is a string, `period` an int.

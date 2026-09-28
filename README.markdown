@@ -311,7 +311,8 @@ exactly as it was set, so a name stays a name.
 References are substituted in every action string, in `setup` `params` and in the
 `timer` seconds key, resolved when the value is actually used, so they always see the
 current value. An int renders as its decimal digits; a str is inserted verbatim (no
-quotes added).
+quotes added). In a command a value is always data, never command syntax - see
+[Values in commands](#values-in-commands).
 
 A name is greedy (`$name_kun` reads `name_kun`). Escape the next character with a
 backslash to end it: `$name\-kun` is the value of `name` followed by `-kun`, and
@@ -359,10 +360,35 @@ Assignments write runtime state only: `config.json` is never modified.
 #### Commands and the shell
 
 A command - an action command, an `image_exec`/`text_exec`/`launch` `params`, or a
-`$(command)` - runs directly when it contains no unquoted shell operator, and through
-`sh -c` when it contains one of `` | & ; < > ` ( ) `` or a newline. Pipelines and
-redirection therefore work when you write them, while a plain command never grows a
-shell.
+`$(command)` - runs directly when its config text contains no unquoted shell operator,
+and through `sh -c` when it contains one of `` | & ; < > ` ( ) `` or a newline.
+Pipelines and redirection therefore work when you write them, while a plain command
+never grows a shell - not even when a variable's value contains shell syntax.
+
+#### Values in commands
+
+A variable may hold any text, including `|`, `;`, `$(`, quotes or newlines, and this
+text often comes from other programs (a `$(command)` assignment storing a track title,
+a window title, a web page). So inside a command, a `$name` value is always **data**:
+
+- In a plain command it is exactly one argument (or part of one), as written: it is not
+  split at spaces, quotes and backslashes in it are kept, and a leading `~` in it is not
+  expanded. `notify-send $title` passes the whole title as one argument, even when it is
+  `x; rm -rf ~` or empty.
+- In a command that runs through `sh -c`, dak hands each value to the shell as a
+  separate argument and the script only expands it (as `"${1}"`, `"${2}"`, ...), quoted
+  for where the reference appears; the shell never parses the value, so
+  `echo $title | wc -c` counts the characters of any title. The script therefore sees
+  those values as its positional parameters.
+- An action that is just `$name` runs the value as one program name; it is never read as
+  a scene switch (`@...`) or an assignment. `@$name` still switches to the scene the
+  value names.
+
+`$!name` (and `$!scope.name`) pastes the value in as if you had typed it into the config
+instead: it is split into words, may add shell syntax (so the command may start using a
+shell) and, as a whole action, may be `@scene` or an assignment. This is how `$name`
+behaved before v0.15.0. **Use `$!` only for values you control** - never for text that
+came from another program.
 
 #### Actions run in parallel
 
