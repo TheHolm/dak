@@ -28,11 +28,11 @@ use std::os::unix::process::CommandExt as _;
 /// Parsed and validated config plus any non-fatal warnings collected while validating it.
 #[derive(Debug)]
 pub struct LoadedConfig {
-    /// The optional top-level `version` string, defaulting to [`DEFAULT_CONFIG_VERSION`]
-    /// when absent. Not currently interpreted (no version-specific parsing exists yet) -
-    /// just carried through and printed on startup, so future config schema changes have
-    /// somewhere to record which shape a file was written for.
-    pub version: String,
+    /// The top-level `version` (the config schema version the file was written for),
+    /// [`SUPPORTED_CONFIG_VERSION`] when absent. Validation already refused a different
+    /// major version; a newer minor version only produced a warning. Printed on startup,
+    /// and the place future schema changes can branch on.
+    pub version: ConfigVersion,
     /// The validated `scenes` section: a dictionary whose keys are scene names.
     pub scenes: Value,
     /// The validated `devices` section, keyed by logical device id.
@@ -57,8 +57,88 @@ pub struct LoadedConfig {
     pub logging: crate::log::LoggingConfig,
 }
 
-/// The config `version` assumed when the top-level `version` key is absent.
-pub const DEFAULT_CONFIG_VERSION: &str = "1.0";
+/// A config schema version, written `"MAJOR.MINOR"` in the top-level `version` key. This
+/// is the version of the config file format, not of dak: `major` is raised when a change
+/// breaks existing configs (a key renamed or removed, or its meaning changed), `minor`
+/// when a change only adds something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ConfigVersion {
+    /// Raised by changes that break existing configs.
+    pub major: u32,
+    /// Raised by backwards-compatible additions; reset to 0 with each new major.
+    pub minor: u32,
+}
+
+impl std::fmt::Display for ConfigVersion {
+    /// Formats the version the way it is written in a config: `MAJOR.MINOR`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// The newest config schema version this build understands; also the version assumed
+/// when the top-level `version` key is absent. `tests/man_pages.rs` requires
+/// `dak-config.5` to name it.
+pub const SUPPORTED_CONFIG_VERSION: ConfigVersion = ConfigVersion { major: 1, minor: 0 };
+
+/// Parses a `"MAJOR.MINOR"` config version: exactly two dot-separated runs of ASCII
+/// digits, without leading zeros (a lone `0` is fine) and small enough for a `u32`.
+/// Returns the reason on anything else.
+fn parse_config_version(text: &str) -> Result<ConfigVersion, String> {
+    /// Parses one component, refusing empty strings, non-digits and leading zeros.
+    fn component(part: &str) -> Option<u32> {
+        let digits_only = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        let leading_zero = part.len() > 1 && part.starts_with('0');
+        if !digits_only || leading_zero {
+            return None;
+        }
+        part.parse().ok()
+    }
+    let invalid = || {
+        format!(
+            "top-level \"version\" must look like \"MAJOR.MINOR\" (e.g. \"{SUPPORTED_CONFIG_VERSION}\"), got {}",
+            serde_json::Value::from(text)
+        )
+    };
+    let (major, minor) = text.split_once('.').ok_or_else(invalid)?;
+    match (component(major), component(minor)) {
+        (Some(major), Some(minor)) => Ok(ConfigVersion { major, minor }),
+        _ => Err(invalid()),
+    }
+}
+
+/// How a config's version relates to [`SUPPORTED_CONFIG_VERSION`].
+#[derive(Debug, PartialEq, Eq)]
+enum VersionCheck {
+    /// Same major, same or older minor: fully understood.
+    Supported,
+    /// Same major, newer minor: loads, but may use settings this build does not know.
+    NewerMinor(String),
+    /// A different major: refused with this message.
+    Unsupported(String),
+}
+
+/// Compares `version` against [`SUPPORTED_CONFIG_VERSION`] and words the outcome.
+fn check_config_version(version: ConfigVersion) -> VersionCheck {
+    let supported = SUPPORTED_CONFIG_VERSION;
+    if version.major > supported.major {
+        VersionCheck::Unsupported(format!(
+            "config version {version} needs a newer dak (this one supports config version {supported})"
+        ))
+    } else if version.major < supported.major {
+        VersionCheck::Unsupported(format!(
+            "config version {version} is an old format this dak no longer reads (it supports config \
+             version {supported}); see RELEASE_NOTES.md and dak-config(5) for how to update it"
+        ))
+    } else if version.minor > supported.minor {
+        VersionCheck::NewerMinor(format!(
+            "config version {version} is newer than this dak supports ({supported}); settings \
+             added after {supported} will be rejected"
+        ))
+    } else {
+        VersionCheck::Supported
+    }
+}
 
 /// Every key the top-level config object may contain; anything else is rejected. This is
 /// also the vocabulary `tests/man_pages.rs` requires `dak-config.5` to document.
@@ -415,11 +495,13 @@ pub fn strip_comments(input: &str) -> String {
     out
 }
 
-/// Validates the whole config (the `scenes` and `devices` sections), returning all errors at
-/// once or warnings with the parsed config.
+/// Validates the whole config, returning all errors at once or warnings with the parsed
+/// config. The top-level `version` is checked first (see [`check_config_version`]): a
+/// different major version is the only error reported, a newer minor version a warning
+/// that leads the warnings, or the errors if the rest does not validate.
 fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
 
     let map = match config.as_object() {
         Some(map) => map,
@@ -430,6 +512,57 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
         }
     };
 
+    // The version comes first: a file written for another major version is reported
+    // with that one error rather than the unknown keys and bad values it would cause.
+    let mut newer_minor = None;
+    let version = match map.get("version") {
+        None => SUPPORTED_CONFIG_VERSION,
+        Some(value) => match value.as_str().map(parse_config_version) {
+            Some(Ok(version)) => {
+                match check_config_version(version) {
+                    VersionCheck::Supported => {}
+                    VersionCheck::NewerMinor(message) => newer_minor = Some(message),
+                    VersionCheck::Unsupported(message) => return Err(vec![message]),
+                }
+                version
+            }
+            Some(Err(message)) => {
+                errors.push(message);
+                SUPPORTED_CONFIG_VERSION
+            }
+            None => {
+                errors.push(format!(
+                    "top-level \"version\" must be a string, got {}",
+                    value_type(value)
+                ));
+                SUPPORTED_CONFIG_VERSION
+            }
+        },
+    };
+    // A newer minor version is only a warning, but when the config does not validate its
+    // errors are most likely the newer settings, so say so next to them as well.
+    let result = validate_sections(map, version, errors, warnings);
+    match (result, newer_minor) {
+        (Ok(mut config), Some(message)) => {
+            config.warnings.insert(0, message);
+            Ok(config)
+        }
+        (Err(mut errors), Some(message)) => {
+            errors.insert(0, message);
+            Err(errors)
+        }
+        (result, None) => result,
+    }
+}
+
+/// Validates everything below the top-level `version` (whose outcome is `version`),
+/// adding to the `errors`/`warnings` collected so far.
+fn validate_sections(
+    map: &serde_json::Map<String, Value>,
+    version: ConfigVersion,
+    mut errors: Vec<String>,
+    mut warnings: Vec<String>,
+) -> Result<LoadedConfig, Vec<String>> {
     for key in map.keys() {
         if !TOP_LEVEL_KEYS.contains(&key.as_str()) {
             errors.push(format!(
@@ -450,20 +583,6 @@ fn validate(config: &Value) -> Result<LoadedConfig, Vec<String>> {
     if missing_scenes || missing_devices {
         return Err(errors);
     }
-
-    let version = match map.get("version") {
-        Some(value) => match value.as_str() {
-            Some(version) => version.to_string(),
-            None => {
-                errors.push(format!(
-                    "top-level \"version\" must be a string, got {}",
-                    value_type(value)
-                ));
-                DEFAULT_CONFIG_VERSION.to_string()
-            }
-        },
-        None => DEFAULT_CONFIG_VERSION.to_string(),
-    };
 
     let scenes = map.get("scenes").expect("checked above");
     let devices = map.get("devices").expect("checked above");
@@ -7562,5 +7681,119 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(seconds, crate::limits::MIN_TIMER_SECONDS);
+    }
+
+    /// Well-formed `MAJOR.MINOR` versions parse, including `0` components and values
+    /// with several digits.
+    #[test]
+    fn parse_config_version_accepts_major_dot_minor() {
+        use super::{parse_config_version, ConfigVersion};
+        let version = |major, minor| ConfigVersion { major, minor };
+        assert_eq!(parse_config_version("1.0"), Ok(version(1, 0)));
+        assert_eq!(parse_config_version("0.9"), Ok(version(0, 9)));
+        assert_eq!(parse_config_version("12.34"), Ok(version(12, 34)));
+    }
+
+    /// Anything but exactly two digit runs without leading zeros is refused, with the
+    /// offending text and the expected shape in the message.
+    #[test]
+    fn parse_config_version_refuses_other_shapes() {
+        for text in [
+            "",
+            "1",
+            "1.",
+            ".0",
+            "1.0.0",
+            "01.0",
+            "1.00",
+            "v1.0",
+            "1.0 ",
+            " 1.0",
+            "+1.0",
+            "-1.0",
+            "1,0",
+            "١.٠",
+            "99999999999.0",
+        ] {
+            let error = super::parse_config_version(text).unwrap_err();
+            assert!(error.contains("\"MAJOR.MINOR\""), "{text:?}: {error}");
+            assert!(error.contains("e.g. \"1.0\""), "{text:?}: {error}");
+            assert!(
+                error.contains(&serde_json::Value::from(text).to_string()),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    /// `Display` writes a version back the way a config spells it.
+    #[test]
+    fn config_version_displays_as_major_dot_minor() {
+        let version = super::ConfigVersion {
+            major: 3,
+            minor: 12,
+        };
+        assert_eq!(version.to_string(), "3.12");
+    }
+
+    /// Versions order by major, then minor.
+    #[test]
+    fn config_versions_order_by_major_then_minor() {
+        use super::ConfigVersion;
+        let version = |major, minor| ConfigVersion { major, minor };
+        assert!(version(1, 9) < version(2, 0));
+        assert!(version(1, 0) < version(1, 1));
+    }
+
+    /// Every outcome of the comparison against the supported version: same or older
+    /// minor is fine, a newer minor is a warning, any other major is refused with a
+    /// message saying which way to go.
+    #[test]
+    fn check_config_version_outcomes() {
+        use super::{check_config_version, ConfigVersion, VersionCheck, SUPPORTED_CONFIG_VERSION};
+        let supported = SUPPORTED_CONFIG_VERSION;
+        assert_eq!(check_config_version(supported), VersionCheck::Supported);
+        if supported.minor > 0 {
+            let older = ConfigVersion {
+                minor: supported.minor - 1,
+                ..supported
+            };
+            assert_eq!(check_config_version(older), VersionCheck::Supported);
+        }
+
+        let newer_minor = ConfigVersion {
+            minor: supported.minor + 1,
+            ..supported
+        };
+        match check_config_version(newer_minor) {
+            VersionCheck::NewerMinor(message) => {
+                assert!(message.contains(&format!("config version {newer_minor} is newer")));
+                assert!(message.contains(&format!("({supported})")), "{message}");
+            }
+            other => panic!("expected a warning, got {other:?}"),
+        }
+
+        let newer_major = ConfigVersion {
+            major: supported.major + 1,
+            minor: 0,
+        };
+        match check_config_version(newer_major) {
+            VersionCheck::Unsupported(message) => {
+                assert!(message.contains("needs a newer dak"), "{message}");
+                assert!(message.contains(&supported.to_string()), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let older_major = ConfigVersion {
+            major: supported.major - 1,
+            minor: 99,
+        };
+        match check_config_version(older_major) {
+            VersionCheck::Unsupported(message) => {
+                assert!(message.contains("old format"), "{message}");
+                assert!(message.contains("RELEASE_NOTES.md"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }

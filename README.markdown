@@ -13,7 +13,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.15.0**.
+The current version is **v1.0.0**.
 
 ## Usage
 
@@ -112,7 +112,7 @@ config is a dictionary with up to six keys:
 - `"variables"` — optional declared variables that actions read and assign (see [Variables](#variables))
 - `"defaults"` — optional press-detection timing knobs, connect-time brightness levels, colours, text markup and fonts (see [Defaults](#defaults))
 - `"logging"` — optional log destinations and detail (see [Logging](#logging))
-- `"version"` — optional config schema version string, defaulting to `"1.0"` when absent. Not currently interpreted (there is only one schema so far) - printed on startup (`Loaded config version X from ...`) so future schema changes have somewhere to record which shape a file was written for.
+- `"version"` — optional config schema version, a `"MAJOR.MINOR"` string (digits only, no leading zeros). This dak supports config version `"1.0"`, which is also assumed when the key is absent. It is the version of the config format, not of dak: the major number is raised only for changes that break existing configs, the minor number for additions. A file with a higher minor version (e.g. `"1.1"`) still loads, with a warning that it was written for a newer dak; a different major version (`"2.0"`, `"0.9"`) or a malformed one is a config error. The version is printed on startup (`Loaded config version X from ...`).
 
 ### Comments
 

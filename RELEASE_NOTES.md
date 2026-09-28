@@ -5,6 +5,43 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v1.0.0 — First major release: config version validation
+
+### User-facing changes
+- **dak 1.0.0.** The first major release: the feature set of v0.15.0 plus a
+  checked config schema version, so future config format changes can be
+  detected and reported instead of silently misread.
+- **The config `version` is now checked.** It must be a `"MAJOR.MINOR"`
+  string (digits only, no leading zeros); this dak supports config version
+  `1.0`, still assumed when the key is absent, so existing configs keep
+  working. It is the version of the config format, not of dak.
+- **A config written for a newer dak says so.** A higher minor version
+  (e.g. `"1.1"`) loads with a warning that settings added after 1.0 will be
+  rejected. A different major version (`"2.0"`, `"0.9"`) is refused as a
+  config error (exit status 3) with that one message, instead of a list of
+  unknown keys. Malformed versions (`"1"`, `"1.0.0"`, `"v1.0"`, ...) are
+  config errors too; before, any string was accepted.
+
+### Details
+- `src/actions.rs`: new `ConfigVersion { major, minor }` (ordered, `Display`
+  as `MAJOR.MINOR`) and `SUPPORTED_CONFIG_VERSION` replace the
+  `DEFAULT_CONFIG_VERSION` string; `LoadedConfig::version` is now a
+  `ConfigVersion`. `parse_config_version` accepts exactly two ASCII digit runs
+  without leading zeros that fit a `u32`; `check_config_version` classifies
+  the result as supported, newer minor (warning) or unsupported major (error
+  saying whether a newer dak is needed or the file must be updated).
+- `validate` checks the version before anything else and returns a
+  major-version error alone; the rest moved into `validate_sections`. A
+  newer-minor warning leads the warnings, and is also put in front of the
+  errors when the config fails, since those are most likely the newer settings.
+- Tests: unit tests for parsing, ordering, display and every comparison
+  outcome; `tests/validation.rs` covers absent/supported/newer-minor/
+  newer-major/older-major/malformed/non-string versions;
+  `tests/exit_status.rs` checks exit status 3 for a newer major and a normal
+  start with a warning for a newer minor; `tests/man_pages.rs` requires
+  `dak-config.5` to name `SUPPORTED_CONFIG_VERSION`.
+- Docs: `dak-config(5)` and the README describe the format and the rules.
+
 ## v0.15.0 — Security hardening
 
 ### User-facing changes

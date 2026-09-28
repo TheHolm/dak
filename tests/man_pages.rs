@@ -15,7 +15,8 @@
 
 use clap::CommandFactory;
 use dak::actions::{
-    CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
+    CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS,
+    SUPPORTED_CONFIG_VERSION, TOP_LEVEL_KEYS,
 };
 use dak::cli::Cli;
 use dak::imaging::FORMATS as IMAGE_FORMATS;
@@ -621,6 +622,20 @@ fn dak_config_5_documents_the_config_vocabulary() {
             );
         }
     }
+}
+
+/// `man/dak-config.5` states the config schema version this build supports, taken
+/// straight from `SUPPORTED_CONFIG_VERSION`, so raising it cannot leave the page behind.
+#[test]
+fn dak_config_5_names_the_supported_config_version() {
+    let text = canonical_text(
+        &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
+    );
+    let sentence = format!("supports config version {SUPPORTED_CONFIG_VERSION}.");
+    assert!(
+        text.contains(&sentence),
+        "man/dak-config.5 does not say {sentence:?}"
+    );
 }
 
 /// The EXIT STATUS section of `dak(1)` lists every status the program can exit with,

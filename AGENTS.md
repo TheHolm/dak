@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.15.0 (declared as `0.15.0` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v1.0.0 (declared as `1.0.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -50,7 +50,12 @@ under other platforms.
   `SETUP_ENTRY_FIELDS`, `CONTROL_EVENTS`, `ENCODER_EVENTS`) that both validation and
   `tests/man_pages.rs` use. Config loading also loads `defaults.fonts` into
   `LoadedConfig::fonts`, which `main.rs` hands every `SceneRunner` via
-  `set_text_settings` together with `defaults.markup`
+  `set_text_settings` together with `defaults.markup`. The top-level `version` is a
+  `ConfigVersion` (`MAJOR.MINOR` schema version, not dak's) checked first against
+  `SUPPORTED_CONFIG_VERSION` (currently 1.0, also assumed when absent): another major
+  is the only error reported, a newer minor a warning. Raise the major for changes that
+  break existing configs, the minor for additions; `tests/man_pages.rs` requires
+  `dak-config.5` to name the supported version
 - `src/variables.rs` — declared variables and their validation, `$` reference
   expansion/substitution, and the runtime variable/default state
   (`VariableStore`/`Variables`) shared by every device. `expand_pieces` keeps config
