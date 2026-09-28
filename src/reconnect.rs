@@ -334,6 +334,10 @@ pub fn disconnected_message(device_number: u8, reason: &str) -> String {
 
 /// The always-shown line printed when device `device_number` is connected again.
 pub fn reconnected_message(device_number: u8, name: &str, serial: &str) -> String {
+    let (name, serial) = (
+        crate::log::escape_text(name),
+        crate::log::escape_text(serial),
+    );
     format!("device #{device_number} reconnected ({name} s/n {serial})")
 }
 
@@ -411,6 +415,13 @@ mod tests {
         // A minute later the old disconnects no longer count.
         let later = start + FLAP_WINDOW;
         assert_eq!(flapping.on_disconnect(later), Duration::ZERO);
+    }
+
+    /// A reconnected device's name and serial come from the device and are escaped.
+    #[test]
+    fn reconnected_message_escapes_device_strings() {
+        let text = reconnected_message(1, "pad\u{1b}[H", "S\n1");
+        assert_eq!(text, "device #1 reconnected (pad\\u{1b}[H s/n S\\n1)");
     }
 
     /// A test error: `gone` marks it as a disconnect for [`is_gone`].

@@ -299,11 +299,13 @@ impl<R: io::BufRead, O: Write, E: Write> Console<R, O, E> {
 
     /// Writes one line of output.
     fn say(&mut self, text: impl std::fmt::Display) {
+        let text = crate::log::escape_controls(&text.to_string());
         let _ = writeln!(self.out, "{text}");
     }
 
     /// Writes one line to the complaint stream.
     fn complain(&mut self, text: impl std::fmt::Display) {
+        let text = crate::log::escape_controls(&text.to_string());
         let _ = writeln!(self.err, "{text}");
     }
 
@@ -625,7 +627,8 @@ fn device_summary(
     serial: &Option<String>,
     name: &str,
 ) -> String {
-    let serial = serial.as_deref().unwrap_or("unknown");
+    let serial = crate::log::escape_text(serial.as_deref().unwrap_or("unknown"));
+    let name = crate::log::escape_text(name);
     format!("{vid:04X}:{pid:04X} path {id:?} serial {serial} \"{name}\"")
 }
 
@@ -638,8 +641,9 @@ fn device_details(
     serial: &Option<String>,
     name: &str,
 ) -> String {
-    let serial = serial.as_deref().unwrap_or("unknown");
-    let path = device_path(id);
+    let serial = crate::log::escape_text(serial.as_deref().unwrap_or("unknown"));
+    let name = crate::log::escape_text(name);
+    let path = crate::log::escape_text(&device_path(id));
     format!(
         "Device name: {name}\nSerial: {serial}\nVendorID/DeviceID {vid:04X}:{pid:04X}\nDevice Path: {path}"
     )

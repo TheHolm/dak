@@ -151,7 +151,10 @@ under other platforms.
   `<N>` priority prefixes), `syslog` (libc `syslog(3)`), `file` (appended, reopenable).
   `check_logging` validates the top-level `logging` section into `LoggingConfig`;
   `LogSettings::resolve` merges it with `CliLogging` (`--log-level`, `--log-file`,
-  `--syslog`, `-d`) and resolves `auto` from `Environment` (`JOURNAL_STREAM` matching
+  `--syslog`, `-d`) and resolves `auto` from `Environment`. Every line goes through
+  `escape_controls` (C0/C1/DEL/bidi made visible); outside text put into a message
+  (device strings, lock records, stderr, command lines) also goes through `escape_text`,
+  which escapes newlines too (`JOURNAL_STREAM` matching
   fd 2 -> journal, detached -> syslog, else console). `LOGGING_KEYS`, `LOG_OUTPUTS`,
   `LOG_LEVELS`, `SYSLOG_FACILITIES`, `TIMESTAMP_VALUES` are vocabulary constants
   `tests/man_pages.rs` checks against `dak-config.5`; `tests/logging.rs` runs the binary

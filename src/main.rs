@@ -1132,12 +1132,15 @@ async fn run_device(
     // Print out some info from the device
     log.debug(
         Subsystem::Device,
-        format!("Connected to '{}'", connected.serial_number()),
+        format!(
+            "Connected to '{}'",
+            dak::log::escape_text(connected.serial_number())
+        ),
     );
     log.info(format!(
         "Connected to {} s/n {} as device #{device_number} using protocol version {protocol_version}",
-        device_info.name,
-        connected.serial_number()
+        dak::log::escape_text(&device_info.name),
+        dak::log::escape_text(connected.serial_number())
     ));
     // How often, and how many times, to try getting this device back if it disappears:
     // its own settings where the definition has them, else the `defaults` ones.
@@ -2666,7 +2669,8 @@ fn device_summary_line(
     pid: u16,
     name: &str,
 ) -> String {
-    let serial = serial.as_deref().unwrap_or("unknown");
+    let serial = dak::log::escape_text(serial.as_deref().unwrap_or("unknown"));
+    let name = dak::log::escape_text(name);
     format!("{vid:04X}:{pid:04X} path {id:?} serial {serial} \"{name}\"")
 }
 
@@ -3346,6 +3350,16 @@ mod tests {
         assert_eq!(
             line,
             r#"0300:3002 path DevPath("/dev/hidraw3") serial ABC123 "Ajazz HOTSPOTEKUSB HID DEMO""#
+        );
+        assert_eq!(
+            super::device_summary_line(
+                &FakeDeviceId("/dev/hidraw0"),
+                &Some("S\u{1b}[2J".to_string()),
+                0x0300,
+                0x3002,
+                "k\nwarning: forged"
+            ),
+            r#"0300:3002 path DevPath("/dev/hidraw0") serial S\u{1b}[2J "k\nwarning: forged""#
         );
         assert_eq!(
             super::device_summary_line(&FakeDeviceId("/dev/hidraw0"), &None, 0x0300, 0x3002, "k"),

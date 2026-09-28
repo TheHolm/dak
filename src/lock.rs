@@ -139,11 +139,12 @@ impl DeviceKey {
 
     /// A short human name for messages, e.g. `0300:3002 s/n ABCD1234EF56`.
     pub fn describe(&self) -> String {
-        match self.identity.strip_prefix("path-") {
+        let identity = crate::log::escape_text(&self.identity);
+        match identity.strip_prefix("path-") {
             Some(path) => format!("{:04x}:{:04x} at {path}", self.vendor_id, self.product_id),
             None => format!(
-                "{:04x}:{:04x} s/n {}",
-                self.vendor_id, self.product_id, self.identity
+                "{:04x}:{:04x} s/n {identity}",
+                self.vendor_id, self.product_id
             ),
         }
     }
@@ -222,9 +223,12 @@ impl Holder {
 
     /// `dak (user alice, pid 1234, since ...)`.
     pub fn describe(&self) -> String {
+        // The record comes from a file every user can write.
         format!(
             "dak (user {}, pid {}, since {})",
-            self.user, self.pid, self.since
+            crate::log::escape_text(&self.user),
+            self.pid,
+            crate::log::escape_text(&self.since)
         )
     }
 }
@@ -747,6 +751,23 @@ mod tests {
             text.contains("pid 7") && text.contains("not signalling"),
             "{text}"
         );
+    }
+
+    /// A holder record and a serial come from outside (a file anyone can write, a
+    /// device): their control characters and newlines are shown escaped.
+    #[test]
+    fn descriptions_escape_outside_text() {
+        let holder = Holder {
+            pid: 7,
+            uid: 1,
+            user: "bob\u{1b}]52;c;eA==\u{7}".into(),
+            since: "t\nwarning: forged".into(),
+        };
+        let text = holder.describe();
+        assert!(!text.contains('\u{1b}') && !text.contains('\n'), "{text}");
+        assert!(text.contains("\\u{1b}") && text.contains("\\n"), "{text}");
+        let key = DeviceKey::new(1, 2, Some("S\u{9b}1"), "");
+        assert!(key.describe().contains("S\\u{9b}1"), "{}", key.describe());
     }
 
     /// Only a singly linked regular file is accepted as a lock file.

@@ -1813,9 +1813,12 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     /// One-line human-readable description of the command, e.g. `"/bin/echo hi"`.
+    ///
+    /// Arguments may hold variable values (program output), so control characters and
+    /// newlines are shown escaped (see [`crate::log::escape_text`]).
     pub fn display(&self) -> String {
-        let mut parts = vec![self.program.clone()];
-        parts.extend(self.args.iter().cloned());
+        let mut parts = vec![crate::log::escape_text(&self.program)];
+        parts.extend(self.args.iter().map(|arg| crate::log::escape_text(arg)));
         parts.join(" ")
     }
 }
@@ -3058,7 +3061,10 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             } => {
                 self.log.debug(
                     Subsystem::Scene,
-                    format!("render value on key {key}: \"{text}\""),
+                    format!(
+                        "render value on key {key}: \"{}\"",
+                        crate::log::escape_text(text)
+                    ),
                 );
                 let background =
                     self.draw_colour(key, "background", background.as_deref(), &self.background);
@@ -3773,13 +3779,15 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
 }
 
 /// `message` followed by the trimmed stderr excerpt (as `: <text>`, newlines shown as
-/// ` / `), or `message` alone when the program printed nothing.
+/// ` / `, other control characters escaped), or `message` alone when the program
+/// printed nothing.
 pub fn with_stderr(message: String, stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let text = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .map(crate::log::escape_text)
         .collect::<Vec<_>>()
         .join(" / ");
     if text.is_empty() {
@@ -3837,14 +3845,16 @@ pub fn clip_button_text(text: &str) -> String {
     clipped
 }
 
-/// `text` cut to [`MAX_LOGGED_WARNING_CHARS`] characters, with `...` when it was cut.
+/// `text` cut to [`MAX_LOGGED_WARNING_CHARS`] characters, with `...` when it was cut,
+/// and escaped (see [`crate::log::escape_text`]): it quotes button text, which may come
+/// from a program.
 fn clip_for_log(text: &str) -> String {
     let mut chars = text.chars();
     let mut clipped: String = chars.by_ref().take(MAX_LOGGED_WARNING_CHARS).collect();
     if chars.next().is_some() {
         clipped.push_str("...");
     }
-    clipped
+    crate::log::escape_text(&clipped)
 }
 
 /// Maximum bytes read from a `text` setup entry's file - far more than the 3x6
@@ -6762,6 +6772,20 @@ mod tests {
         let pid = read_pid(&pid_file).await;
         assert!(running(pid), "the background job was killed");
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// Command lines and stderr excerpts in messages show control characters and
+    /// newlines escaped: both can carry program output.
+    #[test]
+    fn messages_escape_program_text() {
+        let spec = super::CommandSpec {
+            program: "echo".to_string(),
+            args: vec!["a\u{1b}[2J\nb".to_string()],
+        };
+        assert_eq!(spec.display(), "echo a\\u{1b}[2J\\nb");
+        let message = super::with_stderr("failed".to_string(), b"x\x1b[31my\rz\nnext");
+        assert_eq!(message, "failed: x\\u{1b}[31my\\u{d}z / next");
+        assert_eq!(super::clip_for_log("a\u{7}"), "a\\u{7}");
     }
 
     /// Variables for the injection tests: `$v` holds `value`, `$n` an int.

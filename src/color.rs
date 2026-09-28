@@ -79,7 +79,8 @@ impl Color {
                 });
             }
             return Err(format!(
-                "invalid colour \"{value}\": expected \"#RRGGBB\" or a colour name"
+                "invalid colour \"{}\": expected \"#RRGGBB\" or a colour name",
+                crate::log::escape_text(value)
             ));
         }
 
@@ -90,7 +91,8 @@ impl Color {
                 text: text.to_string(),
             }),
             None => Err(format!(
-                "unknown colour \"{value}\": expected \"#RRGGBB\" or one of {}",
+                "unknown colour \"{}\": expected \"#RRGGBB\" or one of {}",
+                crate::log::escape_text(value),
                 colour_names()
             )),
         }
