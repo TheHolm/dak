@@ -311,7 +311,15 @@ instance's user and process id; with
 .B dak
 waits for it to be released, and with
 .B \-\-replace
-it asks the holder to stop and takes the device over. When every configured
+it asks the holder to stop and takes the device over, after checking that the
+recorded process really is a
+.B dak
+of the recorded user (lock files can be written by every user, so a record
+alone is never trusted). A lock file that is a symlink, a hard link or not a
+regular file is refused. Since the lock directory is shared, any local user can
+hold a keypad's lock and so keep it from being used; set
+.B DAK_LOCK_DIR
+to a directory only the keypad's users can write to where that matters. When every configured
 device is held elsewhere the program exits with status 5. The lock is kept
 while a lost device is being waited for, so no other instance takes it over
 meanwhile. The

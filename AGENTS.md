@@ -121,8 +121,12 @@ under other platforms.
   (`DeviceKey::file_name`, `dak-<vid>-<pid>-<serial>.lock`) in `lock_dir()`
   (`$DAK_LOCK_DIR`, else `/run/lock`, else `/tmp`), holding a `Holder` record (pid,
   uid, user, since). `try_lock`/`acquire` with `Conflict::{Refuse, Wait, Replace}`
-  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s). Opened
-  `O_NOFOLLOW|O_NONBLOCK`, without `O_CREAT` first (protected_regular), created 0666
+  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s, only after
+  `holder_is_genuine` confirmed the recorded pid is a live dak of the recorded uid - the
+  0666 record is never trusted; pid <= 1 is rejected). Opened
+  `O_NOFOLLOW|O_NONBLOCK`, must be a singly linked regular file (hard links refused),
+  without `O_CREAT` first (protected_regular), created 0666; identities that are not
+  plain `[A-Za-z0-9._-]{1,96}` get a stable FNV-1a hash suffix so names never collide
   - see `NOTES.md` section 10. `main.rs` locks each device before connecting and keeps
   the lock through reconnects; `--map` locks too. `tests/device_lock.rs` re-runs its
   own test binary as a second lock-holding process for the `--replace` tests

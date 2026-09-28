@@ -966,8 +966,22 @@ never drive the same device. Things learned while building it:
   Also: while *any* thread forks a child, that child briefly holds a copy of every
   fd until its exec closes the `O_CLOEXEC` ones, so a just-released lock can look
   held for an instant. Harmless at runtime (`--wait` retries), but tests must poll.
-- `--replace` trusts the recorded pid only while the lock is held (a live holder wrote
-  it), and signals only its own uid unless root.
+- `--replace` does **not** trust the record: lock files are 0666, so anyone can write
+  `pid=-1` (kill(-1) = every process) or another process's pid into one. `Holder::parse`
+  rejects pid <= 1, and `holder_is_genuine` requires the pid to be a live process with
+  the recorded effective uid running the same program as us (`/proc/<pid>/status` +
+  `comm` on Linux, `sysctl kern.proc.pid` `ki_uid`/`ki_comm` on FreeBSD; comparing
+  with our own comm lets the test binaries act as each other's holder). Then the
+  own-uid-or-root rule applies. The FreeBSD branch is cross-compiled only so far.
+- `O_NOFOLLOW` does not stop hard links. FreeBSD's default
+  `security.bsd.hardlink_check_uid=0` lets anyone hard-link a victim's file into `/tmp`
+  under the lock name, and dak would truncate and rewrite it. So the lock file must
+  have `st_nlink == 1` (`check_lock_file`).
+- Lock names hash (FNV-1a, stable) identities that are not already plain
+  `[A-Za-z0-9._-]{1,96}`, so `A/B` and `A_B` no longer share a lock. Plain serials keep
+  their pre-0.15 names, so an older dak still conflicts correctly with a newer one.
+- Any local user can hold a lock forever (DoS) - inherent to a shared directory;
+  documented in README/`dak.1`, `DAK_LOCK_DIR` is the way out.
 - Not verified on FreeBSD hardware yet; the Linux runs here had the keypad enumerable
   via sysfs but no `/dev/hidraw*` node, so the lock paths were tested up to the point
   the device is opened.

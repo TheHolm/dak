@@ -709,10 +709,18 @@ releases the lock whenever that dak ends, even after a crash. When another dak h
 - with `--wait` dak waits until it is released and then takes it - handy when switching
   users: the next user's dak picks the keypad up as soon as the previous one stops;
 - with `--replace` dak sends the holder `SIGTERM`, waits up to 10 s for it to clean up,
-  and takes over. Only for your own instances, or anyone's as root.
+  and takes over. Only for your own instances, or anyone's as root. Because every user
+  can write to lock files, dak first checks that the recorded process really is a dak
+  running as the recorded user, and refuses to signal it otherwise.
 
 The lock is kept while a lost keypad is being waited for, so nobody takes it over in
 the meantime. `dak --map` locks the keypad too, and refuses one in use.
+
+The lock directory is shared by all users, so any local user can hold (or block) a
+keypad's lock; dak then only refuses or waits, it never trusts what the file says. A lock
+file that is a symlink, a hard link or not a regular file is refused. Where this matters
+(a multi-user machine with untrusted users), point `DAK_LOCK_DIR` at a directory only
+the keypad's users can write to.
 
 ## Device install
 

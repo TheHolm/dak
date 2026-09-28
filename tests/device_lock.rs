@@ -322,3 +322,87 @@ async fn replace_times_out_on_a_stubborn_holder() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A forged holder record naming a live process that is not a `dak` (here a `sleep` of
+/// our own user, which `--replace` would otherwise be allowed to signal) is refused:
+/// the process is not signalled.
+#[tokio::test]
+async fn replace_refuses_a_forged_holder_record() {
+    let dir = lock_dir();
+    let held = lock::try_lock(&dir, &key()).unwrap();
+    let mut victim = Command::new("sleep").arg("30").spawn().unwrap();
+    let forged = Holder {
+        pid: victim.id() as i32,
+        uid: unsafe { libc::geteuid() },
+        user: "me".into(),
+        since: "t".into(),
+    };
+    std::fs::write(held.path(), forged.to_text()).unwrap();
+    let stop = StopSource::new();
+    let result = lock::acquire(&dir, &key(), Conflict::Replace, &stop.signal(), |_| {
+        panic!("a forged holder is not waited for")
+    })
+    .await;
+    assert_eq!(result.unwrap_err(), LockError::NotVerified(forged));
+    assert!(
+        victim.try_wait().unwrap().is_none(),
+        "the forged pid was signalled"
+    );
+    let _ = victim.kill();
+    let _ = victim.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A holder record naming pid -1, 0 or 1 (every process, the process group, init) is
+/// not a record at all, so `--replace` has nobody to signal and reports the device
+/// busy - and this process is still alive to check it.
+#[tokio::test]
+async fn replace_ignores_records_with_impossible_pids() {
+    let dir = lock_dir();
+    let held = lock::try_lock(&dir, &key()).unwrap();
+    for pid in ["-1", "0", "1"] {
+        let text = format!("pid={pid}\nuid={}\nuser=x\nsince=t\n", unsafe {
+            libc::geteuid()
+        });
+        std::fs::write(held.path(), text).unwrap();
+        assert_eq!(lock::holder_of(held.path()), None, "pid {pid}");
+        let stop = StopSource::new();
+        let result = lock::acquire(&dir, &key(), Conflict::Replace, &stop.signal(), |_| {}).await;
+        assert_eq!(result.unwrap_err(), LockError::Busy(None), "pid {pid}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hard link planted at the lock path is refused, and the file it links to is neither
+/// truncated nor overwritten.
+#[test]
+fn hardlinked_lock_file_is_refused() {
+    let dir = lock_dir();
+    let target = dir.join("victim");
+    std::fs::write(&target, "precious").unwrap();
+    std::fs::hard_link(&target, dir.join(key().file_name())).unwrap();
+    match lock::try_lock(&dir, &key()) {
+        Err(LockError::Io(error)) => assert!(error.contains("hard links"), "{error}"),
+        other => panic!("expected an I/O error, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "precious");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real holder passes the check `--replace` makes before signalling it, and a record
+/// with the wrong uid for that process does not.
+#[test]
+fn holder_verification_checks_process_and_user() {
+    let own = Holder::current();
+    assert!(lock::holder_is_genuine(&own));
+    let wrong_uid = Holder {
+        uid: own.uid.wrapping_add(1),
+        ..own.clone()
+    };
+    assert!(!lock::holder_is_genuine(&wrong_uid));
+    let gone = Holder {
+        pid: i32::MAX,
+        ..own
+    };
+    assert!(!lock::holder_is_genuine(&gone));
+}
