@@ -201,20 +201,17 @@ impl Mapping {
         if let Some(number) = self.button_number(code, pressed) {
             return Some(ControlEvent::Button { number });
         }
-        if self
+        // A push code of 0 means "not captured" and never matches, even when another
+        // encoder has real push codes: code 0 is what some firmware (or a short report)
+        // sends when nothing is pressed.
+        if let Some(encoder) = self
             .encoders
             .iter()
-            .any(|encoder| encoder.press != 0 || encoder.release != 0)
+            .find(|encoder| code != 0 && (encoder.press == code || encoder.release == code))
         {
-            if let Some(encoder) = self
-                .encoders
-                .iter()
-                .find(|encoder| encoder.press == code || encoder.release == code)
-            {
-                return Some(ControlEvent::EncoderPress {
-                    number: encoder.number,
-                });
-            }
+            return Some(ControlEvent::EncoderPress {
+                number: encoder.number,
+            });
         }
         if let Some(encoder) = self.encoders.iter().find(|encoder| encoder.cw == code) {
             return Some(ControlEvent::EncoderTurn {
@@ -1657,6 +1654,31 @@ mod tests {
             Some(ControlEvent::EncoderTurn {
                 number: 1,
                 direction: TwistDirection::CounterClockwise,
+            })
+        );
+    }
+
+    /// Code 0 never means a knob push, also when some encoders have push codes and
+    /// others have none (0): it used to resolve to the first encoder without codes.
+    #[test]
+    fn code_zero_is_never_an_encoder_push() {
+        let mut mapping = sample_mapping();
+        mapping.encoders[0].press = 0x31;
+        mapping.encoders[0].release = 0x31;
+        mapping.encoder_count = 2;
+        mapping.encoders.push(EncoderMapping {
+            number: 2,
+            cw: 91,
+            ccw: 90,
+            press: 0,
+            release: 0,
+        });
+        assert_eq!(mapping.control_event(0, true), None);
+        assert_eq!(mapping.control_event(0, false), None);
+        assert_eq!(
+            mapping.control_event(0x31, true),
+            Some(ControlEvent::EncoderPress {
+                number: mapping.encoders[0].number
             })
         );
     }
