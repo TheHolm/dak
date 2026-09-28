@@ -2148,6 +2148,7 @@ pub fn scene_operations_with(
 pub fn spawn_detached(command: &CommandSpec, log: Log) {
     let display = command.display();
     let result = StdCommand::new(&command.program)
+        .env_remove("NOTIFY_SOCKET")
         .args(&command.args)
         .process_group(0)
         .stdin(std::process::Stdio::null())
@@ -3668,6 +3669,10 @@ pub async fn run_command_with_timeout(
     let display = command.display();
     let mut child = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        // Its stderr is a pipe to dak, not the journal; and it must not talk to the
+        // service manager as dak (see `CHILD_ONLY_DAK_ENV`).
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("JOURNAL_STREAM")
         // Never the terminal (or whatever dak's stdin is once detached): a program
         // waiting for input would only sit there until the timeout kills it.
         .stdin(std::process::Stdio::null())
@@ -3795,6 +3800,15 @@ impl Drop for GroupKill {
     }
 }
 
+/// Environment variables meant for dak alone, removed from every program it starts:
+/// `NOTIFY_SOCKET` would let any program (including one a config runs on input from a
+/// keypad) tell systemd that the service is ready, reloading or stopping, as dak. Only
+/// the unit's `NotifyAccess=main` keeps that from working today.
+/// `image_exec`/`text_exec`/`$(...)` programs also lose `JOURNAL_STREAM`, since their
+/// stderr is a pipe read by dak, not the journal; action commands and `launch`
+/// programs keep it, as they write to dak's own stderr.
+pub const CHILD_ONLY_DAK_ENV: &[&str] = &["NOTIFY_SOCKET"];
+
 /// How much of a failed command's stderr is quoted in its error message.
 pub const STDERR_EXCERPT_BYTES: usize = 512;
 
@@ -3845,6 +3859,7 @@ pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
     let display = command.display();
     let status = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        .env_remove("NOTIFY_SOCKET")
         .stdin(std::process::Stdio::null())
         .status()
         .await
@@ -6822,6 +6837,70 @@ mod tests {
         let message = super::with_stderr("failed".to_string(), b"x\x1b[31my\rz\nnext");
         assert_eq!(message, "failed: x\\u{1b}[31my\\u{d}z / next");
         assert_eq!(super::clip_for_log("a\u{7}"), "a\\u{7}");
+    }
+
+    /// Waits for a line-terminated file a test program writes, for up to 5 s.
+    async fn read_line_file(file: &Path) -> String {
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                if text.ends_with('\n') {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no output in {file:?}");
+    }
+
+    /// Programs dak starts never see `NOTIFY_SOCKET` (so they cannot talk to systemd as
+    /// dak); `*_exec`/`$(...)` programs also lose `JOURNAL_STREAM`, while action
+    /// commands and `launch` programs, which write to dak's own stderr, keep it.
+    #[tokio::test]
+    async fn children_do_not_inherit_dak_only_environment() {
+        let dump = |file: &Path| super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "echo \"n=${{NOTIFY_SOCKET-unset}} j=${{JOURNAL_STREAM-unset}}\" > {}",
+                    file.display()
+                ),
+            ],
+        };
+        let (exec_file, action_file, launch_file) = (
+            temp_path("env-exec"),
+            temp_path("env-action"),
+            temp_path("env-launch"),
+        );
+        // The children are spawned (which copies the environment) while the variables
+        // are set and the lock is held; their results are awaited afterwards.
+        let (exec, action) = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            // A path that does not exist, in case a parallel test notifies meanwhile.
+            std::env::set_var("NOTIFY_SOCKET", "/nonexistent/dak-test-notify");
+            std::env::set_var("JOURNAL_STREAM", "8:1234");
+            let exec_spec = dump(&exec_file);
+            let exec = tokio::spawn(async move {
+                super::run_command_with_timeout(&exec_spec, super::EXEC_TIMEOUT).await
+            });
+            let action = tokio::spawn(super::run_action_command(dump(&action_file)));
+            super::spawn_detached(&dump(&launch_file), crate::log::Log::default());
+            (exec, action)
+        };
+        exec.await.unwrap().unwrap();
+        action.await.unwrap().unwrap();
+        assert_eq!(read_line_file(&exec_file).await, "n=unset j=unset\n");
+        assert_eq!(read_line_file(&action_file).await, "n=unset j=8:1234\n");
+        assert_eq!(read_line_file(&launch_file).await, "n=unset j=8:1234\n");
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            std::env::remove_var("NOTIFY_SOCKET");
+            std::env::remove_var("JOURNAL_STREAM");
+        }
+        assert_eq!(super::CHILD_ONLY_DAK_ENV, ["NOTIFY_SOCKET"]);
+        for file in [exec_file, action_file, launch_file] {
+            let _ = std::fs::remove_file(file);
+        }
     }
 
     /// Variables for the injection tests: `$v` holds `value`, `$n` an int.

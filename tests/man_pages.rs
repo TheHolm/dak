@@ -94,7 +94,16 @@ once its devices are connected (or waiting for another instance),
 .B STOPPING=1
 when it is told to stop, and a
 .B STATUS=
-line.
+line. It is removed from the environment of every program
+.B dak
+starts, so none of them can report to systemd in its name;
+.B image_exec ", " text_exec
+and
+.B $(command)
+programs also lose
+.BR JOURNAL_STREAM ,
+since their stderr is read by
+.BR dak .
 .TP
 .B DAK_LOCK_DIR
 The directory device lock files are kept in, instead of
