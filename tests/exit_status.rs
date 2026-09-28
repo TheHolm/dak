@@ -54,6 +54,32 @@ fn invalid_config_exits_with_config_status() {
     assert_eq!(status_of(&output), exit::CONFIG);
 }
 
+/// A config written for a newer major schema version is a configuration error (3), and
+/// the message says a newer dak is needed.
+#[test]
+fn newer_major_config_version_exits_with_config_status() {
+    let path = common::write_temp_config(r#"{"version": "2.0", "scenes": {}, "devices": {}}"#);
+    let output = run_dak(&["-c", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status_of(&output), exit::CONFIG, "{stderr}");
+    assert!(stderr.contains("needs a newer dak"), "{stderr}");
+}
+
+/// A newer minor schema version still starts (here reaching "no device", 4), printing
+/// the version warning on the way.
+#[test]
+fn newer_minor_config_version_only_warns() {
+    let path = common::write_temp_config(
+        r#"{"version": "1.9", "scenes": {"on_start": {}}, "devices": {}}"#,
+    );
+    let output = run_dak(&["-c", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(status_of(&output), exit::NO_DEVICE, "{stderr}");
+    assert!(stderr.contains("config version 1.9 is newer"), "{stderr}");
+}
+
 /// A config that defines no devices finds no device to drive (4), whether or not a
 /// keypad is attached (an attached one is only reported as undefined).
 #[test]

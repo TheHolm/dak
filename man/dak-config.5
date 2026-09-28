@@ -1,5 +1,5 @@
 .\" Man page for the dak configuration file. See man(7) and groff_man(7).
-.TH DAK-CONFIG 5 "2026-09-28" "dak 0.15.0" "File Formats"
+.TH DAK-CONFIG 5 "2026-09-28" "dak 1.0.0" "File Formats"
 .SH NAME
 dak\-config \- configuration file format for
 .BR dak (1)
@@ -23,11 +23,31 @@ Comment markers inside a string are part of the string value.
 The top level is a JSON object with up to six keys, all optional:
 .TP
 .B version
-A config schema version string, defaulting to
-.BR "1.0" .
-It is not currently interpreted (there is only one schema so far); it is
-printed on startup so future schema changes have somewhere to record which
-shape a file was written for.
+The config schema version the file was written for, a string of the form
+.I MAJOR.MINOR
+(digits only, no leading zeros, e.g.
+.BR "\(dq1.0\(dq" ).
+When absent the file is taken to be of the supported version.
+This version of dak supports config version 1.0.
+.IP
+The schema version is not the version of
+.BR dak :
+.I MAJOR
+is raised only when a change breaks existing configs (a key renamed or
+removed, or its meaning changed),
+.I MINOR
+when a change only adds something.
+A file with the same major version and the same or a lower minor version
+loads normally.
+A higher minor version loads with a warning, since it may use settings this
+.B dak
+does not know yet (those are then reported as errors as usual).
+A different major version is refused on its own, without the other errors it
+would cause: a higher one needs a newer
+.BR dak ,
+a lower one has to be updated as described in the release notes.
+A malformed version is a configuration error as well.
+The version is printed on startup.
 .TP
 .B variables
 Declared, typed values that actions and setup parameters read and assign. See

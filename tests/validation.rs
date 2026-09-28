@@ -2,7 +2,7 @@
 
 mod common;
 
-use dak::actions::load_config_from_path;
+use dak::actions::{load_config_from_path, ConfigVersion, SUPPORTED_CONFIG_VERSION};
 
 use crate::common::{
     assert_validation_error, error_texts, temp_dir, write_config_with_defaults,
@@ -159,30 +159,119 @@ fn rejects_unknown_top_level_key() {
     );
 }
 
-/// A missing top-level "version" defaults to "1.0".
+/// A missing top-level "version" means the supported version, 1.0, without a warning.
 #[test]
 fn version_defaults_to_1_0_when_absent() {
     let path = write_temp_config(r#"{"scenes": {}, "devices": {}}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     let config = config.expect("config without a version should still load");
-    assert_eq!(config.version, "1.0");
+    assert_eq!(config.version, SUPPORTED_CONFIG_VERSION);
+    assert_eq!(config.version.to_string(), "1.0");
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
 }
 
-/// An explicit top-level "version" is carried through as given.
+/// The supported version, written out, loads without a warning and is carried through.
 #[test]
-fn version_is_read_when_present() {
-    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "2.3"}"#);
+fn supported_version_loads() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "1.0"}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
-    let config = config.expect("a version string should be accepted");
-    assert_eq!(config.version, "2.3");
+    let config = config.expect("the supported version should be accepted");
+    assert_eq!(config.version, ConfigVersion { major: 1, minor: 0 });
+    assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+}
+
+/// A newer minor version of the same major still loads, with a warning saying the file
+/// was written for a newer dak.
+#[test]
+fn newer_minor_version_loads_with_a_warning() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "1.1"}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let config = config.expect("a newer minor version should only warn");
+    assert_eq!(config.version, ConfigVersion { major: 1, minor: 1 });
+    let warnings = config.warnings.join("\n");
+    assert!(
+        warnings.contains("config version 1.1 is newer than this dak supports (1.0)"),
+        "{warnings}"
+    );
+}
+
+/// When a newer-minor config does not validate, the version warning is repeated in
+/// front of the errors, since those are most likely the newer settings.
+#[test]
+fn newer_minor_version_explains_the_errors_it_causes() {
+    let path =
+        write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "1.2", "future": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    let version = errors
+        .find("config version 1.2 is newer")
+        .unwrap_or_else(|| panic!("{errors}"));
+    let unknown = errors
+        .find("unknown top-level key \"future\"")
+        .unwrap_or_else(|| panic!("{errors}"));
+    assert!(version < unknown, "the version note comes first: {errors}");
+}
+
+/// A newer major version is refused as needing a newer dak, and that is the only error:
+/// the unknown keys and missing sections it would also cause are not reported.
+#[test]
+fn rejects_newer_major_version_alone() {
+    let path = write_temp_config(r#"{"version": "2.0", "layout": {}}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = config.unwrap_err();
+    let text = error_texts(errors.clone());
+    assert!(
+        text.contains(
+            "config version 2.0 needs a newer dak (this one supports config version 1.0)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("unknown top-level key"), "{text}");
+    assert!(!text.contains("missing the"), "{text}");
+}
+
+/// An older major version is refused as an old format, pointing at the release notes.
+#[test]
+fn rejects_older_major_version() {
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": "0.9"}"#);
+    let config = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(config.unwrap_err());
+    assert!(
+        errors.contains("config version 0.9 is an old format"),
+        "{errors}"
+    );
+    assert!(errors.contains("RELEASE_NOTES.md"), "{errors}");
+}
+
+/// Version strings not of the form `MAJOR.MINOR` are rejected with the expected form.
+#[test]
+fn rejects_malformed_version_strings() {
+    for version in ["1", "1.0.0", "01.0", "v1.0", "", "abc"] {
+        let path = write_temp_config(&format!(
+            r#"{{"scenes": {{}}, "devices": {{}}, "version": "{version}"}}"#
+        ));
+        let config = load_config_from_path(path.to_str().unwrap());
+        let _ = std::fs::remove_file(path);
+        let errors = error_texts(config.unwrap_err());
+        assert!(
+            errors.contains(&format!(
+                "top-level \"version\" must look like \"MAJOR.MINOR\" (e.g. \"1.0\"), got \"{version}\""
+            )),
+            "{version:?}: {errors}"
+        );
+    }
 }
 
 /// A non-string top-level "version" is rejected with its type name in the message.
 #[test]
 fn rejects_non_string_version() {
-    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": 2}"#);
+    let path = write_temp_config(r#"{"scenes": {}, "devices": {}, "version": 1.0}"#);
     let config = load_config_from_path(path.to_str().unwrap());
     let _ = std::fs::remove_file(path);
     let errors = error_texts(config.unwrap_err());
