@@ -39,12 +39,15 @@ use crate::log::{Log, Subsystem};
 /// version. `run_device`/`run_map_wizard` also unconditionally request
 /// `with_supports_both_keypress_states(true)` on every connection, so this
 /// capability isn't even consulted for its intended purpose here.
-const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 4] = [
+///
+/// Version 0 (the oldest firmware, without a serial number) is not offered: mirajazz
+/// refuses it as a choice and switches to it by itself for such devices.
+const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 3] = [
     (
-        0,
-        "oldest firmware fallback; 512-byte packets, no unique serial number reported",
+        1,
+        "512-byte packets, hardcoded/shared serial number (devices without any serial are \
+         switched to the oldest protocol automatically)",
     ),
-    (1, "512-byte packets, hardcoded/shared serial number"),
     (
         2,
         "1024-byte packets, unique serial numbers (this project's own tested device uses this)",
@@ -806,8 +809,8 @@ fn choose_protocol_version<R: io::BufRead, O: Write, E: Write>(
     }
     let version = console.ask_number_with_default(
         "protocol version to connect with",
-        0,
-        3,
+        *crate::actions::PROTOCOL_VERSIONS.start() as u64,
+        *crate::actions::PROTOCOL_VERSIONS.end() as u64,
         kind.protocol_version() as u64,
     )? as usize;
     console.say("");
@@ -1931,6 +1934,20 @@ mod tests {
         let (out, _) = written(&c);
         assert!(out.contains("not been verified"), "{out}");
         assert!(out.contains("  3: "), "every version is described: {out}");
+        assert!(!out.contains("  0: "), "0 is not offered: {out}");
+    }
+
+    /// Version 0 (which makes mirajazz panic) and 4 are refused and asked again.
+    #[test]
+    fn choose_protocol_version_refuses_unsupported_versions() {
+        use crate::hardware::Kind;
+        let mut c = console("0\n4\n2\n");
+        assert_eq!(
+            super::choose_protocol_version(&mut c, Kind::Akp03ERev2).unwrap(),
+            2
+        );
+        let (_, complaints) = written(&c);
+        assert!(!complaints.is_empty());
     }
 
     /// Buttons as step 4 creates them: the first `screens` have displays in order.

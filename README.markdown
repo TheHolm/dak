@@ -556,7 +556,7 @@ dak --map
 Each `buttons` entry maps a button `number` to the raw codes it sends when pressed and released, and whether the button has a screen (`screen` `true`/`false` with its `draw_id`). Each `encoders` entry maps an encoder `number` to its `cw`/`ccw` codes — one `turn_cw`/`turn_ccw` action per rotation notch — and, after the wizard replays a knob push, its `press`/`release` codes; an encoder without push codes still turns, but its knob push is ignored at runtime.
 
 `protocol_version` is optional (omit it, or set it to JSON `null`, to fall back to the
-default): it picks which of `mirajazz`'s connection protocol variants `dak` speaks to
+default; otherwise `1`, `2` or `3`): it picks which of `mirajazz`'s connection protocol variants `dak` speaks to
 this device with (see [Help me support more devices](#help-me-support-more-devices)
 for the wider device family this matters for). `dak --map` fills it in with the
 recognized device kind's own default and prints the same value to the console while

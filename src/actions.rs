@@ -780,7 +780,11 @@ fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapp
             Ok(mut mapping) => {
                 mapping.device_reconnect_interval = overrides[0];
                 mapping.device_reconnect_max_attempts = overrides[1];
-                by_id.insert(number, mapping);
+                let before = errors.len();
+                check_mapping_ranges(id, &mapping, errors);
+                if errors.len() == before {
+                    by_id.insert(number, mapping);
+                }
             }
             Err(error) => errors.push(format!(
                 "device \"{id}\" is not a valid device mapping: {error}"
@@ -788,6 +792,38 @@ fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapp
         }
     }
     by_id
+}
+
+/// The protocol versions a device definition may ask for. mirajazz asserts on anything
+/// else (and picks 0 itself for devices that need it), which would crash dak.
+pub const PROTOCOL_VERSIONS: std::ops::RangeInclusive<usize> = 1..=3;
+
+/// The largest key or encoder count a definition may have: mirajazz computes `key + 1`
+/// in a `u8`, which overflows for 255.
+pub const MAX_CONTROL_COUNT: u8 = 254;
+
+/// Reports definition values the device library cannot handle: a `protocol_version`
+/// outside [`PROTOCOL_VERSIONS`], and key or encoder counts above [`MAX_CONTROL_COUNT`].
+fn check_mapping_ranges(id: &str, mapping: &Mapping, errors: &mut Vec<String>) {
+    if let Some(version) = mapping.protocol_version {
+        if !PROTOCOL_VERSIONS.contains(&version) {
+            errors.push(format!(
+                "devices.\"{id}\".protocol_version {version} is not supported; use {} to {}",
+                PROTOCOL_VERSIONS.start(),
+                PROTOCOL_VERSIONS.end()
+            ));
+        }
+    }
+    for (field, count) in [
+        ("key_count", mapping.key_count),
+        ("encoder_count", mapping.encoder_count),
+    ] {
+        if count > MAX_CONTROL_COUNT {
+            errors.push(format!(
+                "devices.\"{id}\".{field} {count} is too large (at most {MAX_CONTROL_COUNT})"
+            ));
+        }
+    }
 }
 
 /// Parses one logical device id from a `devices` dictionary key.

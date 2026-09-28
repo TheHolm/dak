@@ -1067,3 +1067,12 @@ Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg'
      sample and silently dropped. That was a real bug, seen on FreeBSD under
      parallel load. The counters are now sampled in `Supervisor::new`.
 
+## 13. Device library limits dak keeps away from
+
+mirajazz asserts (panics) on `protocol_version` 0 or above 3, computes `key + 1` in a
+`u8` (overflows for 255) and stores an image's byte length in 16 bits. The config check
+rejects protocol versions outside 1..=3 (`actions::PROTOCOL_VERSIONS`) and counts above
+254 (`MAX_CONTROL_COUNT`); `--map` offers only 1..=3. The 16-bit length cannot be
+reached: every image is shrunk to 240 px (`imaging::shrink`) and then resized to the
+button (60x60) and JPEG-encoded, a few KiB.
+
