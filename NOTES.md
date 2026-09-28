@@ -742,8 +742,11 @@ bare metal; **treat FreeBSD reconnect as flaky** until it has been.
 
 - `hw.usb.usbhid.enable=1` was already on in the template; `hidraw` needed
   `kldload hidraw` (plus `hidraw_load="YES"` in `/boot/loader.conf`).
-- devfs rule as in `INSTALL.md` (`hidraw*` mode 0660 group operator) plus the
-  user in `operator`. The keypad appears as three `hidraw` nodes (two for its
+- devfs rule `hidraw*` mode 0660 group operator plus the user in `operator` (what
+  `INSTALL.md` said until v0.15.0; it now recommends a devd attach rule matching the
+  keypad's vendor/product and a dedicated `dak` group, since `hidraw*` covers every HID
+  device including keyboards and `operator` can read raw disks. The devd rule relies
+  on hidbus children's pnpinfo carrying `vendor`/`product`; not yet run on hardware). The keypad appears as three `hidraw` nodes (two for its
   own two `usbhid` interfaces, one for the QEMU tablet); dak uses `hidraw0`.
 - `usbconfig power_off`/`power_on`/`reset` need root even with those devfs
   rules (the `ugen`/`usb` nodes are not covered by them).
@@ -966,8 +969,22 @@ never drive the same device. Things learned while building it:
   Also: while *any* thread forks a child, that child briefly holds a copy of every
   fd until its exec closes the `O_CLOEXEC` ones, so a just-released lock can look
   held for an instant. Harmless at runtime (`--wait` retries), but tests must poll.
-- `--replace` trusts the recorded pid only while the lock is held (a live holder wrote
-  it), and signals only its own uid unless root.
+- `--replace` does **not** trust the record: lock files are 0666, so anyone can write
+  `pid=-1` (kill(-1) = every process) or another process's pid into one. `Holder::parse`
+  rejects pid <= 1, and `holder_is_genuine` requires the pid to be a live process with
+  the recorded effective uid running the same program as us (`/proc/<pid>/status` +
+  `comm` on Linux, `sysctl kern.proc.pid` `ki_uid`/`ki_comm` on FreeBSD; comparing
+  with our own comm lets the test binaries act as each other's holder). Then the
+  own-uid-or-root rule applies. The FreeBSD branch is cross-compiled only so far.
+- `O_NOFOLLOW` does not stop hard links. FreeBSD's default
+  `security.bsd.hardlink_check_uid=0` lets anyone hard-link a victim's file into `/tmp`
+  under the lock name, and dak would truncate and rewrite it. So the lock file must
+  have `st_nlink == 1` (`check_lock_file`).
+- Lock names hash (FNV-1a, stable) identities that are not already plain
+  `[A-Za-z0-9._-]{1,96}`, so `A/B` and `A_B` no longer share a lock. Plain serials keep
+  their pre-0.15 names, so an older dak still conflicts correctly with a newer one.
+- Any local user can hold a lock forever (DoS) - inherent to a shared directory;
+  documented in README/`dak.1`, `DAK_LOCK_DIR` is the way out.
 - Not verified on FreeBSD hardware yet; the Linux runs here had the keypad enumerable
   via sysfs but no `/dev/hidraw*` node, so the lock paths were tested up to the point
   the device is opened.
@@ -1008,7 +1025,7 @@ never drive the same device. Things learned while building it:
 
 Environment: `cargo-llvm-cov` 0.9.x with the `llvm-tools` rustup component, on
 Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg's
-`rust` has no llvm-tools). Last measured for v0.14.1: 95.6% of lines on Linux.
+`rust` has no llvm-tools). Last measured for v0.15.0: 95.7% of lines on Linux (v0.14.1: 95.6%).
 
 - Run `cargo llvm-cov --summary-only` (`--show-missing-lines` for line numbers,
   `--no-fail-fast` to get a report despite a failing test). Point
@@ -1049,4 +1066,31 @@ Linux (Debian trixie container) and on a FreeBSD 15.1 VM (rustup toolchain; pkg'
      `READY=1`. A SIGUSR1/SIGHUP arriving right after READY was counted before the
      sample and silently dropped. That was a real bug, seen on FreeBSD under
      parallel load. The counters are now sampled in `Supervisor::new`.
+
+## 13. Device library limits dak keeps away from
+
+mirajazz asserts (panics) on `protocol_version` 0 or above 3, computes `key + 1` in a
+`u8` (overflows for 255) and stores an image's byte length in 16 bits. The config check
+rejects protocol versions outside 1..=3 (`actions::PROTOCOL_VERSIONS`) and counts above
+254 (`MAX_CONTROL_COUNT`); `--map` offers only 1..=3. The 16-bit length cannot be
+reached: every image is shrunk to 240 px (`imaging::shrink`) and then resized to the
+button (60x60) and JPEG-encoded, a few KiB.
+
+## 14. Verifying CI downloads without pinned hashes
+
+`release.yaml` pins no checksums (they would need updating for every OS/toolchain
+release). Instead:
+
+- `base.txz`: `scripts/verify-freebsd-dist.sh` checks it against the release `MANIFEST`
+  (tab separated: set, sha256, ...), and requires that MANIFEST to be byte-identical on
+  download.freebsd.org and on every reachable mirror of `FREEBSD_MIRRORS` (default
+  ftp.de.freebsd.org and mirror.aarnet.edu.au, both HTTPS with valid certificates as
+  of 2026-09; ftp.uk.freebsd.org's certificate did not match). At least one mirror must
+  answer. Checked live against 15.1-RELEASE.
+- rustup (Ubuntu job): `scripts/fetch-verified.sh` against
+  `static.rust-lang.org/.../rustup-init.sha256`, replacing `curl sh.rustup.rs | sh`.
+- `cargo-deb` and `cargo-audit` are installed with fixed `--version`s (update them
+  deliberately). `cargo audit` exits 0 on "unmaintained" warnings; in 2026-09 it
+  reported only RUSTSEC-2026-0192 (`ttf-parser`, via `ab_glyph`).
+- Docker images stay referenced by tag, not digest.
 

@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH DAK 1 2026-09-27 "dak 0.14.1" "User Commands"
+.TH DAK 1 2026-09-28 "dak 0.15.0" "User Commands"
 .SH NAME
 dak \- Control an Ajazz AKP03E / AKP03R USB macro keypad from a JSON config
 .SH SYNOPSIS
@@ -14,7 +14,7 @@ dak is a command\-line\-only tool: a config file plus a binary, with no GUI. It 
 .SH OPTIONS
 .TP
 \fB\-c\fR, \fB\-\-config\fR \fI<CONFIG>\fR
-Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory
+Path to the config file. When omitted, `config.json` is searched for in `~/.config/dak/`, then the current directory, then the binary directory. A config runs commands as you, so one in the current or the binary directory is skipped (with a warning) when it is not owned by you or it or its directory can be written by other users; a doubtful one in `~/.config/dak/` or given here is loaded with a warning
 .TP
 \fB\-d\fR, \fB\-\-debug\fR \fI<DEBUG>...\fR
 Debug subsystems to enable: device, scene, action, fonts (the fonts in use and the characters configured fonts cannot draw; silent without defaults.fonts). The option may be given repeatedly, and several comma\-separated subsystems may be given at once; the two forms are additive
@@ -112,7 +112,16 @@ once its devices are connected (or waiting for another instance),
 .B STOPPING=1
 when it is told to stop, and a
 .B STATUS=
-line.
+line. It is removed from the environment of every program
+.B dak
+starts, so none of them can report to systemd in its name;
+.B image_exec ", " text_exec
+and
+.B $(command)
+programs also lose
+.BR JOURNAL_STREAM ,
+since their stderr is read by
+.BR dak .
 .TP
 .B DAK_LOCK_DIR
 The directory device lock files are kept in, instead of
@@ -311,7 +320,15 @@ instance's user and process id; with
 .B dak
 waits for it to be released, and with
 .B \-\-replace
-it asks the holder to stop and takes the device over. When every configured
+it asks the holder to stop and takes the device over, after checking that the
+recorded process really is a
+.B dak
+of the recorded user (lock files can be written by every user, so a record
+alone is never trusted). A lock file that is a symlink, a hard link or not a
+regular file is refused. Since the lock directory is shared, any local user can
+hold a keypad's lock and so keep it from being used; set
+.B DAK_LOCK_DIR
+to a directory only the keypad's users can write to where that matters. When every configured
 device is held elsewhere the program exits with status 5. The lock is kept
 while a lost device is being waited for, so no other instance takes it over
 meanwhile. The

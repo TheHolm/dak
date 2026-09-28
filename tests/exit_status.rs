@@ -86,6 +86,32 @@ fn relative_config_path_is_made_absolute() {
     assert!(stdout.contains(&expected), "stdout: {stdout}");
 }
 
+/// Started in a directory any user can write to (like `/tmp`), dak does not load the
+/// `config.json` there - someone else may have put it there to run their commands - and
+/// says so; with no other config it then fails to find one.
+#[test]
+fn config_in_a_shared_directory_is_ignored() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = common::temp_dir();
+    let home = common::temp_dir();
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"scenes": {"on_start": {}}, "devices": {}}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ignoring config"), "stderr: {stderr}");
+    assert_eq!(status_of(&output), exit::CONFIG, "stderr: {stderr}");
+}
+
 /// A configured keypad held by another dak is skipped with a message naming the
 /// holder, and with nothing left to drive the program exits with status 5.
 #[test]

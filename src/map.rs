@@ -39,12 +39,15 @@ use crate::log::{Log, Subsystem};
 /// version. `run_device`/`run_map_wizard` also unconditionally request
 /// `with_supports_both_keypress_states(true)` on every connection, so this
 /// capability isn't even consulted for its intended purpose here.
-const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 4] = [
+///
+/// Version 0 (the oldest firmware, without a serial number) is not offered: mirajazz
+/// refuses it as a choice and switches to it by itself for such devices.
+const PROTOCOL_VERSION_DESCRIPTIONS: [(usize, &str); 3] = [
     (
-        0,
-        "oldest firmware fallback; 512-byte packets, no unique serial number reported",
+        1,
+        "512-byte packets, hardcoded/shared serial number (devices without any serial are \
+         switched to the oldest protocol automatically)",
     ),
-    (1, "512-byte packets, hardcoded/shared serial number"),
     (
         2,
         "1024-byte packets, unique serial numbers (this project's own tested device uses this)",
@@ -201,20 +204,17 @@ impl Mapping {
         if let Some(number) = self.button_number(code, pressed) {
             return Some(ControlEvent::Button { number });
         }
-        if self
+        // A push code of 0 means "not captured" and never matches, even when another
+        // encoder has real push codes: code 0 is what some firmware (or a short report)
+        // sends when nothing is pressed.
+        if let Some(encoder) = self
             .encoders
             .iter()
-            .any(|encoder| encoder.press != 0 || encoder.release != 0)
+            .find(|encoder| code != 0 && (encoder.press == code || encoder.release == code))
         {
-            if let Some(encoder) = self
-                .encoders
-                .iter()
-                .find(|encoder| encoder.press == code || encoder.release == code)
-            {
-                return Some(ControlEvent::EncoderPress {
-                    number: encoder.number,
-                });
-            }
+            return Some(ControlEvent::EncoderPress {
+                number: encoder.number,
+            });
         }
         if let Some(encoder) = self.encoders.iter().find(|encoder| encoder.cw == code) {
             return Some(ControlEvent::EncoderTurn {
@@ -302,11 +302,13 @@ impl<R: io::BufRead, O: Write, E: Write> Console<R, O, E> {
 
     /// Writes one line of output.
     fn say(&mut self, text: impl std::fmt::Display) {
+        let text = crate::log::escape_controls(&text.to_string());
         let _ = writeln!(self.out, "{text}");
     }
 
     /// Writes one line to the complaint stream.
     fn complain(&mut self, text: impl std::fmt::Display) {
+        let text = crate::log::escape_controls(&text.to_string());
         let _ = writeln!(self.err, "{text}");
     }
 
@@ -628,7 +630,8 @@ fn device_summary(
     serial: &Option<String>,
     name: &str,
 ) -> String {
-    let serial = serial.as_deref().unwrap_or("unknown");
+    let serial = crate::log::escape_text(serial.as_deref().unwrap_or("unknown"));
+    let name = crate::log::escape_text(name);
     format!("{vid:04X}:{pid:04X} path {id:?} serial {serial} \"{name}\"")
 }
 
@@ -641,8 +644,9 @@ fn device_details(
     serial: &Option<String>,
     name: &str,
 ) -> String {
-    let serial = serial.as_deref().unwrap_or("unknown");
-    let path = device_path(id);
+    let serial = crate::log::escape_text(serial.as_deref().unwrap_or("unknown"));
+    let name = crate::log::escape_text(name);
+    let path = crate::log::escape_text(&device_path(id));
     format!(
         "Device name: {name}\nSerial: {serial}\nVendorID/DeviceID {vid:04X}:{pid:04X}\nDevice Path: {path}"
     )
@@ -805,8 +809,8 @@ fn choose_protocol_version<R: io::BufRead, O: Write, E: Write>(
     }
     let version = console.ask_number_with_default(
         "protocol version to connect with",
-        0,
-        3,
+        *crate::actions::PROTOCOL_VERSIONS.start() as u64,
+        *crate::actions::PROTOCOL_VERSIONS.end() as u64,
         kind.protocol_version() as u64,
     )? as usize;
     console.say("");
@@ -1661,6 +1665,31 @@ mod tests {
         );
     }
 
+    /// Code 0 never means a knob push, also when some encoders have push codes and
+    /// others have none (0): it used to resolve to the first encoder without codes.
+    #[test]
+    fn code_zero_is_never_an_encoder_push() {
+        let mut mapping = sample_mapping();
+        mapping.encoders[0].press = 0x31;
+        mapping.encoders[0].release = 0x31;
+        mapping.encoder_count = 2;
+        mapping.encoders.push(EncoderMapping {
+            number: 2,
+            cw: 91,
+            ccw: 90,
+            press: 0,
+            release: 0,
+        });
+        assert_eq!(mapping.control_event(0, true), None);
+        assert_eq!(mapping.control_event(0, false), None);
+        assert_eq!(
+            mapping.control_event(0x31, true),
+            Some(ControlEvent::EncoderPress {
+                number: mapping.encoders[0].number
+            })
+        );
+    }
+
     /// The knob's push code resolves to an encoder press on both edges.
     #[test]
     fn control_event_resolves_encoder_push_and_release() {
@@ -1905,6 +1934,20 @@ mod tests {
         let (out, _) = written(&c);
         assert!(out.contains("not been verified"), "{out}");
         assert!(out.contains("  3: "), "every version is described: {out}");
+        assert!(!out.contains("  0: "), "0 is not offered: {out}");
+    }
+
+    /// Version 0 (which makes mirajazz panic) and 4 are refused and asked again.
+    #[test]
+    fn choose_protocol_version_refuses_unsupported_versions() {
+        use crate::hardware::Kind;
+        let mut c = console("0\n4\n2\n");
+        assert_eq!(
+            super::choose_protocol_version(&mut c, Kind::Akp03ERev2).unwrap(),
+            2
+        );
+        let (_, complaints) = written(&c);
+        assert!(!complaints.is_empty());
     }
 
     /// Buttons as step 4 creates them: the first `screens` have displays in order.

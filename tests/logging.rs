@@ -138,3 +138,19 @@ fn unknown_log_level_is_a_usage_error() {
         .unwrap();
     assert_eq!(output.status.code(), Some(dak::exit::USAGE as i32));
 }
+
+/// What dak prints never carries a raw escape sequence, even when the text comes from
+/// outside (here the config path given on the command line): the terminal gets a
+/// visible `\u{1b}` instead of a colour change.
+#[test]
+fn printed_lines_escape_control_characters() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dak"))
+        .args(["-c", "/nonexistent/dak\u{1b}[31mred.json"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let all = [output.stdout, output.stderr].concat();
+    let text = String::from_utf8_lossy(&all);
+    assert!(!all.contains(&0x1b), "raw ESC printed: {text}");
+    assert!(text.contains("dak\\u{1b}[31mred.json"), "{text}");
+}

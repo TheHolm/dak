@@ -126,3 +126,56 @@ fn spawn_detached_reports_failed_start() {
     // The failed spawn is logged (to stderr) and control returns normally.
     spawn_detached(&command, Log::default());
 }
+
+/// Whether `pid` is a zombie of ours (exited, never reaped), via `waitpid(WNOHANG)`:
+/// it reports a finished child of this process without blocking; after a reaper thread
+/// got it first there is no such child any more (`ECHILD`).
+fn unreaped_zombie(pid: i32) -> bool {
+    let mut status = 0;
+    // SAFETY: plain waitpid on a pid; WNOHANG never blocks. If the reaper thread has
+    // not waited yet, this reaps it instead - either way it is not left a zombie, and
+    // the return value tells which happened.
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    result == pid
+}
+
+/// A detached program that exits is reaped by its waiter thread, so no zombie is left
+/// behind (a `launch` entry re-run on every scene entry used to leave one each time).
+#[test]
+fn spawn_detached_reaps_finished_programs() {
+    let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid_file = format!("/tmp/dak_spawn_reap_{}_{n}.pid", std::process::id());
+    let _ = std::fs::remove_file(&pid_file);
+    let command = CommandSpec {
+        program: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), format!("echo $$ > {pid_file}")],
+    };
+    spawn_detached(&command, Log::default());
+    let mut pid = None;
+    for _ in 0..300 {
+        if let Some(parsed) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+        {
+            pid = Some(parsed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let pid = pid.expect("the program did not write its pid");
+    // Give the program time to exit and the waiter time to reap it.
+    let mut reaped = false;
+    for _ in 0..300 {
+        std::thread::sleep(Duration::from_millis(10));
+        if !is_process_alive(pid) {
+            reaped = true;
+            break;
+        }
+    }
+    assert!(reaped, "program {pid} is still around (a zombie?)");
+    assert!(
+        !unreaped_zombie(pid),
+        "program {pid} was left for us to reap"
+    );
+    let _ = std::fs::remove_file(&pid_file);
+}

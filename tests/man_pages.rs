@@ -18,6 +18,7 @@ use dak::actions::{
     CONTROL_EVENTS, DEFAULTS_KEYS, ENCODER_EVENTS, SETUP_ENTRY_FIELDS, SETUP_KINDS, TOP_LEVEL_KEYS,
 };
 use dak::cli::Cli;
+use dak::imaging::FORMATS as IMAGE_FORMATS;
 use dak::log::{LOGGING_KEYS, LOG_LEVELS, LOG_OUTPUTS, SYSLOG_FACILITIES, TIMESTAMP_VALUES};
 use dak::markup::MARKUP_VALUES;
 use dak::text::FONT_KEYS;
@@ -93,7 +94,16 @@ once its devices are connected (or waiting for another instance),
 .B STOPPING=1
 when it is told to stop, and a
 .B STATUS=
-line.
+line. It is removed from the environment of every program
+.B dak
+starts, so none of them can report to systemd in its name;
+.B image_exec ", " text_exec
+and
+.B $(command)
+programs also lose
+.BR JOURNAL_STREAM ,
+since their stderr is read by
+.BR dak .
 .TP
 .B DAK_LOCK_DIR
 The directory device lock files are kept in, instead of
@@ -292,7 +302,15 @@ instance's user and process id; with
 .B dak
 waits for it to be released, and with
 .B \-\-replace
-it asks the holder to stop and takes the device over. When every configured
+it asks the holder to stop and takes the device over, after checking that the
+recorded process really is a
+.B dak
+of the recorded user (lock files can be written by every user, so a record
+alone is never trusted). A lock file that is a symlink, a hard link or not a
+regular file is refused. Since the lock directory is shared, any local user can
+hold a keypad's lock and so keep it from being used; set
+.B DAK_LOCK_DIR
+to a directory only the keypad's users can write to where that matters. When every configured
 device is held elsewhere the program exits with status 5. The lock is kept
 while a lost device is being waited for, so no other instance takes it over
 meanwhile. The
@@ -341,7 +359,7 @@ fn render_dak_1() -> Vec<u8> {
     let man = clap_mangen::Man::new(Cli::command())
         .title("DAK")
         .section("1")
-        .date("2026-09-27")
+        .date("2026-09-28")
         .source(format!("dak {}", env!("CARGO_PKG_VERSION")))
         .manual("User Commands");
     let mut page = Vec::new();
@@ -577,13 +595,14 @@ fn dak_config_5_documents_the_config_vocabulary() {
     let text = canonical_text(
         &std::fs::read_to_string(DAK_CONFIG_5.path).expect("man/dak-config.5 readable"),
     );
-    let groups: [(&str, &[&str]); 15] = [
+    let groups: [(&str, &[&str]); 16] = [
         ("top-level key", TOP_LEVEL_KEYS),
         ("defaults key", DEFAULTS_KEYS),
         ("setup type", SETUP_KINDS),
         ("setup entry field", SETUP_ENTRY_FIELDS),
         ("markup value", MARKUP_VALUES),
         ("defaults.fonts key", FONT_KEYS),
+        ("image format", IMAGE_FORMATS),
         ("button event", CONTROL_EVENTS),
         ("encoder event", ENCODER_EVENTS),
         ("variable key", VARIABLE_KEYS),

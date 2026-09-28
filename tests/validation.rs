@@ -1239,6 +1239,15 @@ fn rejects_invalid_timer_seconds() {
     assert!(errors.contains("not a valid number of seconds"), "{errors}");
 }
 
+/// A timer of 0 seconds is rejected: re-entering its own scene it would be a busy loop.
+#[test]
+fn rejects_zero_timer_seconds() {
+    assert_validation_error(
+        r#"{"on_start": {"actions": {"timer": {"0": "@"}}}}"#,
+        "below the minimum of 1 second",
+    );
+}
+
 /// `timer` must be a single-entry object.
 #[test]
 fn rejects_timer_not_an_object() {
@@ -2245,4 +2254,74 @@ fn timer_key_rejects_non_int_variable() {
     let _ = std::fs::remove_file(&path);
     let errors = error_texts(config.unwrap_err());
     assert!(errors.contains("timer seconds must be an int"), "{errors}");
+}
+
+/// `$!name` references validate like `$name` ones: in a command, as a whole action and
+/// as a scene name; an undeclared `$!name` is an error.
+#[test]
+fn raw_references_validate_like_plain_ones() {
+    let path = write_variables_config(
+        r#"{ "v": { "type": "str", "value": "@Main" } }"#,
+        r#"{ "Main": { "actions": {
+            "1b01": { "pressed": "$!v", "released": "echo $!v | cat" },
+            "1b02": { "pressed": "@$!v", "released": "echo $v" }
+        } } }"#,
+    );
+    let result = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    assert!(result.is_ok(), "{:?}", result.err());
+
+    let path = write_variables_config(
+        r#"{ "v": { "type": "str", "value": "x" } }"#,
+        r#"{ "Main": { "actions": { "1b01": { "pressed": "echo $!missing" } } } }"#,
+    );
+    let result = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(path);
+    let errors = error_texts(result.unwrap_err());
+    assert!(errors.contains("missing"), "{errors}");
+}
+
+/// Loads a config whose device 1 has `field` set to `value` (replacing the default).
+fn load_with_device_field(
+    field: &str,
+    value: &str,
+) -> Result<dak::actions::LoadedConfig, Vec<String>> {
+    let mut device = serde_json::json!({
+        "device_id": "0300:3002", "device_name": "keypad", "serial": "unknown",
+        "key_count": 9, "encoder_count": 3, "screens": 6,
+        "buttons": [], "encoders": []
+    });
+    device[field] = serde_json::from_str(value).unwrap();
+    let config = serde_json::json!({
+        "scenes": { "on_start": { "actions": {} } },
+        "devices": { "1": device }
+    });
+    let path = write_temp_config(&config.to_string());
+    let result = load_config_from_path(path.to_str().unwrap());
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// `protocol_version` must be 1 to 3 (mirajazz panics on anything else), and key and
+/// encoder counts at most 254 (it computes `key + 1` in a byte).
+#[test]
+fn device_definition_ranges_are_checked() {
+    for version in ["1", "2", "3"] {
+        assert!(load_with_device_field("protocol_version", version).is_ok());
+    }
+    for version in ["0", "4", "255"] {
+        let errors = error_texts(load_with_device_field("protocol_version", version).unwrap_err());
+        assert!(
+            errors.contains("protocol_version") && errors.contains("not supported"),
+            "{errors}"
+        );
+    }
+    for field in ["key_count", "encoder_count"] {
+        assert!(load_with_device_field(field, "254").is_ok(), "{field}");
+        let errors = error_texts(load_with_device_field(field, "255").unwrap_err());
+        assert!(
+            errors.contains(field) && errors.contains("at most 254"),
+            "{errors}"
+        );
+    }
 }

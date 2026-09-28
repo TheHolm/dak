@@ -13,8 +13,8 @@ use crate::markup::Markup;
 use crate::press::Defaults;
 use crate::text::{FontPaths, FontReport, FontSet, FONT_KEYS};
 use crate::variables::{
-    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, VarDef,
-    VarRef, VarType, VarValue, Variables,
+    check_variables, is_reserved_name, is_valid_name, parse_lone_reference, references_in, Piece,
+    VarDef, VarRef, VarType, VarValue, Variables,
 };
 use image::DynamicImage;
 use mirajazz::device::Device;
@@ -222,6 +222,46 @@ fn config_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Why the config file at `path` might have been written by someone other than the user
+/// running dak (`euid`), or `None` when it cannot have been: the file is not owned by
+/// `euid`, or the file or its directory is writable by group or others (then anyone in
+/// that group, or anybody, could have replaced it). A file that cannot be inspected is
+/// not a problem here; loading reports it.
+pub fn config_file_problem(path: &Path, euid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let file = fs::metadata(path).ok()?;
+    if file.uid() != euid {
+        return Some(format!("it is owned by uid {}, not by you", file.uid()));
+    }
+    if file.mode() & 0o022 != 0 {
+        return Some(format!(
+            "it can be written by other users (mode {:o})",
+            file.mode() & 0o777
+        ));
+    }
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let dir = dir.unwrap_or(Path::new("."));
+    if let Ok(meta) = fs::metadata(dir) {
+        if meta.mode() & 0o022 != 0 {
+            return Some(format!(
+                "its directory {} can be written by other users (mode {:o})",
+                dir.display(),
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    None
+}
+
+/// The config file to load, plus warnings about the choice.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConfigChoice {
+    /// The file to load.
+    pub path: PathBuf,
+    /// Warnings: loose permissions on the chosen file, or candidates that were skipped.
+    pub warnings: Vec<String>,
+}
+
 /// Picks the config file to load.
 ///
 /// An explicitly provided `explicit` path wins as-is. Otherwise the first existing
@@ -229,29 +269,70 @@ fn config_search_dirs() -> Vec<PathBuf> {
 /// them contains a config, the first directory's candidate is returned so loading
 /// reports the missing file instead of guessing a location, and an empty directory
 /// list falls back to a bare `config.json` in the current directory.
-pub fn pick_config_path(explicit: Option<&Path>, dirs: &[PathBuf]) -> PathBuf {
+///
+/// A config runs commands as the user, so where it comes from matters
+/// ([`config_file_problem`]): the explicit path and the first directory (the user's own
+/// `~/.config/dak`) are loaded with a warning when their ownership or permissions are
+/// loose, while a later directory's file (the current directory's, the binary's) is
+/// skipped with a warning then - running dak in someone else's directory must not run
+/// their commands.
+pub fn pick_config_path(explicit: Option<&Path>, dirs: &[PathBuf], euid: u32) -> ConfigChoice {
+    let mut warnings = Vec::new();
+    let loose = |path: &Path, problem: String| {
+        format!(
+            "config {} may have been written by someone else: {problem}",
+            path.display()
+        )
+    };
     if let Some(path) = explicit {
-        return path.to_path_buf();
-    }
-    for dir in dirs {
-        let candidate = dir.join(DEFAULT_CONFIG_FILE);
-        if candidate.exists() {
-            return candidate;
+        if let Some(problem) = config_file_problem(path, euid) {
+            warnings.push(loose(path, problem));
         }
+        return ConfigChoice {
+            path: path.to_path_buf(),
+            warnings,
+        };
     }
-    dirs.first()
-        .map(|dir| dir.join(DEFAULT_CONFIG_FILE))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE))
+    for (index, dir) in dirs.iter().enumerate() {
+        let candidate = dir.join(DEFAULT_CONFIG_FILE);
+        if !candidate.exists() {
+            continue;
+        }
+        match config_file_problem(&candidate, euid) {
+            None => {}
+            Some(problem) if index == 0 => warnings.push(loose(&candidate, problem)),
+            Some(problem) => {
+                warnings.push(format!(
+                    "ignoring config {}: {problem} (use --config to load it anyway)",
+                    candidate.display()
+                ));
+                continue;
+            }
+        }
+        return ConfigChoice {
+            path: candidate,
+            warnings,
+        };
+    }
+    ConfigChoice {
+        path: dirs
+            .first()
+            .map(|dir| dir.join(DEFAULT_CONFIG_FILE))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE)),
+        warnings,
+    }
 }
 
 /// Resolves the config file the program should load.
 ///
 /// An explicitly passed path (from `-c`/`--config`) is used as-is; without one the
-/// first existing `config.json` wins from the [`config_search_dirs`] order —
-/// `~/.config/dak/`, then the current directory, then the binary's directory. See
-/// [`pick_config_path`] for the no-match behaviour.
-pub fn resolve_config_path(explicit: Option<&Path>) -> PathBuf {
-    pick_config_path(explicit, &config_search_dirs())
+/// first existing, trustworthy `config.json` wins from the [`config_search_dirs`] order
+/// — `~/.config/dak/`, then the current directory, then the binary's directory. See
+/// [`pick_config_path`] for the checks and the no-match behaviour.
+pub fn resolve_config_path(explicit: Option<&Path>) -> ConfigChoice {
+    // SAFETY: geteuid cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    pick_config_path(explicit, &config_search_dirs(), euid)
 }
 
 /// Loads, parses and validates the config file at `path`.
@@ -699,7 +780,11 @@ fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapp
             Ok(mut mapping) => {
                 mapping.device_reconnect_interval = overrides[0];
                 mapping.device_reconnect_max_attempts = overrides[1];
-                by_id.insert(number, mapping);
+                let before = errors.len();
+                check_mapping_ranges(id, &mapping, errors);
+                if errors.len() == before {
+                    by_id.insert(number, mapping);
+                }
             }
             Err(error) => errors.push(format!(
                 "device \"{id}\" is not a valid device mapping: {error}"
@@ -707,6 +792,38 @@ fn check_devices(devices: &Value, errors: &mut Vec<String>) -> BTreeMap<u8, Mapp
         }
     }
     by_id
+}
+
+/// The protocol versions a device definition may ask for. mirajazz asserts on anything
+/// else (and picks 0 itself for devices that need it), which would crash dak.
+pub const PROTOCOL_VERSIONS: std::ops::RangeInclusive<usize> = 1..=3;
+
+/// The largest key or encoder count a definition may have: mirajazz computes `key + 1`
+/// in a `u8`, which overflows for 255.
+pub const MAX_CONTROL_COUNT: u8 = 254;
+
+/// Reports definition values the device library cannot handle: a `protocol_version`
+/// outside [`PROTOCOL_VERSIONS`], and key or encoder counts above [`MAX_CONTROL_COUNT`].
+fn check_mapping_ranges(id: &str, mapping: &Mapping, errors: &mut Vec<String>) {
+    if let Some(version) = mapping.protocol_version {
+        if !PROTOCOL_VERSIONS.contains(&version) {
+            errors.push(format!(
+                "devices.\"{id}\".protocol_version {version} is not supported; use {} to {}",
+                PROTOCOL_VERSIONS.start(),
+                PROTOCOL_VERSIONS.end()
+            ));
+        }
+    }
+    for (field, count) in [
+        ("key_count", mapping.key_count),
+        ("encoder_count", mapping.encoder_count),
+    ] {
+        if count > MAX_CONTROL_COUNT {
+            errors.push(format!(
+                "devices.\"{id}\".{field} {count} is too large (at most {MAX_CONTROL_COUNT})"
+            ));
+        }
+    }
 }
 
 /// Parses one logical device id from a `devices` dictionary key.
@@ -1190,10 +1307,15 @@ fn check_timer(
     let (seconds, value) = entries.iter().next().unwrap();
     let seconds_refs = check_references(scene_name, "actions.timer", seconds, variables, errors);
     if seconds_refs.is_empty() {
-        if seconds.parse::<u64>().is_err() {
-            errors.push(format!(
+        match seconds.parse::<u64>() {
+            Err(_) => errors.push(format!(
                 "scene \"{scene_name}\": actions.timer key \"{seconds}\" is not a valid number of seconds"
-            ));
+            )),
+            Ok(value) if value < crate::limits::MIN_TIMER_SECONDS => errors.push(format!(
+                "scene \"{scene_name}\": actions.timer key \"{seconds}\" is below the minimum of {} second",
+                crate::limits::MIN_TIMER_SECONDS
+            )),
+            Ok(_) => {}
         }
     } else {
         for reference in &seconds_refs {
@@ -1303,7 +1425,9 @@ fn check_action_value(
         }
         return;
     }
-    if value.starts_with('$') {
+    // `$!name ...` is a raw reference, not an assignment: validated as a command (its
+    // value, and so what it does, is only known when it fires).
+    if value.starts_with('$') && !value.starts_with("$!") {
         check_set_config_action(variables, scene_name, path, value, errors, warnings);
         return;
     }
@@ -1725,9 +1849,12 @@ pub struct CommandSpec {
 
 impl CommandSpec {
     /// One-line human-readable description of the command, e.g. `"/bin/echo hi"`.
+    ///
+    /// Arguments may hold variable values (program output), so control characters and
+    /// newlines are shown escaped (see [`crate::log::escape_text`]).
     pub fn display(&self) -> String {
-        let mut parts = vec![self.program.clone()];
-        parts.extend(self.args.iter().cloned());
+        let mut parts = vec![crate::log::escape_text(&self.program)];
+        parts.extend(self.args.iter().map(|arg| crate::log::escape_text(arg)));
         parts.join(" ")
     }
 }
@@ -1915,9 +2042,10 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
     let scene_name = raw.scene.as_str();
     let reference = raw.reference;
     let key = reference.to_string();
-    let params = variables
-        .expand(&raw.params)
+    let pieces = variables
+        .expand_pieces(&raw.params)
         .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))?;
+    let params = pieces_display(&pieces);
     // Colour texts are expanded here but parsed at draw time (see `SceneRunner`), so a
     // value a reference resolves to that is not a colour falls back to the default with
     // a warning instead of failing the whole scene.
@@ -1958,7 +2086,7 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
         },
         "text_exec" => SceneOp::TextExec {
             reference,
-            command: params_command(scene_name, &key, "text_exec", &params)?,
+            command: params_command(scene_name, &key, "text_exec", &pieces)?,
             refresh_seconds: raw.refresh_seconds,
             background,
             text_color,
@@ -1966,13 +2094,13 @@ pub fn resolve_scene_op(raw: &RawSceneOp, variables: &Variables) -> Result<Scene
         },
         "image_exec" => SceneOp::ImageExec {
             reference,
-            command: params_command(scene_name, &key, "image_exec", &params)?,
+            command: params_command(scene_name, &key, "image_exec", &pieces)?,
             refresh_seconds: raw.refresh_seconds,
             background,
         },
         "launch" => SceneOp::Launch {
             reference,
-            command: params_command(scene_name, &key, "launch", &params)?,
+            command: params_command(scene_name, &key, "launch", &pieces)?,
         },
         "clear" => SceneOp::Clear { reference },
         other => SceneOp::Unsupported {
@@ -2009,15 +2137,18 @@ pub fn scene_operations_with(
 }
 
 /// Spawns `command` fully detached from this program: its own process group (so terminal
-/// Ctrl-C / SIGHUP never reach it), null stdio, and the child handle is dropped without
-/// waiting or killing — the child keeps running and gets re-parented to the OS init when
-/// this program terminates, so it outlives us.
+/// Ctrl-C / SIGHUP never reach it), null stdio, and never killed — the child keeps
+/// running and gets re-parented to the OS init when this program terminates, so it
+/// outlives us. While we run, a small waiter thread reaps it when it exits, so finished
+/// programs do not pile up as zombies (a scene with a `launch` entered again and again
+/// would otherwise leave one per entry).
 ///
 /// Only implemented for unix (the project's only supported platform family, Linux and
 /// FreeBSD): `process_group` is a unix-only `Command` extension.
 pub fn spawn_detached(command: &CommandSpec, log: Log) {
     let display = command.display();
     let result = StdCommand::new(&command.program)
+        .env_remove("NOTIFY_SOCKET")
         .args(&command.args)
         .process_group(0)
         .stdin(std::process::Stdio::null())
@@ -2025,11 +2156,21 @@ pub fn spawn_detached(command: &CommandSpec, log: Log) {
         .stderr(std::process::Stdio::null())
         .spawn();
     match result {
-        Ok(child) => {
-            // Dropping the handle detaches the child from us: it runs on its own,
-            // reparented to init, and is never killed when this program exits.
+        Ok(mut child) => {
             let pid = child.id();
-            drop(child);
+            // Only waits: the child is never killed, and if this program exits first the
+            // thread simply ends with it and init adopts the child.
+            let reaper = std::thread::Builder::new()
+                .name(format!("reap-{pid}"))
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+            if let Err(error) = reaper {
+                log.warn(format!(
+                    "\"{display}\" (pid {pid}) will stay a zombie after it exits: {error}"
+                ));
+            }
             log.debug(
                 Subsystem::Actions,
                 format!("launched detached \"{display}\" (pid {pid})"),
@@ -2039,21 +2180,155 @@ pub fn spawn_detached(command: &CommandSpec, log: Log) {
     }
 }
 
-/// Parses an `*_exec`/`image_exec`/`text_exec` command specification from the collapsed
-/// `params` command line. The `scene_name`, physical `key`, and `kind` label are only used
+/// Builds an `image_exec`/`text_exec`/`launch` command specification from the expanded
+/// `params` command line (see [`build_command_pieces`]). The `scene_name`, physical `key`, and `kind` label are only used
 /// for error messages. An empty `params` is an error.
 fn params_command(
     scene_name: &str,
     key: &str,
     kind: &str,
-    params: &str,
+    pieces: &[Piece],
 ) -> Result<CommandSpec, String> {
-    if params.is_empty() {
+    if pieces_display(pieces).is_empty() {
         return Err(format!(
             "scene \"{scene_name}\": key \"{key}\": {kind} params must be a program command line"
         ));
     }
-    build_command(params).map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+    build_command_pieces(pieces)
+        .map_err(|error| format!("scene \"{scene_name}\": key \"{key}\": {error}"))
+}
+
+/// One unit of a command line being tokenised: a character of config text (including
+/// the text of a `$!name` reference), or the whole value of a `$name` reference, which
+/// is never looked into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit<'a> {
+    /// A character of config text.
+    Char(char),
+    /// A `$name` value: literal data.
+    Value(&'a str),
+}
+
+/// Flattens expansion pieces into [`Unit`]s: config text and `$!name` values become
+/// characters, `$name` values stay whole.
+fn command_units(pieces: &[Piece]) -> Vec<Unit<'_>> {
+    let mut units = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Text(text) | Piece::Raw(text) => units.extend(text.chars().map(Unit::Char)),
+            Piece::Value(value) => units.push(Unit::Value(value)),
+        }
+    }
+    units
+}
+
+/// The command line as one string, for messages.
+fn pieces_display(pieces: &[Piece]) -> String {
+    pieces.iter().map(Piece::text).collect()
+}
+
+/// A word of a command line being collected by [`parse_units`].
+#[derive(Default)]
+struct Word {
+    /// The word's text so far, quotes and escapes removed.
+    text: String,
+    /// Whether a `$name` value is part of the word: such a word is kept even when empty,
+    /// so a value always makes exactly one argument.
+    has_value: bool,
+    /// Whether anything has been added yet.
+    started: bool,
+    /// Whether the word started with config text (only then is a leading `~` expanded:
+    /// a value that begins with `~` stays as written).
+    tilde: bool,
+}
+
+impl Word {
+    /// Adds a config-text character.
+    fn push_char(&mut self, c: char) {
+        if !self.started {
+            self.started = true;
+            self.tilde = true;
+        }
+        self.text.push(c);
+    }
+
+    /// Adds a `$name` value, verbatim.
+    fn push_value(&mut self, value: &str) {
+        self.started = true;
+        self.has_value = true;
+        self.text.push_str(value);
+    }
+
+    /// Whether the word should become an argument.
+    fn is_word(&self) -> bool {
+        !self.text.is_empty() || self.has_value
+    }
+
+    /// The finished argument, with a leading config-text `~` expanded.
+    fn finish(self) -> String {
+        if self.tilde {
+            expand_tilde(&self.text)
+        } else {
+            self.text
+        }
+    }
+}
+
+/// Splits command-line units into words: [`parse_command_line`]'s rules for config text,
+/// while each `$name` value is appended verbatim to the word it is in (never split,
+/// unquoted or escaped, never tilde-expanded).
+fn parse_units(units: &[Unit], display: &str) -> Result<CommandSpec, String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = Word::default();
+    let mut quote: Option<char> = None;
+    let mut units = units.iter();
+
+    while let Some(unit) = units.next() {
+        let c = match unit {
+            Unit::Value(value) => {
+                current.push_value(value);
+                continue;
+            }
+            Unit::Char(c) => *c,
+        };
+        if let Some(open) = quote {
+            if c == open {
+                quote = None;
+            } else {
+                current.push_char(c);
+            }
+            continue;
+        }
+        match c {
+            ' ' | '\t' => {
+                if current.is_word() {
+                    words.push(std::mem::take(&mut current).finish());
+                }
+                current = Word::default();
+            }
+            '"' | '\'' => quote = Some(c),
+            '\\' => match units.next() {
+                Some(Unit::Char(next)) => current.push_char(*next),
+                Some(Unit::Value(value)) => current.push_value(value),
+                None => {}
+            },
+            _ => current.push_char(c),
+        }
+    }
+    if quote.is_some() {
+        return Err(format!("unbalanced quotes in \"{display}\""));
+    }
+    if current.is_word() {
+        words.push(current.finish());
+    }
+    let mut words = words.into_iter();
+    match words.next() {
+        Some(program) if !program.is_empty() => Ok(CommandSpec {
+            program,
+            args: words.collect(),
+        }),
+        _ => Err(format!("empty command in \"{display}\"")),
+    }
 }
 
 /// Splits a whitespace-separated command line into a program and its arguments.
@@ -2067,50 +2342,36 @@ fn params_command(
 /// is expanded to `$HOME` via [`expand_tilde`], so `~/scripts/foo.sh --config
 /// ~/my.json` resolves both paths.
 pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut chars = params.chars();
-    let mut quote: Option<char> = None;
+    let units: Vec<Unit> = params.chars().map(Unit::Char).collect();
+    parse_units(&units, params)
+}
 
-    while let Some(c) = chars.next() {
+/// Whether command-line units need a shell: an unquoted shell operator in the config
+/// text. `$name` values are never looked into, so a value cannot make a command run
+/// through a shell.
+fn units_need_shell(units: &[Unit]) -> bool {
+    let mut quote: Option<char> = None;
+    let mut units = units.iter();
+    while let Some(unit) = units.next() {
+        let Unit::Char(c) = *unit else {
+            continue;
+        };
         if let Some(open) = quote {
             if c == open {
                 quote = None;
-            } else {
-                current.push(c);
             }
             continue;
         }
         match c {
-            ' ' | '\t' => {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-            }
             '"' | '\'' => quote = Some(c),
             '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
+                units.next();
             }
-            _ => current.push(c),
+            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
+            _ => {}
         }
     }
-    if quote.is_some() {
-        return Err(format!("unbalanced quotes in \"{params}\""));
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    if words.is_empty() {
-        return Err(format!("empty command in \"{params}\""));
-    }
-
-    let mut words = words.into_iter();
-    Ok(CommandSpec {
-        program: expand_tilde(&words.next().unwrap()),
-        args: words.map(|arg| expand_tilde(&arg)).collect(),
-    })
+    false
 }
 
 /// Whether an already-expanded command line needs a shell to run: it contains an
@@ -2122,38 +2383,94 @@ pub fn parse_command_line(params: &str) -> Result<CommandSpec, String> {
 /// quotes, exactly as [`parse_command_line`] treats them. A command without any operator
 /// runs directly, so no shell is involved.
 pub fn command_needs_shell(text: &str) -> bool {
-    let mut quote: Option<char> = None;
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if let Some(open) = quote {
-            if c == open {
-                quote = None;
+    let units: Vec<Unit> = text.chars().map(Unit::Char).collect();
+    units_need_shell(&units)
+}
+
+/// The `sh -c` script for command-line units, plus the `$name` values it reads.
+///
+/// Config text is copied as written. Each `$name` value becomes a positional parameter
+/// (`${1}`, `${2}`, ...) passed to `sh` as a separate argument, quoted for where it
+/// appears: `"${N}"` outside quotes, `${N}` inside double quotes, `'"${N}"'` inside single
+/// quotes. The shell never parses the text of an expansion, so a value can hold `;`, `|`,
+/// `$(...)` or quotes and still only be data. A backslash in the config text directly
+/// before a value is doubled, so it stays a literal backslash instead of escaping the
+/// quoting added here.
+fn shell_script(units: &[Unit]) -> (String, Vec<String>) {
+    #[derive(PartialEq)]
+    enum Context {
+        Unquoted,
+        Single,
+        Double,
+    }
+    let mut script = String::new();
+    let mut values: Vec<String> = Vec::new();
+    let mut context = Context::Unquoted;
+    let mut escaped = false;
+    for unit in units {
+        match *unit {
+            Unit::Value(value) => {
+                if escaped {
+                    script.push('\\');
+                    escaped = false;
+                }
+                values.push(value.to_string());
+                let parameter = format!("${{{}}}", values.len());
+                match context {
+                    Context::Unquoted => script.push_str(&format!("\"{parameter}\"")),
+                    Context::Double => script.push_str(&parameter),
+                    Context::Single => script.push_str(&format!("'\"{parameter}\"'")),
+                }
             }
-            continue;
-        }
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '\\' => {
-                chars.next();
+            Unit::Char(c) => {
+                script.push(c);
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match (&context, c) {
+                    (Context::Unquoted, '\\') | (Context::Double, '\\') => escaped = true,
+                    (Context::Unquoted, '\'') => context = Context::Single,
+                    (Context::Unquoted, '"') => context = Context::Double,
+                    (Context::Single, '\'') | (Context::Double, '"') => context = Context::Unquoted,
+                    _ => {}
+                }
             }
-            '|' | '&' | ';' | '<' | '>' | '`' | '(' | ')' | '\n' | '\r' => return true,
-            _ => {}
         }
     }
-    false
+    (script, values)
 }
 
 /// Builds the command to run for an already-expanded command line: `sh -c "<text>"` when
 /// the line contains shell syntax (so pipes and redirection work), or a direct
 /// [`parse_command_line`] program plus arguments otherwise.
 pub fn build_command(text: &str) -> Result<CommandSpec, String> {
-    if command_needs_shell(text) {
+    build_command_pieces(&[Piece::Text(text.to_string())])
+}
+
+/// Builds the command to run for an expanded command line (see
+/// [`Variables::expand_pieces`]).
+///
+/// Whether it runs through a shell is decided by the config text (and `$!name` values)
+/// only. Without a shell, each `$name` value is exactly one argument (or part of one);
+/// with a shell it is passed as a positional parameter the script only expands (see
+/// [`shell_script`]). Either way program output stored in a variable can never inject
+/// commands or extra arguments; `$!name` pastes a value in as config text instead.
+pub fn build_command_pieces(pieces: &[Piece]) -> Result<CommandSpec, String> {
+    let units = command_units(pieces);
+    if units_need_shell(&units) {
+        let (script, values) = shell_script(&units);
+        let mut args = vec!["-c".to_string(), script];
+        if !values.is_empty() {
+            args.push("dak".to_string());
+            args.extend(values);
+        }
         Ok(CommandSpec {
             program: "sh".to_string(),
-            args: vec!["-c".to_string(), text.to_string()],
+            args,
         })
     } else {
-        parse_command_line(text)
+        parse_units(&units, &pieces_display(pieces))
     }
 }
 
@@ -2448,10 +2765,19 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
         background: &Color,
         text_color: &Color,
     ) -> Result<DynamicImage, String> {
-        let parsed = crate::markup::parse(text, markup.unwrap_or(self.markup));
-        for warning in &parsed.warnings {
-            self.log
-                .warn(format!("button {key}: {warning}; shown as written"));
+        let text = clip_button_text(text);
+        let parsed = crate::markup::parse(&text, markup.unwrap_or(self.markup));
+        for warning in parsed.warnings.iter().take(MAX_MARKUP_WARNINGS) {
+            self.log.warn(format!(
+                "button {key}: {}; shown as written",
+                clip_for_log(warning)
+            ));
+        }
+        if parsed.warnings.len() > MAX_MARKUP_WARNINGS {
+            self.log.warn(format!(
+                "button {key}: {} more markup warnings not shown",
+                parsed.warnings.len() - MAX_MARKUP_WARNINGS
+            ));
         }
         crate::text::render_lines(
             &parsed.lines,
@@ -2772,7 +3098,10 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
             } => {
                 self.log.debug(
                     Subsystem::Scene,
-                    format!("render value on key {key}: \"{text}\""),
+                    format!(
+                        "render value on key {key}: \"{}\"",
+                        crate::log::escape_text(text)
+                    ),
                 );
                 let background =
                     self.draw_colour(key, "background", background.as_deref(), &self.background);
@@ -2957,7 +3286,7 @@ impl<'a, D: ButtonDevice> SceneRunner<'a, D> {
                             }
                         }
                     }
-                    ExecOutputKind::Image => match image::load_from_memory(&stdout) {
+                    ExecOutputKind::Image => match decode_image_output(stdout).await {
                         Ok(image) => crate::color::flatten(image, &background),
                         Err(error) => {
                             self.log.error(format!(
@@ -3340,11 +3669,18 @@ pub async fn run_command_with_timeout(
     let display = command.display();
     let mut child = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        // Its stderr is a pipe to dak, not the journal; and it must not talk to the
+        // service manager as dak (see `CHILD_ONLY_DAK_ENV`).
+        .env_remove("NOTIFY_SOCKET")
+        .env_remove("JOURNAL_STREAM")
         // Never the terminal (or whatever dak's stdin is once detached): a program
         // waiting for input would only sit there until the timeout kills it.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Its own process group, so everything it starts (an `sh -c` pipeline, a
+        // background job) can be killed along with it - see `GroupKill`.
+        .process_group(0)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("command \"{display}\" failed to start: {error}"))?;
@@ -3353,7 +3689,10 @@ pub async fn run_command_with_timeout(
     // and blocks on its own write until the timeout. The first bytes are kept for the
     // failure message.
     let stderr = child.stderr.take().expect("stderr pipe was requested");
-    let stderr_task = tokio::spawn(drain_stderr(stderr));
+    let mut stderr_task = AbortOnDrop(tokio::spawn(drain_stderr(stderr)));
+    // Declared after `child`, so when this future is dropped mid-run (the button was
+    // reassigned) the group is killed before the child is reaped.
+    let mut group = GroupKill(child.id().map(|pid| pid as i32));
 
     // Drain stdout *before* waiting for exit, not after: a program producing more than
     // one OS pipe buffer's worth of output blocks on its own `write()` once that buffer
@@ -3385,11 +3724,13 @@ pub async fn run_command_with_timeout(
     let (status, bytes) = match tokio::time::timeout(timeout, run).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => {
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(error);
         }
         Err(_) => {
+            group.kill();
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(format!(
@@ -3399,14 +3740,74 @@ pub async fn run_command_with_timeout(
     };
 
     if !status.success() {
-        let stderr = stderr_task.await.unwrap_or_default();
+        // Something the program started may still hold stderr open: wait for the
+        // excerpt only briefly, then kill what is left of the group.
+        let stderr = match tokio::time::timeout(STDERR_GRACE, &mut stderr_task.0).await {
+            Ok(result) => result.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        group.kill();
         return Err(with_stderr(
             format!("command \"{display}\" exited with {status}"),
             &stderr,
         ));
     }
+    // A program that succeeded may leave background jobs running on purpose.
+    group.disarm();
     Ok(bytes)
 }
+
+/// How long a failed command's stderr is still read after it exited.
+pub const STDERR_GRACE: Duration = Duration::from_millis(500);
+
+/// Aborts the task when dropped, so a helper task never outlives its command.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    /// Aborts the task (a no-op when it already finished).
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Kills a command's whole process group (`SIGKILL`) when dropped or told to, unless
+/// disarmed: `kill_on_drop` only reaches the direct child, not the programs of an
+/// `sh -c` pipeline or background jobs it started.
+///
+/// Safe against pid reuse because it is used before the child is reaped (a pid stays
+/// taken until then), or while other members keep the group alive.
+struct GroupKill(Option<i32>);
+
+impl GroupKill {
+    /// Kills the group now (at most once).
+    fn kill(&mut self) {
+        if let Some(group) = self.0.take() {
+            // SAFETY: killpg on a process group we created; failure (already gone) is fine.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        }
+    }
+
+    /// Leaves the group alone from now on.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    /// Kills the group unless disarmed or already killed.
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Environment variables meant for dak alone, removed from every program it starts:
+/// `NOTIFY_SOCKET` would let any program (including one a config runs on input from a
+/// keypad) tell systemd that the service is ready, reloading or stopping, as dak. Only
+/// the unit's `NotifyAccess=main` keeps that from working today.
+/// `image_exec`/`text_exec`/`$(...)` programs also lose `JOURNAL_STREAM`, since their
+/// stderr is a pipe read by dak, not the journal; action commands and `launch`
+/// programs keep it, as they write to dak's own stderr.
+pub const CHILD_ONLY_DAK_ENV: &[&str] = &["NOTIFY_SOCKET"];
 
 /// How much of a failed command's stderr is quoted in its error message.
 pub const STDERR_EXCERPT_BYTES: usize = 512;
@@ -3428,13 +3829,15 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
 }
 
 /// `message` followed by the trimmed stderr excerpt (as `: <text>`, newlines shown as
-/// ` / `), or `message` alone when the program printed nothing.
+/// ` / `, other control characters escaped), or `message` alone when the program
+/// printed nothing.
 pub fn with_stderr(message: String, stderr: &[u8]) -> String {
     let text = String::from_utf8_lossy(stderr);
     let text = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .map(crate::log::escape_text)
         .collect::<Vec<_>>()
         .join(" / ");
     if text.is_empty() {
@@ -3456,6 +3859,7 @@ pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
     let display = command.display();
     let status = tokio::process::Command::new(&command.program)
         .args(&command.args)
+        .env_remove("NOTIFY_SOCKET")
         .stdin(std::process::Stdio::null())
         .status()
         .await
@@ -3464,6 +3868,44 @@ pub async fn run_action_command(command: CommandSpec) -> Result<(), String> {
         return Err(format!("command \"{display}\" exited with {status}"));
     }
     Ok(())
+}
+
+/// Most characters of one line of button text passed to the markup parser: plenty for
+/// six columns plus their tags, while a line of megabytes of program output is not
+/// parsed (and warned about) in full.
+pub const MAX_TEXT_LINE_CHARS: usize = 1024;
+
+/// Most markup warnings logged for one drawing of a button; the rest are counted.
+pub const MAX_MARKUP_WARNINGS: usize = 3;
+
+/// Most characters of a warning about button text written to the log.
+const MAX_LOGGED_WARNING_CHARS: usize = 200;
+
+/// The part of `text` a button can show before markup is parsed: its first
+/// [`crate::text::MAX_LINES`] lines, each cut to [`MAX_TEXT_LINE_CHARS`] characters.
+/// Text from programs and files can be megabytes long; only this much of it can ever
+/// be drawn.
+pub fn clip_button_text(text: &str) -> String {
+    let mut clipped = String::new();
+    for (index, line) in text.lines().take(crate::text::MAX_LINES).enumerate() {
+        if index > 0 {
+            clipped.push('\n');
+        }
+        clipped.extend(line.chars().take(MAX_TEXT_LINE_CHARS));
+    }
+    clipped
+}
+
+/// `text` cut to [`MAX_LOGGED_WARNING_CHARS`] characters, with `...` when it was cut,
+/// and escaped (see [`crate::log::escape_text`]): it quotes button text, which may come
+/// from a program.
+fn clip_for_log(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut clipped: String = chars.by_ref().take(MAX_LOGGED_WARNING_CHARS).collect();
+    if chars.next().is_some() {
+        clipped.push_str("...");
+    }
+    crate::log::escape_text(&clipped)
 }
 
 /// Maximum bytes read from a `text` setup entry's file - far more than the 3x6
@@ -3478,15 +3920,36 @@ pub const MAX_TEXT_FILE_BYTES: u64 = 64 * 1024;
 async fn load_image_file(
     path: &str,
 ) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
-    let path = path.to_string();
-    let result = tokio::task::spawn_blocking(move || image::open(path))
+    let path = PathBuf::from(path);
+    let shown = path.display().to_string();
+    let task = tokio::task::spawn_blocking(move || crate::imaging::open(&path));
+    let result = tokio::time::timeout(FILE_READ_TIMEOUT, task)
+        .await
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("reading {shown} took longer than {FILE_READ_TIMEOUT:?}").into()
+        })?
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+    result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
+}
+
+/// How long reading an `image` or `text` entry's file may take before it is given up
+/// (the device loop waits for it; a stalled network file system must not freeze it).
+pub const FILE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Decodes `image_exec` output (see [`crate::imaging::decode`]) off the async runtime's
+/// worker thread, since decoding is CPU-bound.
+async fn decode_image_output(
+    bytes: Vec<u8>,
+) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
+    let result = tokio::task::spawn_blocking(move || crate::imaging::decode(&bytes))
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
     result.map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
 }
 
-/// Reads at most [`MAX_TEXT_FILE_BYTES`] from `path`, using `tokio::fs` so a large or
-/// slow read never blocks a worker thread; a source with more data than the cap (e.g.
+/// Reads at most [`MAX_TEXT_FILE_BYTES`] from the regular file `path` (see
+/// [`crate::imaging::open_regular_file`]) within [`FILE_READ_TIMEOUT`], using `tokio::fs`
+/// so a large or slow read never blocks a worker thread; a source with more data than the cap (e.g.
 /// `/dev/zero`) simply stops there instead of reading forever. Bytes are decoded
 /// lossily, since a `text` entry only ever shows the first few lines, so invalid UTF-8
 /// anywhere in a large file is not worth failing the whole read over.
@@ -3494,9 +3957,17 @@ async fn read_text_file_bounded(
     path: &str,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::open(path).await?;
+    let owned = PathBuf::from(path);
+    let file =
+        tokio::task::spawn_blocking(move || crate::imaging::open_regular_file(&owned)).await??;
+    let file = tokio::fs::File::from_std(file);
     let mut buf = Vec::new();
-    file.take(MAX_TEXT_FILE_BYTES).read_to_end(&mut buf).await?;
+    tokio::time::timeout(
+        FILE_READ_TIMEOUT,
+        file.take(MAX_TEXT_FILE_BYTES).read_to_end(&mut buf),
+    )
+    .await
+    .map_err(|_| format!("reading {path} took longer than {FILE_READ_TIMEOUT:?}"))??;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -3787,8 +4258,14 @@ pub enum Action {
     SwitchScene {
         scene: String,
     },
+    /// A command as written in the config, unexpanded (what [`parse_action`] returns).
     Command {
         command: String,
+    },
+    /// A command ready to run, built by [`resolve_action`] from the expanded action
+    /// (see [`build_command_pieces`]).
+    Run {
+        spec: CommandSpec,
     },
     Assign {
         target: AssignTarget,
@@ -3842,13 +4319,49 @@ pub fn parse_action(value: &str) -> Action {
 /// current state first.
 ///
 /// An assignment is parsed structurally without expanding its left-hand side (only the
-/// assignment's own right-hand side is resolved, when it fires); every other value -
-/// a scene switch target, a command - is expanded as a whole.
+/// assignment's own right-hand side is resolved, when it fires). Otherwise the action is
+/// classified by its config text, never by a `$name` value: text starting with `@` is a
+/// scene switch (a value may name the scene), and anything else is a command, returned
+/// as [`Action::Run`] and built by [`build_command_pieces`], so a `$name` value is always
+/// data. `$!name` values count as config text: an action made of just `$!name` is
+/// re-read as a whole action, so its value may be `@scene` or an assignment.
 pub fn resolve_action(value: &str, variables: &Variables) -> Result<Action, String> {
     if value.starts_with('$') && parse_assignment(value).is_some() {
         return Ok(parse_action(value));
     }
-    Ok(parse_action(&variables.expand(value)?))
+    let pieces = merge_raw_pieces(variables.expand_pieces(value)?);
+    if let Some(Piece::Text(first)) = pieces.first() {
+        if first.starts_with('@') {
+            return Ok(parse_action(&pieces_display(&pieces)));
+        }
+        if first.starts_with('$') && pieces.len() == 1 {
+            // Only reachable through `$!name` (or an escaped `\$`): re-read as an
+            // action, the pre-v0.15.0 behaviour.
+            let action = parse_action(first);
+            if !matches!(action, Action::Command { .. }) {
+                return Ok(action);
+            }
+        }
+    }
+    Ok(Action::Run {
+        spec: build_command_pieces(&pieces)?,
+    })
+}
+
+/// Turns every [`Piece::Raw`] into config text, merging it with its neighbours, so only
+/// [`Piece::Value`]s stay apart.
+fn merge_raw_pieces(pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut merged: Vec<Piece> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Value(value) => merged.push(Piece::Value(value)),
+            Piece::Text(text) | Piece::Raw(text) => match merged.last_mut() {
+                Some(Piece::Text(last)) => last.push_str(&text),
+                _ => merged.push(Piece::Text(text)),
+            },
+        }
+    }
+    merged
 }
 
 /// One scalar value on its way into an assignment, kept in its source precision until it
@@ -4164,8 +4677,7 @@ fn prepare_command_assignment(
             ),
         },
     };
-    let expanded = state.expand(inner)?;
-    let spec = build_command(&expanded)?;
+    let spec = build_command_pieces(&state.expand_pieces(inner)?)?;
     Ok((conversion, spec, label))
 }
 
@@ -4174,7 +4686,9 @@ fn prepare_command_assignment(
 ///
 /// The command is expanded and built here (reading the current values of any referenced
 /// variables), then the task runs it, converts its output, and reports the result through
-/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply.
+/// `exec_tx` as [`ExecEvent::Assignment`] for the input loop to apply. The task holds one
+/// of the shared [`crate::limits::command_slots`]; with none free the assignment is
+/// skipped with a (throttled) warning.
 pub fn start_command_assignment(
     target: AssignTarget,
     op: AssignOp,
@@ -4194,7 +4708,16 @@ pub fn start_command_assignment(
             return;
         }
     };
+    let Some(slot) = crate::limits::command_slots().try_take() else {
+        if crate::limits::BUSY_WARNING.ready(std::time::Instant::now()) {
+            log.warn(crate::limits::busy_message(&format!(
+                "the command of the assignment to {label}"
+            )));
+        }
+        return;
+    };
     tokio::spawn(async move {
+        let _slot = slot;
         let outcome = match run_command_with_timeout(&spec, EXEC_TIMEOUT).await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(output) => convert_output(&output, &conversion, op, &label, log),
@@ -4390,7 +4913,9 @@ pub fn timer_for_scene<'a>(scene_name: &str, scenes: &'a Value) -> Option<(u64, 
 ///
 /// The seconds key is either a number or a single int variable reference. Returns
 /// `Ok(None)` when the scene has no timer (or an unrecognizable one, matching
-/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable.
+/// [`timer_for_scene`]), and `Err` when a reference is malformed or unresolvable. The
+/// seconds are at least [`crate::limits::MIN_TIMER_SECONDS`]: validation rejects a
+/// smaller literal, and a variable's smaller value is raised to it.
 pub fn timer_for_scene_with<'a>(
     scene_name: &str,
     scenes: &'a Value,
@@ -4429,7 +4954,12 @@ pub fn timer_for_scene_with<'a>(
             }
         }
     };
-    Ok(Some((seconds, action_values(action))))
+    // A value from a variable is only known now; it may still be 0 (e.g. set from a
+    // program's output), which would re-run the timer in a busy loop.
+    Ok(Some((
+        seconds.max(crate::limits::MIN_TIMER_SECONDS),
+        action_values(action),
+    )))
 }
 
 #[cfg(test)]
@@ -4493,6 +5023,98 @@ mod tests {
         PathBuf::from(dir)
     }
 
+    /// This process's effective uid.
+    fn euid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    /// A private file in a private directory has no problem; a file owned by someone
+    /// else, or writable by others, or in a directory writable by others, has one.
+    #[test]
+    fn config_file_problems() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = dir.join("config.json");
+        std::fs::write(&file, "{}").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::config_file_problem(&file, euid()), None);
+        let other = super::config_file_problem(&file, euid().wrapping_add(1)).unwrap();
+        assert!(other.contains("not by you"), "{other}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let writable = super::config_file_problem(&file, euid()).unwrap();
+        assert!(writable.contains("mode 664"), "{writable}");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let open_dir = super::config_file_problem(&file, euid()).unwrap();
+        assert!(open_dir.contains("directory"), "{open_dir}");
+        assert_eq!(
+            super::config_file_problem(&dir.join("missing.json"), euid()),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A doubtful config in a later search directory (the current or the binary's
+    /// directory) is skipped with a warning, so a trustworthy one after it - or the
+    /// missing-file fallback - is used instead.
+    #[test]
+    fn pick_config_path_skips_doubtful_later_configs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir();
+        let shared = temp_dir();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        std::fs::write(shared.join("config.json"), "{}").unwrap();
+        let picked = super::pick_config_path(None, &[home.clone(), shared.clone()], euid());
+        assert_eq!(picked.path, home.join("config.json"));
+        assert_eq!(picked.warnings.len(), 1);
+        assert!(
+            picked.warnings[0].contains("ignoring config"),
+            "{:?}",
+            picked.warnings
+        );
+
+        // Owned by someone else: skipped too.
+        let other = temp_dir();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(other.join("config.json"), "{}").unwrap();
+        std::fs::set_permissions(
+            other.join("config.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let picked =
+            super::pick_config_path(None, &[home.clone(), other.clone()], euid().wrapping_add(1));
+        assert_eq!(picked.path, home.join("config.json"));
+        assert!(picked.warnings[0].contains("not by you"));
+        // ...while the same file is fine for its owner.
+        let picked = super::pick_config_path(None, &[home.clone(), other.clone()], euid());
+        assert_eq!(picked.path, other.join("config.json"));
+        assert!(picked.warnings.is_empty(), "{:?}", picked.warnings);
+        for dir in [home, shared, other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// The user's own directory and an explicit path are loaded even when doubtful,
+    /// with a warning.
+    #[test]
+    fn pick_config_path_warns_about_doubtful_own_configs() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_dir();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = home.join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let picked = super::pick_config_path(None, std::slice::from_ref(&home), euid());
+        assert_eq!(picked.path, config);
+        assert!(picked.warnings[0].contains("may have been written by someone else"));
+        let picked = super::pick_config_path(Some(&config), &[], euid());
+        assert_eq!(picked.path, config);
+        assert_eq!(picked.warnings.len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// An explicitly given config path wins as-is, even if the search directories
     /// hold a config or are completely unrelated.
     #[test]
@@ -4502,8 +5124,8 @@ mod tests {
         std::fs::write(&config, "{}").unwrap();
         let explicit = Path::new("/some/elsewhere/custom.json");
 
-        let picked = super::pick_config_path(Some(explicit), std::slice::from_ref(&dir));
-        assert_eq!(picked, explicit);
+        let picked = super::pick_config_path(Some(explicit), std::slice::from_ref(&dir), euid());
+        assert_eq!(picked.path, explicit);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4515,8 +5137,8 @@ mod tests {
         std::fs::write(first.join("config.json"), "{}").unwrap();
         std::fs::write(second.join("config.json"), "{}").unwrap();
 
-        let picked = super::pick_config_path(None, &[first.clone(), second.clone()]);
-        assert_eq!(picked, first.join("config.json"));
+        let picked = super::pick_config_path(None, &[first.clone(), second.clone()], euid());
+        assert_eq!(picked.path, first.join("config.json"));
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -4524,12 +5146,21 @@ mod tests {
     /// Directories without a config are skipped, so a later directory with one wins.
     #[test]
     fn pick_config_path_skips_dirs_without_config() {
+        use std::os::unix::fs::PermissionsExt;
         let empty_dir = temp_dir();
         let with_config = temp_dir();
         std::fs::write(with_config.join("config.json"), "{}").unwrap();
+        // Private whatever the umask, so the later directory's config is trusted.
+        std::fs::set_permissions(&with_config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            with_config.join("config.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
 
-        let picked = super::pick_config_path(None, &[empty_dir.clone(), with_config.clone()]);
-        assert_eq!(picked, with_config.join("config.json"));
+        let picked =
+            super::pick_config_path(None, &[empty_dir.clone(), with_config.clone()], euid());
+        assert_eq!(picked.path, with_config.join("config.json"));
         let _ = std::fs::remove_dir_all(&empty_dir);
         let _ = std::fs::remove_dir_all(&with_config);
     }
@@ -4541,8 +5172,8 @@ mod tests {
         let first = temp_dir();
         let second = temp_dir();
 
-        let picked = super::pick_config_path(None, &[first.clone(), second.clone()]);
-        assert_eq!(picked, first.join("config.json"));
+        let picked = super::pick_config_path(None, &[first.clone(), second.clone()], euid());
+        assert_eq!(picked.path, first.join("config.json"));
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
     }
@@ -4551,7 +5182,7 @@ mod tests {
     #[test]
     fn pick_config_path_falls_back_to_bare_name() {
         assert_eq!(
-            super::pick_config_path(None, &[]),
+            super::pick_config_path(None, &[], euid()).path,
             PathBuf::from("config.json")
         );
     }
@@ -4561,7 +5192,7 @@ mod tests {
     fn resolve_config_path_passes_explicit_path_through() {
         let explicit = Path::new("/opt/custom/settings.json");
         assert_eq!(
-            super::resolve_config_path(Some(explicit)),
+            super::resolve_config_path(Some(explicit)).path,
             explicit.to_path_buf()
         );
     }
@@ -4578,7 +5209,7 @@ mod tests {
 
         let picked = super::resolve_config_path(None);
 
-        assert_eq!(picked, home_config);
+        assert_eq!(picked.path, home_config);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -5170,7 +5801,10 @@ mod tests {
         let dir = temp_dir();
         write_file_with_mode(&dir.join("dak-test-tool"), 0o755);
         let old = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
+        // Prepended, not replacing PATH: other tests spawn programs meanwhile.
+        let mut paths = vec![dir.clone()];
+        paths.extend(std::env::split_paths(old.as_deref().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
 
         let mut found = Vec::new();
         super::check_executable("s", "p", "dak-test-tool", &mut found);
@@ -5779,18 +6413,20 @@ mod tests {
     #[test]
     fn resolve_action_expands_values_but_not_assignment_targets() {
         let variables = scene_variables();
+        let run = |program: &str, args: &[&str]| super::Action::Run {
+            spec: super::CommandSpec {
+                program: program.to_string(),
+                args: args.iter().map(|arg| arg.to_string()).collect(),
+            },
+        };
         assert_eq!(
             super::resolve_action("/bin/echo $dir", &variables).unwrap(),
-            super::Action::Command {
-                command: "/bin/echo a".to_string()
-            }
+            run("/bin/echo", &["a"])
         );
         // A value that is exactly one reference expands to just its value.
         assert_eq!(
             super::resolve_action("$dir", &variables).unwrap(),
-            super::Action::Command {
-                command: "a".to_string()
-            }
+            run("a", &[])
         );
         assert!(super::resolve_action("/bin/echo $missing", &variables).is_err());
         assert_eq!(
@@ -6022,6 +6658,489 @@ mod tests {
             matches!(received, Ok(None)),
             "an undeclared target must not spawn a command: {received:?}"
         );
+    }
+
+    /// Button text is cut to the lines and characters a button can show before markup
+    /// is parsed.
+    #[test]
+    fn clip_button_text_keeps_what_a_button_can_show() {
+        assert_eq!(super::clip_button_text("a\nb\nc\nd\ne"), "a\nb\nc");
+        assert_eq!(super::clip_button_text("a\r\nb"), "a\nb");
+        assert_eq!(super::clip_button_text(""), "");
+        let long = "é".repeat(5000);
+        let clipped = super::clip_button_text(&long);
+        assert_eq!(clipped.chars().count(), super::MAX_TEXT_LINE_CHARS);
+        // Megabytes of output are clipped without trouble.
+        let huge = "#[x]".repeat(2_000_000);
+        assert_eq!(
+            super::clip_button_text(&huge).chars().count(),
+            super::MAX_TEXT_LINE_CHARS
+        );
+    }
+
+    /// Log text is cut with an ellipsis only when it is too long.
+    #[test]
+    fn clip_for_log_marks_cut_text() {
+        assert_eq!(super::clip_for_log("short"), "short");
+        let long = "x".repeat(super::MAX_LOGGED_WARNING_CHARS + 1);
+        let clipped = super::clip_for_log(&long);
+        assert!(clipped.ends_with("..."));
+        assert_eq!(clipped.len(), super::MAX_LOGGED_WARNING_CHARS + 3);
+    }
+
+    use std::time::Duration;
+
+    /// A unique path in the temp dir for a test's pid file.
+    fn temp_path(name: &str) -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("dak_{name}_{}_{n}", std::process::id()))
+    }
+
+    /// Whether `pid` is a running (not zombie) process, via the portable `ps`.
+    fn running(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map(|output| {
+                let stat = String::from_utf8_lossy(&output.stdout);
+                let stat = stat.trim();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
+            .unwrap_or(false)
+    }
+
+    /// Polls until `pid` is no longer running, for up to 5 s.
+    async fn wait_gone(pid: i32) -> bool {
+        for _ in 0..500 {
+            if !running(pid) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// Reads the pid a test command wrote to `path`, polling for up to 5 s.
+    async fn read_pid(path: &Path) -> i32 {
+        for _ in 0..500 {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no pid in {path:?}");
+    }
+
+    /// A shell command's background job is killed with it on timeout: the whole process
+    /// group goes, not only the direct child.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        let pid_file = temp_path("group-timeout");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display()),
+            ],
+        };
+        let error = super::run_command_with_timeout(&spec, Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(error.contains("killed"), "{error}");
+        let pid = read_pid(&pid_file).await;
+        assert!(wait_gone(pid).await, "background job {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// A command that failed while something it started keeps stderr open returns its
+    /// error promptly (not when that program ends), and the leftover is killed.
+    #[tokio::test]
+    async fn failed_command_does_not_wait_for_leftover_stderr() {
+        let pid_file = temp_path("group-stderr");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 30 >/dev/null & echo $! > {}; echo oops >&2; exit 3",
+                    pid_file.display()
+                ),
+            ],
+        };
+        let started = std::time::Instant::now();
+        let error = super::run_command_with_timeout(&spec, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.contains("exited with"), "{error}");
+        let pid = read_pid(&pid_file).await;
+        assert!(wait_gone(pid).await, "leftover {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// Dropping a running command (its button was reassigned) kills its process group.
+    #[tokio::test]
+    async fn dropping_a_command_kills_its_process_group() {
+        let pid_file = temp_path("group-drop");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("sleep 30 & echo $! > {}; sleep 30", pid_file.display()),
+            ],
+        };
+        let task = tokio::spawn(async move {
+            super::run_command_with_timeout(&spec, Duration::from_secs(60)).await
+        });
+        let pid = read_pid(&pid_file).await;
+        task.abort();
+        let _ = task.await;
+        assert!(wait_gone(pid).await, "background job {pid} survived");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// A successful command may leave a background job running on purpose.
+    #[tokio::test]
+    async fn successful_command_keeps_its_background_jobs() {
+        let pid_file = temp_path("group-ok");
+        let spec = super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "sleep 2 >/dev/null 2>&1 & echo $! > {}; echo hi",
+                    pid_file.display()
+                ),
+            ],
+        };
+        let output = super::run_command_with_timeout(&spec, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(output, b"hi\n");
+        let pid = read_pid(&pid_file).await;
+        assert!(running(pid), "the background job was killed");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    /// Command lines and stderr excerpts in messages show control characters and
+    /// newlines escaped: both can carry program output.
+    #[test]
+    fn messages_escape_program_text() {
+        let spec = super::CommandSpec {
+            program: "echo".to_string(),
+            args: vec!["a\u{1b}[2J\nb".to_string()],
+        };
+        assert_eq!(spec.display(), "echo a\\u{1b}[2J\\nb");
+        let message = super::with_stderr("failed".to_string(), b"x\x1b[31my\rz\nnext");
+        assert_eq!(message, "failed: x\\u{1b}[31my\\u{d}z / next");
+        assert_eq!(super::clip_for_log("a\u{7}"), "a\\u{7}");
+    }
+
+    /// Waits for a line-terminated file a test program writes, for up to 5 s.
+    async fn read_line_file(file: &Path) -> String {
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                if text.ends_with('\n') {
+                    return text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no output in {file:?}");
+    }
+
+    /// Programs dak starts never see `NOTIFY_SOCKET` (so they cannot talk to systemd as
+    /// dak); `*_exec`/`$(...)` programs also lose `JOURNAL_STREAM`, while action
+    /// commands and `launch` programs, which write to dak's own stderr, keep it.
+    #[tokio::test]
+    async fn children_do_not_inherit_dak_only_environment() {
+        let dump = |file: &Path| super::CommandSpec {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "echo \"n=${{NOTIFY_SOCKET-unset}} j=${{JOURNAL_STREAM-unset}}\" > {}",
+                    file.display()
+                ),
+            ],
+        };
+        let (exec_file, action_file, launch_file) = (
+            temp_path("env-exec"),
+            temp_path("env-action"),
+            temp_path("env-launch"),
+        );
+        // The children are spawned (which copies the environment) while the variables
+        // are set and the lock is held; their results are awaited afterwards.
+        let (exec, action) = {
+            let _guard = ENV_LOCK.lock().unwrap();
+            // A path that does not exist, in case a parallel test notifies meanwhile.
+            std::env::set_var("NOTIFY_SOCKET", "/nonexistent/dak-test-notify");
+            std::env::set_var("JOURNAL_STREAM", "8:1234");
+            let exec_spec = dump(&exec_file);
+            let exec = tokio::spawn(async move {
+                super::run_command_with_timeout(&exec_spec, super::EXEC_TIMEOUT).await
+            });
+            let action = tokio::spawn(super::run_action_command(dump(&action_file)));
+            super::spawn_detached(&dump(&launch_file), crate::log::Log::default());
+            (exec, action)
+        };
+        exec.await.unwrap().unwrap();
+        action.await.unwrap().unwrap();
+        assert_eq!(read_line_file(&exec_file).await, "n=unset j=unset\n");
+        assert_eq!(read_line_file(&action_file).await, "n=unset j=8:1234\n");
+        assert_eq!(read_line_file(&launch_file).await, "n=unset j=8:1234\n");
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            std::env::remove_var("NOTIFY_SOCKET");
+            std::env::remove_var("JOURNAL_STREAM");
+        }
+        assert_eq!(super::CHILD_ONLY_DAK_ENV, ["NOTIFY_SOCKET"]);
+        for file in [exec_file, action_file, launch_file] {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
+    /// Variables for the injection tests: `$v` holds `value`, `$n` an int.
+    fn hostile_variables(value: &str) -> crate::variables::Variables {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "v".to_string(),
+            crate::variables::VarDef::string(65535, value.to_string()),
+        );
+        defs.insert("n".to_string(), crate::variables::VarDef::int(0, 100, 7));
+        crate::variables::Variables::new(defs, &crate::press::Defaults::default())
+    }
+
+    /// Builds the command for `template` with `$v` set to `value`.
+    fn command_with(template: &str, value: &str) -> super::CommandSpec {
+        let variables = hostile_variables(value);
+        super::build_command_pieces(&variables.expand_pieces(template).unwrap()).unwrap()
+    }
+
+    /// Values a program might print to attack a command it is substituted into.
+    const HOSTILE_VALUES: &[&str] = &[
+        "x; touch /tmp/pwned",
+        "x | sh",
+        "x && id",
+        "$(id)",
+        "`id`",
+        "a b c",
+        "it's \"quoted\"",
+        "back\\slash",
+        "line\nnext",
+        "--output=/etc/passwd",
+        "~/secret",
+        "",
+        "${1} $0 \"$@\"",
+    ];
+
+    /// In a plain command a `$name` value is always exactly one argument, verbatim: no
+    /// shell appears, it is not split, unquoted, unescaped or tilde-expanded.
+    #[test]
+    fn value_is_one_literal_argument_in_a_plain_command() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
+        for value in HOSTILE_VALUES {
+            let spec = command_with("notify-send $v", value);
+            assert_eq!(spec.program, "notify-send", "{value:?}");
+            assert_eq!(spec.args, [value.to_string()], "{value:?}");
+            // Inside a word and inside quotes it is still just part of that one word.
+            let spec = command_with("printf pre-$v-post '[$v]'", value);
+            assert_eq!(
+                spec.args,
+                [format!("pre-{value}-post"), format!("[{value}]")],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// A value can be the program itself, but still as one word.
+    #[test]
+    fn value_as_program_is_one_word() {
+        let spec = command_with("$v --flag", "my prog; rm -rf /");
+        assert_eq!(spec.program, "my prog; rm -rf /");
+        assert_eq!(spec.args, ["--flag"]);
+    }
+
+    /// An empty value as the program is an error, not an empty program name.
+    #[test]
+    fn empty_value_as_program_is_an_error() {
+        let variables = hostile_variables("");
+        let pieces = variables.expand_pieces("$v").unwrap();
+        assert!(super::build_command_pieces(&pieces)
+            .unwrap_err()
+            .contains("empty command"));
+    }
+
+    /// When the config text needs a shell, each value is passed to `sh` as a positional
+    /// parameter that the script only expands, quoted for where it appears.
+    #[test]
+    fn value_is_a_positional_parameter_in_a_shell_command() {
+        let spec = command_with("echo $v \"in $v\" 'lit $v' | wc -c", "x; id");
+        assert_eq!(spec.program, "sh");
+        assert_eq!(
+            spec.args,
+            [
+                "-c",
+                "echo \"${1}\" \"in ${2}\" 'lit '\"${3}\"'' | wc -c",
+                "dak",
+                "x; id",
+                "x; id",
+                "x; id"
+            ]
+        );
+    }
+
+    /// A backslash in the config text right before a value stays a literal backslash
+    /// instead of escaping the quote dak adds around the value.
+    #[test]
+    fn backslash_before_a_value_in_a_shell_command_is_literal() {
+        let spec = command_with("echo a\\\\$v | cat", "x");
+        assert_eq!(spec.args[1], "echo a\\\\\"${1}\" | cat");
+    }
+
+    /// Shell syntax in a value never turns a plain command into a shell command.
+    #[test]
+    fn value_never_makes_a_command_use_a_shell() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
+        for value in HOSTILE_VALUES {
+            assert_ne!(command_with("echo $v", value).program, "sh", "{value:?}");
+        }
+    }
+
+    /// `$!name` keeps the pre-v0.15.0 behaviour: the value is pasted in as config text,
+    /// so it may add arguments and shell syntax.
+    #[test]
+    fn raw_reference_is_pasted_as_config_text() {
+        // Reads $HOME (tilde expansion), which other tests change.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let spec = command_with("echo $!v", "a b");
+        assert_eq!(spec.args, ["a", "b"]);
+        let spec = command_with("echo $!v", "a | wc -c");
+        assert_eq!(spec.program, "sh");
+        assert_eq!(spec.args, ["-c", "echo a | wc -c"]);
+        let spec = command_with("echo $!v", "~/x");
+        assert_eq!(spec.args, [super::expand_tilde("~/x")]);
+    }
+
+    /// Runs `sh` for real: the hostile values reach the program byte for byte and no
+    /// injected command runs.
+    #[tokio::test]
+    async fn shell_command_passes_hostile_values_through_unchanged() {
+        let marker = std::env::temp_dir().join(format!("dak-injection-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let attack = format!(
+            "x; touch {0} $(touch {0}) `touch {0}` '\"",
+            marker.display()
+        );
+        let spec = command_with("printf %s $v | cat", &attack);
+        let output = super::run_command_with_timeout(&spec, super::EXEC_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), attack);
+        assert!(!marker.exists(), "an injected command ran");
+    }
+
+    /// An action made of a `$name` value runs it as a single command word; it is never
+    /// re-read as a scene switch or an assignment.
+    #[test]
+    fn resolve_action_never_reinterprets_a_value() {
+        for value in ["@Main", "@", "$v := $(id)", "$n = 5"] {
+            let variables = hostile_variables(value);
+            match super::resolve_action("$v", &variables).unwrap() {
+                super::Action::Run { spec } => {
+                    assert_eq!(spec.program, value);
+                    assert!(spec.args.is_empty());
+                }
+                other => panic!("{value:?} became {other:?}"),
+            }
+        }
+    }
+
+    /// `$!name` as a whole action is re-read as an action, as before v0.15.0.
+    #[test]
+    fn resolve_action_rereads_a_raw_value() {
+        let variables = hostile_variables("@Main");
+        assert_eq!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::SwitchScene {
+                scene: "Main".to_string()
+            }
+        );
+        let variables = hostile_variables("$n = 5");
+        assert!(matches!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::Assign { .. }
+        ));
+        let variables = hostile_variables("echo a b");
+        assert_eq!(
+            super::resolve_action("$!v", &variables).unwrap(),
+            super::Action::Run {
+                spec: super::CommandSpec {
+                    program: "echo".to_string(),
+                    args: vec!["a".to_string(), "b".to_string()],
+                }
+            }
+        );
+    }
+
+    /// A scene switch may still take its scene name from a value.
+    #[test]
+    fn resolve_action_switches_to_a_scene_named_by_a_value() {
+        let variables = hostile_variables("Main");
+        assert_eq!(
+            super::resolve_action("@$v", &variables).unwrap(),
+            super::Action::SwitchScene {
+                scene: "Main".to_string()
+            }
+        );
+    }
+
+    /// `text_exec`/`image_exec`/`launch` params get the same treatment.
+    #[test]
+    fn scene_commands_keep_values_literal() {
+        let scenes = json!({
+            "main": { "setup": {
+                "1b01": { "type": "text_exec", "params": "echo $v" },
+                "1b02": { "type": "launch", "params": "echo $v | cat" },
+                "1b03": { "type": "image_exec", "params": "echo $!v" }
+            } }
+        });
+        let variables = hostile_variables("a; id");
+        let operations = super::scene_operations_with("main", &scenes, &variables).unwrap();
+        let commands: Vec<&super::CommandSpec> = operations
+            .iter()
+            .map(|op| match op {
+                super::SceneOp::TextExec { command, .. }
+                | super::SceneOp::ImageExec { command, .. }
+                | super::SceneOp::Launch { command, .. } => command,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(commands[0].args, ["a; id"]);
+        assert_eq!(
+            commands[1].args,
+            ["-c", "echo \"${1}\" | cat", "dak", "a; id"]
+        );
+        assert_eq!(commands[2].args, ["-c", "echo a; id"]);
+    }
+
+    /// A `$(command)` assignment's command keeps values literal too.
+    #[test]
+    fn command_assignment_keeps_values_literal() {
+        let variables = hostile_variables("x; id");
+        let (_, spec, _) = super::prepare_command_assignment(
+            &super::AssignTarget::Variable("v".to_string()),
+            "echo $v",
+            &variables,
+        )
+        .unwrap();
+        assert_eq!(spec.program, "echo");
+        assert_eq!(spec.args, ["x; id"]);
     }
 
     /// A variable store for scene/param tests: `dir` is a string, `period` an int.
@@ -6426,5 +7545,22 @@ mod tests {
         let malformed = json!({ "main": { "actions": { "timer": { "${period": "@Main" } } } });
         let error = super::timer_for_scene_with("main", &malformed, &variables).unwrap_err();
         assert!(error.contains("actions.timer"), "{error}");
+    }
+
+    /// A timer period of 0 from a variable (say, set from a program's output) is raised
+    /// to the minimum, so a timer re-entering its own scene cannot spin.
+    #[test]
+    fn timer_seconds_from_a_variable_have_a_minimum() {
+        let mut defs = std::collections::BTreeMap::new();
+        defs.insert(
+            "period".to_string(),
+            crate::variables::VarDef::int(0, 10, 0),
+        );
+        let zero = crate::variables::Variables::new(defs, &crate::press::Defaults::default());
+        let scenes = json!({ "main": { "actions": { "timer": { "$period": "@" } } } });
+        let (seconds, _) = super::timer_for_scene_with("main", &scenes, &zero)
+            .unwrap()
+            .unwrap();
+        assert_eq!(seconds, crate::limits::MIN_TIMER_SECONDS);
     }
 }

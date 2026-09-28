@@ -16,7 +16,7 @@ partly for this reason.
 
 ## Project overview
 
-DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.14.1 (declared as `0.14.1` in `Cargo.toml`, also printed on startup).
+DAK (**D**ynamic **A**jazz **K**eyboard) is a Rust tool for controlling an **Ajazz AKP03E / AKP03R** USB macro keypad (HID device, vendor `0x0300`, product `0x3002`). It connects to the device, paints button images, controls brightness, and reacts to key/encoder input. The package, library and binary are all named `dak`. Version: v0.15.0 (declared as `0.15.0` in `Cargo.toml`, also printed on startup).
 
 ## Stack
 
@@ -53,7 +53,11 @@ under other platforms.
   `set_text_settings` together with `defaults.markup`
 - `src/variables.rs` — declared variables and their validation, `$` reference
   expansion/substitution, and the runtime variable/default state
-  (`VariableStore`/`Variables`) shared by every device
+  (`VariableStore`/`Variables`) shared by every device. `expand_pieces` keeps config
+  text, `$name` values (`Piece::Value`) and `$!name` values (`Piece::Raw`) apart, so
+  `actions::build_command_pieces` can treat a `$name` value as one literal argument (or,
+  in an `sh -c` script, a positional parameter `"${N}"`) and never let it add words or
+  shell syntax - values often come from other programs' output
 - `src/baseplane.rs` — device addressing: the `Reference`/`Kind` model (device N,
   button B, encoder E) that scene configs and control references use
 - `src/reconnect.rs` — surviving the keypad disappearing (host suspend, unplug,
@@ -71,6 +75,11 @@ under other platforms.
 - `src/color.rs` — button colours: parsing the `background`/`text_color` config
   values (hex or CSS colour names) and alpha-compositing transparent images onto
   an opaque background
+- `src/imaging.rs` — bounded image decoding (`decode`/`decode_as`/`open`: at most
+  `MAX_DIMENSION` px a side and `MAX_ALLOC` bytes, then `shrink` to `WORKING_SIZE`)
+  for `image` files, `image_exec` output and font colour bitmaps; only the formats in
+  `FORMATS` are compiled in (`image` has `default-features = false`), checked against
+  `dak-config.5` by `tests/man_pages.rs`
 - `src/markup.rs` — button text markup: parses a `text`/`text_value`/`text_exec`
   entry's text into lines of styled spans (`Line`/`Span`/`Style`/`Align`) per its
   `markup` (`none`, or the default `tmux`: `#[bold,fg=red,align=left]` tags, `##`
@@ -113,12 +122,23 @@ under other platforms.
   `StopSignal` (from a `StopSource`) instead of calling `tokio::signal::ctrl_c()`
   themselves, so a signal arriving mid-event is never lost. `main` is a plain
   function that loads the config before building the tokio runtime by hand
+- `src/limits.rs` — brakes on outside input: `EventLimiter` (per-control events per
+  second, used by `Session::on_report`; a release follows its press's fate),
+  `CommandSlots`/`command_slots()` (concurrent action commands and `$(...)`
+  assignments), `MIN_TIMER_SECONDS`, `Throttle` for repeated warnings. Exec children
+  run in their own process group (`GroupKill` in `actions.rs`), `launch` children are
+  reaped by a waiter thread, and `reconnect::Flapping` slows down a device that keeps
+  disconnecting
 - `src/lock.rs` — one dak per keypad: an `flock(2)` lock file per device
   (`DeviceKey::file_name`, `dak-<vid>-<pid>-<serial>.lock`) in `lock_dir()`
   (`$DAK_LOCK_DIR`, else `/run/lock`, else `/tmp`), holding a `Holder` record (pid,
   uid, user, since). `try_lock`/`acquire` with `Conflict::{Refuse, Wait, Replace}`
-  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s). Opened
-  `O_NOFOLLOW|O_NONBLOCK`, without `O_CREAT` first (protected_regular), created 0666
+  (`--wait`, `--replace`: SIGTERM to own-uid holder or as root, 10 s, only after
+  `holder_is_genuine` confirmed the recorded pid is a live dak of the recorded uid - the
+  0666 record is never trusted; pid <= 1 is rejected). Opened
+  `O_NOFOLLOW|O_NONBLOCK`, must be a singly linked regular file (hard links refused),
+  without `O_CREAT` first (protected_regular), created 0666; identities that are not
+  plain `[A-Za-z0-9._-]{1,96}` get a stable FNV-1a hash suffix so names never collide
   - see `NOTES.md` section 10. `main.rs` locks each device before connecting and keeps
   the lock through reconnects; `--map` locks too. `tests/device_lock.rs` re-runs its
   own test binary as a second lock-holding process for the `--replace` tests
@@ -131,7 +151,10 @@ under other platforms.
   `<N>` priority prefixes), `syslog` (libc `syslog(3)`), `file` (appended, reopenable).
   `check_logging` validates the top-level `logging` section into `LoggingConfig`;
   `LogSettings::resolve` merges it with `CliLogging` (`--log-level`, `--log-file`,
-  `--syslog`, `-d`) and resolves `auto` from `Environment` (`JOURNAL_STREAM` matching
+  `--syslog`, `-d`) and resolves `auto` from `Environment`. Every line goes through
+  `escape_controls` (C0/C1/DEL/bidi made visible); outside text put into a message
+  (device strings, lock records, stderr, command lines) also goes through `escape_text`,
+  which escapes newlines too (`JOURNAL_STREAM` matching
   fd 2 -> journal, detached -> syslog, else console). `LOGGING_KEYS`, `LOG_OUTPUTS`,
   `LOG_LEVELS`, `SYSLOG_FACILITIES`, `TIMESTAMP_VALUES` are vocabulary constants
   `tests/man_pages.rs` checks against `dak-config.5`; `tests/logging.rs` runs the binary
@@ -209,14 +232,19 @@ under other platforms.
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
 - `NOTES.md` — agent-to-agent knowledge base for cross-compiling/packaging/testing `dak` for FreeBSD from Linux (sysroot setup, building a `.pkg`, jail-based dependency testing). Read it before touching CI or cross-compilation; keep it updated as you learn more, don't let it go stale.
 - `.woodpecker/release.yaml` — tag-triggered CI pipeline (`event: tag`, `ref: refs/tags/v*`) that builds a Debian trixie `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD `.pkg`, then publishes them to a GitHub Release; `.woodpecker/check-target-freshness.yaml` — monthly cron job flagging when the OS versions pinned in `release.yaml` go stale (see `scripts/check-target-freshness.sh`)
-- `scripts/` — helpers used only by `.woodpecker/*.yaml`: `build-freebsd-pkg.py` (builds the FreeBSD `.pkg`, see `NOTES.md` section 2), `extract-release-notes.sh` (pulls one tag's user-facing section out of `RELEASE_NOTES.md` for the GitHub release body), `check-target-freshness.sh` (the actual staleness checks referenced above)
+- `scripts/` — helpers used only by `.woodpecker/*.yaml`: `verify-freebsd-dist.sh`
+  (base.txz against MANIFEST, cross-checked between download.freebsd.org and mirrors),
+  `fetch-verified.sh` (a download against its published `.sha256`), `check-release-tag.sh`
+  (tag must be `vX.Y.Z`; the three are tested offline by `tests/ci_scripts.rs` with a fake
+  `curl`), `build-freebsd-pkg.py` (builds the FreeBSD `.pkg`, see `NOTES.md` section 2), `extract-release-notes.sh` (pulls one tag's user-facing section out of `RELEASE_NOTES.md` for the GitHub release body), `check-target-freshness.sh` (the actual staleness checks referenced above)
 
 ## Device notes
 
 - `QUERY` in `main.rs` (vendor 0x0300, product 0x3002) filters the device list
 - Images are 60x60 JPEG; the `image` crate computes them on the fly
 - Button text: at most 3 lines x 6 display columns, scaled to fit; embedding the fonts
-  and colour-bitmap decoding grew the release binary by about 3.7 MB (5.6 MB to 9.4 MB stripped)
+  and colour-bitmap decoding grew the release binary by about 3.7 MB (5.6 MB to 9.4 MB stripped);
+  trimming `image` to the documented formats in v0.15.0 brought it back to 7.8 MB
 - The device supports distinct press/release key and encoder states
 
 ## Status / known gaps
@@ -255,6 +283,10 @@ Work in progress. Current known issues:
   buttons and encoders, encoder turns, scene switches, SIGHUP reload, and unplug/
   re-plug with repaint. Config actions should use bare program names (`expr`,
   `date`), not `/usr/bin/...`: FreeBSD keeps several of them in `/bin`
+- v0.15.0's security hardening is covered by tests but not yet re-run against
+  hardware. Not yet verified on real systems at all: the FreeBSD branch of
+  `lock::process_identity` (cross-compiled only), the FreeBSD devd permission rule and
+  the Linux `uaccess`-only udev rule in `INSTALL.md`
 - A keypad that is enumerable but cannot be opened (e.g. a container that sees
   the host's sysfs but has no `/dev/hidraw*` node) makes the hardware tests skip,
   but `dak --map` still lists it; `tests/exit_status.rs`'s `--map` test accepts

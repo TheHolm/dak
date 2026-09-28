@@ -1,5 +1,5 @@
 .\" Man page for the dak configuration file. See man(7) and groff_man(7).
-.TH DAK-CONFIG 5 "2026-09-27" "dak 0.14.1" "File Formats"
+.TH DAK-CONFIG 5 "2026-09-28" "dak 0.15.0" "File Formats"
 .SH NAME
 dak\-config \- configuration file format for
 .BR dak (1)
@@ -370,7 +370,9 @@ picks face
 (from 0) of a
 .B .ttc
 font collection. Files are loaded once at startup; a missing, unreadable,
-larger than 256 MiB or invalid font file is a config error, and fonts cannot be
+larger than 256 MiB or invalid font file (including one whose line height,
+.B M
+width or units per em make no sense) is a config error, and fonts cannot be
 changed at runtime.
 .PP
 Each character is looked up in the configured font of its style, then the
@@ -702,11 +704,18 @@ and
 .TP
 .B image
 .IB params " is a path"
-to an image file to load onto the button.
+to an image file to load onto the button. It must be a regular file (a device
+or FIFO is refused), read within 5 seconds. The formats read are PNG, JPEG, GIF,
+BMP, ICO, WebP and PNM (the netpbm formats). An image may be at most 4096
+pixels wide and high; larger ones are refused as an error, and big ones are
+scaled down before they are drawn.
 .TP
 .B image_exec
 .I params
-is a command run asynchronously whose stdout must be a valid image file. If it
+is a command run asynchronously whose stdout must be a valid image file, in
+one of the formats and within the size limit of
+.BR image .
+If it
 does not finish within 5 seconds, or the button is changed in the meantime,
 the process is killed, an error is logged, and the button shows the text
 .B Error
@@ -852,7 +861,31 @@ value is an action:
 "timer": { "5": "@Main" }
 .RE
 .fi
-The action runs once that many seconds after the scene is entered.
+The action runs once that many seconds after the scene is entered. The
+seconds must be at least 1; a variable that holds less is treated as 1.
+.SS "Limits"
+Keypad input and program output come from outside dak, so its work is
+bounded:
+.IP \(bu 2
+At most 50 input events (presses, or encoder notches) per control per second
+are acted on; the rest are dropped with a warning, a dropped press together
+with its release.
+.IP \(bu 2
+At most 32 action commands and
+.B $(command)
+assignments run at the same time, across all keypads; an action that would
+start another is skipped with a warning.
+.IP \(bu 2
+.BR image_exec ,
+.B text_exec
+and
+.B $(command)
+programs run in their own process group, which is killed as a whole when the
+program times out, fails or is no longer needed, so the programs it started do
+not outlive it. A program that succeeded may leave background jobs running.
+.IP \(bu 2
+A keypad that disconnects more than 5 times within a minute is reconnected
+only after a pause, from 1 second doubling up to 1 minute.
 .SS "Action values"
 An action value is one of:
 .IP \(bu 2
@@ -891,7 +924,44 @@ through
 when it contains one of
 .B "| & ; < > ` ( )"
 or a newline. Pipelines and redirection therefore work when written, while a
-plain command never grows a shell.
+plain command never grows a shell. Only the config text decides this, never the
+value of a variable.
+.SS "Values in commands"
+A variable may hold any text, including shell syntax, and that text often
+comes from other programs. Inside a command, a
+.B $name
+value is therefore always data:
+.IP \(bu 2
+In a plain command it is exactly one argument, or part of one, as written: it
+is not split at spaces, its quotes and backslashes are kept, and a leading
+.B ~
+in it is not expanded. An empty value is an empty argument.
+.IP \(bu 2
+In a command that runs through
+.BR "sh \-c" ,
+each value is passed to the shell as a separate argument and the script only
+expands it, as
+.BR \(dq${1}\(dq ,
+.BR \(dq${2}\(dq ,
+and so on, quoted for where the reference appears. The shell never parses the
+value itself. The script therefore sees these values as its positional
+parameters.
+.IP \(bu 2
+A value never changes what kind of action runs:
+.B @$name
+switches to the scene the value names, and a command stays a command whatever
+its values contain.
+.PP
+.B $!name
+(and
+.BR $!scope.name )
+pastes the value in as if it were config text: it is split into words, may add
+shell syntax, and as a whole action may be
+.B @scene
+or an assignment. This is how
+.B $name
+behaved before version 0.15.0. Use it only for values you control, never for
+text another program produced.
 .PP
 A leading
 .B ~
@@ -964,16 +1034,22 @@ devices apart. A definition whose serial is
 .B unknown
 falls back to comparing
 .BR device_id .
+When more than one attached device matches a definition, none of them is used
+and a warning is printed: serial numbers are not secret, so a second device
+reporting the same one may be impersonating the keypad. A lost keypad is only
+reconnected to a device with the same serial it had.
 .TP
 .B key_count ", " encoder_count
-The number of buttons and encoders the device has.
+The number of buttons and encoders the device has, at most 254 each.
 .TP
 .B screens
 The number of button LCDs.
 .TP
 .B protocol_version
 Optional. Selects which connection protocol variant to use, overriding the
-value recognized from the device id. Omit it or set it to JSON
+value recognized from the device id: 1, 2 or 3 (a device without any serial
+number is switched to the oldest protocol automatically). Omit it or set it to
+JSON
 .B null
 to use the default.
 .TP
@@ -1097,7 +1173,9 @@ is expanded. Defaults to
 else
 .IR ~/.local/state/dak/dak.log .
 Missing directories are created (mode 0700) and the file is created with mode
-0600. A file that cannot be opened stops the program at startup. It is
+0600. A symlink, a file with more than one hard link, a file owned by another
+user or anything that is not a regular file is refused. A file that cannot be
+opened stops the program at startup. It is
 reopened on
 .BR SIGHUP ,
 so it can be rotated. Setting it without the

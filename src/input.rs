@@ -27,9 +27,26 @@ pub trait InputSource: Send + Sync {
 }
 
 impl InputSource for DeviceStateReader {
+    /// Reads through the reader mirajazz keeps, not its `raw_read_data`: that one
+    /// discards the length the kernel returned, so a short report came back padded with
+    /// zeros and decoded as "code 0 released". See [`read_trimmed`].
     async fn read_report(&self) -> Result<Vec<u8>, MirajazzError> {
-        self.raw_read_data(REPORT_LENGTH).await
+        let mut reader = self.reader.lock().await;
+        read_trimmed(&mut *reader, REPORT_LENGTH).await
     }
+}
+
+/// Reads one report of at most `length` bytes from `reader` and returns only the bytes
+/// actually read, so a report shorter than [`decode_report`] needs is seen as noise
+/// rather than as zeros.
+pub async fn read_trimmed<R: async_hid::AsyncHidRead + ?Sized>(
+    reader: &mut R,
+    length: usize,
+) -> Result<Vec<u8>, MirajazzError> {
+    let mut buf = vec![0u8; length];
+    let read = reader.read_input_report(&mut buf).await?;
+    buf.truncate(read.min(length));
+    Ok(buf)
 }
 
 impl<T: InputSource> InputSource for std::sync::Arc<T> {
@@ -113,6 +130,62 @@ impl InputSource for ScriptedInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A HID reader returning one fixed report, claiming `claimed` bytes were read.
+    struct FixedReader {
+        /// The report bytes copied into the buffer.
+        data: Vec<u8>,
+        /// The length the read reports.
+        claimed: usize,
+    }
+
+    impl async_hid::AsyncHidRead for FixedReader {
+        fn read_input_report<'a>(
+            &'a mut self,
+            buf: &'a mut [u8],
+        ) -> impl std::future::Future<Output = async_hid::HidResult<usize>> + Send + 'a {
+            let copied = self.data.len().min(buf.len());
+            buf[..copied].copy_from_slice(&self.data[..copied]);
+            let claimed = self.claimed;
+            async move { Ok(claimed) }
+        }
+    }
+
+    /// Only the bytes actually read are returned: a short report (here: the ACK prefix
+    /// and nothing else) is noise, not "code 0 released"; an empty one too; a full one
+    /// decodes; a reader claiming more than the buffer is clamped.
+    #[tokio::test]
+    async fn short_reports_are_not_padded() {
+        let mut short = FixedReader {
+            data: ACK_PREFIX.to_vec(),
+            claimed: 3,
+        };
+        let report = read_trimmed(&mut short, REPORT_LENGTH).await.unwrap();
+        assert_eq!(report.len(), 3);
+        assert_eq!(decode_report(&report), None);
+
+        let mut empty = FixedReader {
+            data: Vec::new(),
+            claimed: 0,
+        };
+        assert!(read_trimmed(&mut empty, REPORT_LENGTH)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let mut full = FixedReader {
+            data: encode_report(7, 1),
+            claimed: REPORT_LENGTH,
+        };
+        let report = read_trimmed(&mut full, REPORT_LENGTH).await.unwrap();
+        assert_eq!(decode_report(&report), Some((7, 1)));
+
+        let mut liar = FixedReader {
+            data: encode_report(7, 1),
+            claimed: usize::MAX,
+        };
+        assert_eq!(read_trimmed(&mut liar, 16).await.unwrap().len(), 16);
+    }
 
     /// A report carries its code and state at bytes 9 and 10 behind the `ACK` prefix;
     /// anything else, or a truncated report, is noise.

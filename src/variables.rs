@@ -490,34 +490,87 @@ fn parse_name(chars: &[char], index: &mut usize) -> Option<String> {
 /// replacement text.
 ///
 /// Reference syntax is `$name` (the variables scope) or `$scope.name`; names are greedy
-/// over letters/digits/underscores. Backslash is the escape character: `\$` produces a
+/// over letters/digits/underscores. `$!name`/`$!scope.name` is the same reference marked
+/// raw (it only matters to commands, see [`Piece::Raw`]). Backslash is the escape character: `\$` produces a
 /// literal `$` and `\\` a literal backslash. A backslash immediately *after* a reference
 /// terminates its name and escapes the next character (`$name\kun` is `<value>kun`);
 /// every other backslash is passed through untouched so the downstream command tokenizer
 /// still sees it. A `$` not followed by a variable name, an unknown scope, or a reference
 /// `resolve` rejects is an error describing the first problem found.
-pub fn expand_with<F>(text: &str, mut resolve: F) -> Result<String, String>
+pub fn expand_with<F>(text: &str, resolve: F) -> Result<String, String>
+where
+    F: FnMut(&VarRef) -> Result<String, String>,
+{
+    Ok(expand_pieces_with(text, resolve)?
+        .iter()
+        .map(Piece::text)
+        .collect())
+}
+
+/// One part of an expanded text, as produced by [`expand_pieces_with`]: config text as
+/// written, or the value of a reference.
+///
+/// Commands keep the two apart so a value can never change how a command line is split
+/// into words or whether it runs through a shell (see `actions::build_command_pieces`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Piece {
+    /// Config text, with `\$`/`\\` escapes already resolved.
+    Text(String),
+    /// The value of a `$name` reference: always literal data, one argument at most.
+    Value(String),
+    /// The value of a `$!name` reference: pasted in as if it were config text, so it may
+    /// add arguments or shell syntax (the behaviour of `$name` before v0.15.0).
+    Raw(String),
+}
+
+impl Piece {
+    /// The piece's text, whatever its kind.
+    pub fn text(&self) -> &str {
+        match self {
+            Piece::Text(text) | Piece::Value(text) | Piece::Raw(text) => text,
+        }
+    }
+}
+
+/// Appends `c` to the trailing [`Piece::Text`] of `pieces`, starting one when needed.
+fn push_text(pieces: &mut Vec<Piece>, c: char) {
+    match pieces.last_mut() {
+        Some(Piece::Text(text)) => text.push(c),
+        _ => pieces.push(Piece::Text(c.to_string())),
+    }
+}
+
+/// [`expand_with`], but keeping config text and reference values apart as [`Piece`]s.
+///
+/// `$name` gives a [`Piece::Value`], `$!name` (and `$!scope.name`) a [`Piece::Raw`];
+/// consecutive config text is merged into one [`Piece::Text`]. Syntax and errors are the
+/// same as [`expand_with`]'s.
+pub fn expand_pieces_with<F>(text: &str, mut resolve: F) -> Result<Vec<Piece>, String>
 where
     F: FnMut(&VarRef) -> Result<String, String>,
 {
     let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
+    let mut out: Vec<Piece> = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         let c = chars[index];
         if c == '\\' {
             match chars.get(index + 1) {
                 Some(next @ ('$' | '\\')) => {
-                    out.push(*next);
+                    push_text(&mut out, *next);
                     index += 2;
                 }
                 _ => {
-                    out.push('\\');
+                    push_text(&mut out, '\\');
                     index += 1;
                 }
             }
         } else if c == '$' {
             index += 1;
+            let raw = chars.get(index) == Some(&'!');
+            if raw {
+                index += 1;
+            }
             let Some(first) = parse_name(&chars, &mut index) else {
                 return Err(format!(
                     "\"$\" in \"{text}\" must be followed by a variable name"
@@ -543,20 +596,25 @@ where
                     name: first,
                 }
             };
-            out.push_str(&resolve(&reference)?);
+            let value = resolve(&reference)?;
+            out.push(if raw {
+                Piece::Raw(value)
+            } else {
+                Piece::Value(value)
+            });
             // A backslash directly after a reference ends its name: consume it and emit
             // the escaped character, so it cannot leak into the downstream tokenizer.
             if chars.get(index) == Some(&'\\') {
                 if let Some(next) = chars.get(index + 1) {
-                    out.push(*next);
+                    push_text(&mut out, *next);
                     index += 2;
                 } else {
-                    out.push('\\');
+                    push_text(&mut out, '\\');
                     index += 1;
                 }
             }
         } else {
-            out.push(c);
+            push_text(&mut out, c);
             index += 1;
         }
     }
@@ -710,6 +768,12 @@ impl Variables {
     /// Expands every `$` reference in `text` from the current state.
     pub fn expand(&self, text: &str) -> Result<String, String> {
         expand_with(text, |reference| self.read(reference))
+    }
+
+    /// Expands every `$` reference in `text` from the current state, keeping config text
+    /// and values apart (see [`expand_pieces_with`]).
+    pub fn expand_pieces(&self, text: &str) -> Result<Vec<Piece>, String> {
+        expand_pieces_with(text, |reference| self.read(reference))
     }
 
     /// The current button/screen brightness (0-100).
@@ -1145,6 +1209,54 @@ mod tests {
     fn expand_keeps_a_trailing_backslash_after_a_reference() {
         let variables = test_variables();
         assert_eq!(variables.expand(r"$name\").unwrap(), r"Bob\");
+    }
+
+    /// `expand_pieces` keeps config text, `$name` values and `$!name` values apart and
+    /// merges consecutive config text.
+    #[test]
+    fn expand_pieces_separates_text_values_and_raw_values() {
+        let variables = test_variables();
+        assert_eq!(
+            variables
+                .expand_pieces(r"a \$b $name-$!count $!var.name\x")
+                .unwrap(),
+            vec![
+                Piece::Text("a $b ".to_string()),
+                Piece::Value("Bob".to_string()),
+                Piece::Text("-".to_string()),
+                Piece::Raw("7".to_string()),
+                Piece::Text(" ".to_string()),
+                Piece::Raw("Bob".to_string()),
+                Piece::Text("x".to_string()),
+            ]
+        );
+        // `$!` expands like `$` when the pieces are joined back into text.
+        assert_eq!(variables.expand("$!name $name").unwrap(), "Bob Bob");
+    }
+
+    /// `$!` needs a name after it, and is listed by `references_in` like `$`.
+    #[test]
+    fn raw_references_are_checked_like_plain_ones() {
+        let variables = test_variables();
+        assert!(variables
+            .expand("$!")
+            .unwrap_err()
+            .contains("variable name"));
+        assert!(variables.expand("$! x").is_err());
+        assert!(variables.expand("$!missing").is_err());
+        assert_eq!(
+            references_in("$!x $!defaults.markup").unwrap(),
+            vec![
+                VarRef {
+                    scope: Scope::Var,
+                    name: "x".to_string()
+                },
+                VarRef {
+                    scope: Scope::Defaults,
+                    name: "markup".to_string()
+                },
+            ]
+        );
     }
 
     /// `parse_lone_reference` accepts exactly one whole reference (bare or scoped) and

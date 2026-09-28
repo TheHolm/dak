@@ -5,6 +5,196 @@ summary (what also appears in the tagged merge commit's own description)
 and a **Details** section with the full low-level technical narrative.
 See `AGENTS.md`'s conventions section for how this file is maintained.
 
+## v0.15.0 — Security hardening
+
+### User-facing changes
+- **Variable values can no longer inject commands.** A `$name` value (often
+  the output of another program, such as a track title stored with
+  `$title := $(playerctl metadata title)`) is now always data inside a
+  command. In a plain command it is exactly one argument: never split at
+  spaces, never tilde-expanded, and it never makes the command run through a
+  shell. In a command that uses a shell, the value is handed to `sh` as a
+  positional parameter the script only expands. A value also never changes
+  what kind of action runs.
+- **`$!name` restores the old behaviour for trusted values.** It pastes the
+  value in as if it were config text, so it may add arguments or shell
+  syntax, and as a whole action (`"$!v"`) may be `@scene` or an assignment.
+  Configs that relied on a variable splitting into several arguments or
+  carrying shell syntax need `$!` now. Use it only for values you control.
+- **`--replace` checks before it signals.** Lock files can be written by
+  every user, so dak now only sends `SIGTERM` to a recorded holder that
+  really is a dak of the recorded user, and never to pid 1 or below. Lock
+  files that are symlinks, hard links or not regular files are refused.
+  Serials that differ only in unusual characters no longer share a lock.
+- **Configs in other people's directories are ignored.** Without
+  `--config`, a `config.json` in the current or the binary's directory that
+  is not yours, or that others can write to (it, or its directory), is
+  skipped with a warning. One in `~/.config/dak` or given with `--config` is
+  loaded, with a warning.
+- **Stricter log files.** A log file that is a symlink, has several hard
+  links, belongs to someone else or is not a regular file is refused.
+- **`image`/`text` entries only read regular files,** within 5 seconds. A
+  device such as `/dev/zero`, or a FIFO, now shows the error label instead
+  of being read (a FIFO used to freeze the keypad).
+- **Image and text limits.** Images may be at most 4096 pixels wide and
+  high, and only PNG, JPEG, GIF, BMP, ICO, WebP and PNM are read (EXR, TIFF,
+  AVIF, DDS, HDR, QOI, TGA and Farbfeld are gone). Button text from programs
+  and files is cut to what a button can show before it is processed, and at
+  most three markup warnings are logged per drawing. The release binary is
+  1.6 MB smaller.
+- **Rate limits.**
+  - At most 50 input events per control per second are acted on.
+  - At most 32 action commands and `$(command)` assignments run at once;
+    further ones are skipped with a warning.
+  - Scene timers must be at least 1 second (a variable holding less counts
+    as 1).
+  - A keypad that keeps disconnecting is reconnected only after a growing
+    pause.
+- **No more leftover processes.**
+  - Finished `launch` programs no longer stay behind as zombies.
+  - An `image_exec`/`text_exec`/`$(command)` program that times out, fails
+    or is no longer needed is killed together with everything it started.
+  - A failed program no longer hangs dak when something it started keeps
+    running.
+- **Impersonating keypads are not guessed between.** When more than one
+  attached device matches a definition, none is used and a warning says so.
+  A lost keypad is only reconnected to a device with the serial it had.
+- **Tighter device permissions in `INSTALL.md`.**
+  - FreeBSD: a dedicated `dak` group and a devd rule that matches only the
+    keypad, replacing the old rule that gave the `operator` group every HID
+    device (keyboards included).
+  - Linux: `uaccess` only, without the raw USB device node or `plugdev`.
+- **Nothing from outside can drive your terminal or forge log lines.**
+  Control characters (escape sequences, `\r`, bidi overrides) in anything
+  dak logs or prints are shown as `\u{..}`, and device names and serials,
+  lock file records, program error output and variable values in messages
+  also have their newlines escaped.
+- **Short input reports are ignored.** A truncated report from the keypad no
+  longer reads as "button code 0 released", and code 0 never counts as a
+  knob push.
+- **Device definitions the device library cannot handle are config
+  errors:** `protocol_version` outside 1-3 (0 used to crash dak) and more
+  than 254 keys or encoders. `dak --map` no longer offers version 0.
+- **Programs dak starts no longer see `NOTIFY_SOCKET`**, so they cannot
+  report to systemd as dak. `image_exec`/`text_exec`/`$(command)` programs
+  also lose `JOURNAL_STREAM`.
+- **Fonts with nonsensical metrics are refused** (no line height, an `M`
+  without width), and text scaling is bounded, so a broken font can no
+  longer make drawing blow up.
+- **Release downloads are verified.** The FreeBSD `base.txz` is checked
+  against the release `MANIFEST`, confirmed by independent mirrors, and
+  `rustup-init` against its published checksum. Only `vX.Y.Z` tags are
+  released, `cargo audit` gates the release, and each release carries a
+  `SHA256SUMS` file.
+
+### Details
+- **Command building (`src/variables.rs`, `src/actions.rs`).**
+  - `expand_pieces`/`Variables::expand_pieces` return `Piece::Text`,
+    `Piece::Value` (`$name`) and `Piece::Raw` (`$!name`).
+  - `build_command_pieces` tokenises units: config characters, with raw
+    values flattened into them, and whole values.
+  - `units_need_shell` looks only at config characters.
+  - `shell_script` emits `"${N}"`, `${N}` or `'"${N}"'` depending on the
+    quoting context, and doubles a config backslash in front of a value.
+  - `resolve_action` classifies the action by its config text and returns
+    the new `Action::Run { spec }`. `merge_raw_pieces` makes a lone `$!v`
+    re-parse.
+  - Validation treats `$!...` actions as commands. `build_command` and
+    `parse_command_line` keep their plain-text behaviour.
+- **Lock files (`src/lock.rs`).**
+  - `Holder::parse` rejects pid <= 1.
+  - `process_identity` reads `/proc/<pid>/status` and `comm` on Linux, and
+    `sysctl kern.proc.pid` (`ki_uid`, `ki_comm`) on FreeBSD. The FreeBSD
+    path is cross-compiled only.
+  - `holder_is_genuine` compares the uid and the command name with this
+    process's. A mismatch gives the new `LockError::NotVerified`.
+  - `check_lock_file` requires `st_nlink == 1`.
+  - `DeviceKey::file_name` keeps plain `[A-Za-z0-9._-]{1,96}` identities
+    unchanged (compatible with older versions) and hashes everything else:
+    64 sanitised characters, `~`, then 16 hex digits of FNV-1a.
+- **New `src/imaging.rs`.**
+  - `decode`/`decode_as`/`open` go through `ImageReader` with limits of
+    4096 px a side and 96 MiB of allocation.
+  - `shrink` scales anything larger than 240 px down with `thumbnail`.
+  - `open_regular_file` opens with `O_NONBLOCK` and checks for a regular
+    file.
+  - `image_exec` output is decoded in `spawn_blocking`.
+  - Font BGRA strikes are size-checked in u64.
+  - `image` is built with `default-features = false` and 7 formats (no
+    rayon). Stripped binary: 9.4 MB, now 7.8 MB.
+- **Text.**
+  - `actions::clip_button_text` keeps 3 lines of at most 1024 characters
+    before markup parsing.
+  - `MAX_MARKUP_WARNINGS` is 3; each warning is cut to 200 characters.
+  - `text::MAX_CLUSTER_CHARS` (8) caps the characters drawn per grapheme
+    cluster.
+- **New `src/limits.rs`.**
+  - `EventLimiter` uses per-control one-second windows, and a release
+    follows its press. `Session::on_report` warns through a 10 s throttle.
+  - `CommandSlots`/`command_slots()` is a semaphore of 32, held by
+    `spawn_action_command` and `start_command_assignment`. `BUSY_WARNING`
+    throttles its warning to one per 5 s.
+  - `MIN_TIMER_SECONDS` is enforced both in `check_timer` and in
+    `timer_for_scene_with`.
+- **Processes (`src/actions.rs`).**
+  - `spawn_detached` hands the child to a waiter thread with a 64 KiB stack.
+  - `run_command_with_timeout` uses `process_group(0)`, and `GroupKill`
+    sends `killpg(SIGKILL)` on timeout, error or drop. A successful command
+    disarms it, so its background jobs survive.
+  - `AbortOnDrop` covers the stderr drain, and `STDERR_GRACE` (500 ms)
+    bounds the wait for the excerpt after a failure.
+  - `FILE_READ_TIMEOUT` (5 s) applies to `image`/`text` files.
+- **Reconnect (`src/reconnect.rs`, `src/main.rs`).**
+  - `Flapping` tolerates 5 disconnects per 60 s, then pauses for 1 s,
+    doubling up to 60 s. Its state lives in `run_device` and a stop cancels
+    the pause.
+  - `match_devices`/`ReopenDevice::reopen` use `unique_match`.
+  - `ReopenDevice` carries the held `DeviceKey` and checks it with
+    `same_locked_device` (skipped for path-keyed locks).
+- **Config lookup (`src/actions.rs`).** `config_file_problem`, `ConfigChoice`
+  and `pick_config_path(explicit, dirs, euid)`. The log file
+  (`src/log.rs`) opens with `O_NOFOLLOW|O_NONBLOCK`, and `check_log_file`
+  checks it, on reopen too.
+- **Control characters (`src/log.rs`).** `escape_controls` runs in
+  `Sinks::write` (C0/C1, DEL, bidi embeddings/overrides/isolates/marks,
+  keeping tab and newline). `escape_text` also escapes newline and tab and
+  is used for outside text inside messages: `DeviceKey::describe`,
+  `Holder::describe`, the device summary lines, "Connected to",
+  `reconnected_message`, `CommandSpec::display`, `with_stderr`, markup
+  warning excerpts, colour errors. `map::Console` escapes its output.
+- **Input reports (`src/input.rs`).** `read_trimmed` reads through
+  `DeviceStateReader.reader` and truncates to the length read (mirajazz's
+  `raw_read_data` discards it). `Mapping::control_event` never matches a
+  push code of 0.
+- **Device ranges (`src/actions.rs`).** `check_mapping_ranges` with
+  `PROTOCOL_VERSIONS` (1..=3) and `MAX_CONTROL_COUNT` (254). mirajazz's
+  16-bit image length is unreachable (NOTES.md section 13).
+- **Child environment.** `NOTIFY_SOCKET` is removed for all children
+  (`CHILD_ONLY_DAK_ENV`), `JOURNAL_STREAM` for exec children.
+- **Fonts (`src/text.rs`).** `check_font_metrics` at load, `sane_scale` for
+  the text scale (at most 4x the button size), glyph and fit scales
+  (`MAX_FIT_SCALE` 8), bitmaps at most the button's size, saturating
+  `blend_picture`.
+- **CI (`.woodpecker/release.yaml`, `scripts/`).**
+  `verify-freebsd-dist.sh` (MANIFEST from download.freebsd.org plus
+  ftp.de.freebsd.org and mirror.aarnet.edu.au, all reachable copies
+  identical, at least one mirror), `fetch-verified.sh` (rustup-init against
+  its `.sha256`), `check-release-tag.sh`, `cargo-deb` 3.8.0 and
+  `cargo-audit` 0.22.2 pinned by version, `SHA256SUMS`. No checksum is
+  stored in the repository, and base images stay referenced by tag.
+  Tested offline by `tests/ci_scripts.rs` (fake `curl`); see NOTES.md
+  section 14.
+- **Test fixes found along the way.**
+  - `check_executable_searches_path_for_bare_names` replaced `PATH` while
+    other tests spawned programs. It now prepends.
+  - Two `device_lock` tests now poll when re-taking a lock that was just
+    released.
+- **Coverage.** 95.7% of lines. The new modules are at 99% or above; what
+  is left needs a non-root user (the `--replace` permission path) or a real
+  keypad.
+- **Not yet verified on hardware:** the FreeBSD `process_identity`, the
+  FreeBSD devd permission rule and the new Linux udev rule.
+
 ## v0.14.1 — Bug fixes found while raising test coverage and testing on hardware
 
 ### User-facing changes

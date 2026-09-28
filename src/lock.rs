@@ -18,6 +18,12 @@
 //! *without* `O_CREAT` first (Linux's `fs.protected_regular` refuses `O_CREAT` opens of
 //! another user's file in a sticky directory even when it exists) and are made
 //! world-writable (`0666`) when created, so the next user can record themselves in it.
+//! Hard links are refused too (a singly linked file only, see `check_lock_file`), since
+//! the holder record is written into the file.
+//!
+//! Because every user can write every lock file, the holder record is only ever a
+//! hint for messages: before `--replace` signals the recorded pid, [`holder_is_genuine`]
+//! checks that process really is a `dak` of the recorded user.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -103,21 +109,28 @@ impl DeviceKey {
         }
     }
 
-    /// `dak-<vid>-<pid>-<identity>.lock`, with every character outside
-    /// `[A-Za-z0-9._-]` replaced by `_` and the identity cut to 96 characters.
+    /// `dak-<vid>-<pid>-<identity>.lock`.
+    ///
+    /// An identity of at most 96 characters from `[A-Za-z0-9._-]` is used as is.
+    /// Anything else (a serial with other characters, a path, an over-long serial) is
+    /// shown with every other character replaced by `_`, cut to 64 characters, and
+    /// followed by `~` and a 64-bit hash of the exact identity, so two different
+    /// identities never share a lock file just because they look alike after
+    /// sanitising (`A/B` and `A_B`). `~` cannot appear in a plain identity, so a
+    /// hashed name never equals a plain one either.
     pub fn file_name(&self) -> String {
-        let identity: String = self
-            .identity
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .take(96)
-            .collect();
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        let identity = if self.identity.len() <= 96 && self.identity.chars().all(plain) {
+            self.identity.clone()
+        } else {
+            let shown: String = self
+                .identity
+                .chars()
+                .map(|c| if plain(c) { c } else { '_' })
+                .take(64)
+                .collect();
+            format!("{shown}~{:016x}", fnv1a(self.identity.as_bytes()))
+        };
         format!(
             "dak-{:04x}-{:04x}-{identity}.lock",
             self.vendor_id, self.product_id
@@ -126,14 +139,23 @@ impl DeviceKey {
 
     /// A short human name for messages, e.g. `0300:3002 s/n ABCD1234EF56`.
     pub fn describe(&self) -> String {
-        match self.identity.strip_prefix("path-") {
+        let identity = crate::log::escape_text(&self.identity);
+        match identity.strip_prefix("path-") {
             Some(path) => format!("{:04x}:{:04x} at {path}", self.vendor_id, self.product_id),
             None => format!(
-                "{:04x}:{:04x} s/n {}",
-                self.vendor_id, self.product_id, self.identity
+                "{:04x}:{:04x} s/n {identity}",
+                self.vendor_id, self.product_id
             ),
         }
     }
+}
+
+/// The 64-bit FNV-1a hash of `bytes`: stable across versions and platforms, which is all
+/// lock file names need (a device could copy another's serial outright anyway).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Who holds a lock, as recorded in its file by the holder.
@@ -171,7 +193,8 @@ impl Holder {
     }
 
     /// Parses [`Holder::to_text`]; `None` when the text is incomplete (e.g. read while
-    /// the holder was still writing it).
+    /// the holder was still writing it) or names a pid that cannot be a `dak` (`0`, `1`
+    /// or negative: `kill` would signal a process group, init, or every process).
     pub fn parse(text: &str) -> Option<Self> {
         let mut pid = None;
         let mut uid = None;
@@ -186,8 +209,12 @@ impl Holder {
                 _ => {}
             }
         }
+        let pid: i32 = pid?;
+        if pid <= 1 {
+            return None;
+        }
         Some(Self {
-            pid: pid?,
+            pid,
             uid: uid?,
             user: user?,
             since: since?,
@@ -196,9 +223,12 @@ impl Holder {
 
     /// `dak (user alice, pid 1234, since ...)`.
     pub fn describe(&self) -> String {
+        // The record comes from a file every user can write.
         format!(
             "dak (user {}, pid {}, since {})",
-            self.user, self.pid, self.since
+            crate::log::escape_text(&self.user),
+            self.pid,
+            crate::log::escape_text(&self.since)
         )
     }
 }
@@ -250,6 +280,10 @@ pub enum LockError {
     /// `--replace` may not stop this holder: it belongs to another user and we are not
     /// root.
     NotPermitted(Holder),
+    /// `--replace` refused to signal the recorded holder: that process is not a `dak`
+    /// running as the recorded user (the record is forged or stale - lock files can be
+    /// written by every user).
+    NotVerified(Holder),
     /// `--replace` sent `SIGTERM` but the holder did not let go in time.
     Timeout(Option<Holder>),
     /// The wait was ended by a stop signal.
@@ -275,6 +309,12 @@ impl LockError {
             LockError::NotPermitted(h) => format!(
                 "device {device} is in use by {}, which belongs to another user; --replace \
                  only stops your own instances (or any, as root)",
+                h.describe()
+            ),
+            LockError::NotVerified(h) => format!(
+                "device {device} is locked, but its holder record names {}, which is not a \
+                 dak running as that user; not signalling it (the lock file can be written by \
+                 any user)",
                 h.describe()
             ),
             LockError::Timeout(h) => format!(
@@ -339,10 +379,86 @@ fn open_lock_file(path: &Path) -> std::io::Result<(File, bool)> {
             Err(error) => return Err(error),
         }
     };
-    if !file.0.metadata()?.file_type().is_file() {
+    check_lock_file(&file.0.metadata()?)?;
+    Ok(file)
+}
+
+/// Refuses a lock file that is not a plain, singly linked regular file. A hard link
+/// someone planted under the lock file's name would otherwise make `dak` truncate and
+/// overwrite the file it points to (`O_NOFOLLOW` only stops symlinks).
+fn check_lock_file(metadata: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !metadata.file_type().is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
-    Ok(file)
+    if metadata.nlink() != 1 {
+        return Err(std::io::Error::other(format!(
+            "has {} hard links; refusing to use it (someone may have linked it to another \
+             file)",
+            metadata.nlink()
+        )));
+    }
+    Ok(())
+}
+
+/// The effective uid and command name of the running process `pid`, or `None` when
+/// there is no such process (or it cannot be inspected).
+#[cfg(target_os = "linux")]
+pub fn process_identity(pid: i32) -> Option<(u32, String)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    // "Uid:\treal\teffective\tsaved\tfs"
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some((uid, comm.trim_end_matches('\n').to_string()))
+}
+
+/// The effective uid and command name of the running process `pid`, or `None` when
+/// there is no such process (or it cannot be inspected).
+#[cfg(target_os = "freebsd")]
+pub fn process_identity(pid: i32) -> Option<(u32, String)> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: kinfo_proc is plain old data; sysctl fills at most `size` bytes of it.
+    let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::kinfo_proc>();
+    // SAFETY: mib, info and size are valid for the duration of the call.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut info as *mut libc::kinfo_proc as *mut libc::c_void,
+            &mut size,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 || size < std::mem::size_of::<libc::kinfo_proc>() || info.ki_pid != pid {
+        return None;
+    }
+    // SAFETY: ki_comm is a NUL-terminated array inside `info`.
+    let comm = unsafe { std::ffi::CStr::from_ptr(info.ki_comm.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Some((info.ki_uid, comm))
+}
+
+/// Whether the process a holder record names really is a `dak` holder that `--replace`
+/// may signal: it exists, runs as the recorded uid, and runs the same program as this
+/// process (compared by command name, so the test binaries, which re-run themselves as
+/// the other holder, pass too). Lock files are writable by every user, so the record
+/// alone proves nothing.
+pub fn holder_is_genuine(holder: &Holder) -> bool {
+    // SAFETY: getpid cannot fail.
+    let own_pid = unsafe { libc::getpid() };
+    match (process_identity(holder.pid), process_identity(own_pid)) {
+        (Some((uid, name)), Some((_, own_name))) => uid == holder.uid && name == own_name,
+        _ => false,
+    }
 }
 
 /// Reads the holder record from an open lock file.
@@ -433,7 +549,10 @@ pub async fn acquire_with_timeout(
             if !may_replace(own_uid, target.uid) {
                 return Err(LockError::NotPermitted(target));
             }
-            // SAFETY: plain kill(2) of the pid recorded by the lock's live holder.
+            if !holder_is_genuine(&target) {
+                return Err(LockError::NotVerified(target));
+            }
+            // SAFETY: plain kill(2) of a verified holder (a dak of the recorded user).
             if unsafe { libc::kill(target.pid, libc::SIGTERM) } != 0 {
                 let error = os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -478,13 +597,34 @@ mod tests {
         let key = DeviceKey::new(0x0300, 0x3002, Some("ABCD1234EF56"), "x");
         assert_eq!(key.file_name(), "dak-0300-3002-ABCD1234EF56.lock");
         let key = DeviceKey::new(0x0300, 0x3002, Some("../a b/c"), "x");
-        assert_eq!(key.file_name(), "dak-0300-3002-.._a_b_c.lock");
+        let name = key.file_name();
+        assert!(name.starts_with("dak-0300-3002-.._a_b_c~"), "{name}");
+        assert!(!name.contains('/'));
         let long = "A".repeat(300);
         let key = DeviceKey::new(1, 2, Some(&long), "x");
         assert_eq!(
             key.file_name().len(),
-            "dak-0001-0002-".len() + 96 + ".lock".len()
+            "dak-0001-0002-".len() + 64 + 1 + 16 + ".lock".len()
         );
+        let exact = "B".repeat(96);
+        let key = DeviceKey::new(1, 2, Some(&exact), "x");
+        assert_eq!(key.file_name(), format!("dak-0001-0002-{exact}.lock"));
+    }
+
+    /// Identities that look alike once sanitised or cut still get distinct lock files,
+    /// and the names are stable (other dak versions must compute the same ones).
+    #[test]
+    fn file_names_do_not_collide() {
+        let name = |serial: &str| DeviceKey::new(1, 2, Some(serial), "x").file_name();
+        assert_ne!(name("A/B"), name("A_B"));
+        assert_ne!(name("A/B"), name("A B"));
+        assert_ne!(
+            name(&format!("{}1", "C".repeat(100))),
+            name(&format!("{}2", "C".repeat(100)))
+        );
+        assert_eq!(name("A/B"), "dak-0001-0002-A_B~fa76c319a0b010e1.lock");
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     /// A device without a (non-blank) serial is keyed by its OS path instead.
@@ -493,7 +633,9 @@ mod tests {
         for serial in [None, Some(""), Some("  ")] {
             let key = DeviceKey::new(0x0300, 0x3002, serial, "/dev/hidraw3");
             assert_eq!(key.identity, "path-/dev/hidraw3");
-            assert_eq!(key.file_name(), "dak-0300-3002-path-_dev_hidraw3.lock");
+            assert!(key
+                .file_name()
+                .starts_with("dak-0300-3002-path-_dev_hidraw3~"));
             assert_eq!(key.describe(), "0300:3002 at /dev/hidraw3");
         }
         let key = DeviceKey::new(0x0300, 0x3002, Some("S1"), "/dev/hidraw3");
@@ -579,9 +721,77 @@ mod tests {
     /// Unknown lines in a holder record (from a newer dak, say) are ignored.
     #[test]
     fn holder_records_ignore_unknown_lines() {
-        let text = "pid=1\nfuture=yes\nuid=2\nno separator\nuser=u\nsince=s\n";
+        let text = "pid=2\nfuture=yes\nuid=3\nno separator\nuser=u\nsince=s\n";
         let holder = Holder::parse(text).unwrap();
-        assert_eq!((holder.pid, holder.uid), (1, 2));
+        assert_eq!((holder.pid, holder.uid), (2, 3));
+    }
+
+    /// A record naming pid 1 or below is not a record: signalling it would hit init, the
+    /// own process group or every process.
+    #[test]
+    fn holder_records_reject_impossible_pids() {
+        for pid in ["1", "0", "-1", "-1234"] {
+            let text = format!("pid={pid}\nuid=0\nuser=u\nsince=s\n");
+            assert_eq!(Holder::parse(&text), None, "pid {pid}");
+        }
+    }
+
+    /// The not-verified message names the holder and says why it is not signalled.
+    #[test]
+    fn not_verified_message() {
+        let key = DeviceKey::new(0x0300, 0x3002, Some("S1"), "");
+        let holder = Holder {
+            pid: 7,
+            uid: 1,
+            user: "bob".into(),
+            since: "t".into(),
+        };
+        let text = LockError::NotVerified(holder).describe(&key);
+        assert!(
+            text.contains("pid 7") && text.contains("not signalling"),
+            "{text}"
+        );
+    }
+
+    /// A holder record and a serial come from outside (a file anyone can write, a
+    /// device): their control characters and newlines are shown escaped.
+    #[test]
+    fn descriptions_escape_outside_text() {
+        let holder = Holder {
+            pid: 7,
+            uid: 1,
+            user: "bob\u{1b}]52;c;eA==\u{7}".into(),
+            since: "t\nwarning: forged".into(),
+        };
+        let text = holder.describe();
+        assert!(!text.contains('\u{1b}') && !text.contains('\n'), "{text}");
+        assert!(text.contains("\\u{1b}") && text.contains("\\n"), "{text}");
+        let key = DeviceKey::new(1, 2, Some("S\u{9b}1"), "");
+        assert!(key.describe().contains("S\\u{9b}1"), "{}", key.describe());
+    }
+
+    /// Only a singly linked regular file is accepted as a lock file.
+    #[test]
+    fn lock_file_check_refuses_links_and_non_files() {
+        let dir = scratch_dir("check");
+        let file = dir.join("f");
+        std::fs::write(&file, "").unwrap();
+        assert!(check_lock_file(&std::fs::metadata(&file).unwrap()).is_ok());
+        std::fs::hard_link(&file, dir.join("g")).unwrap();
+        let error = check_lock_file(&std::fs::metadata(&file).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("2 hard links"), "{error}");
+        let error = check_lock_file(&std::fs::metadata(&dir).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// This process can be inspected; a pid that does not exist cannot.
+    #[test]
+    fn process_identity_reads_uid_and_name() {
+        let (uid, name) = process_identity(std::process::id() as i32).unwrap();
+        assert_eq!(uid, unsafe { libc::geteuid() });
+        assert!(!name.is_empty());
+        assert_eq!(process_identity(i32::MAX), None);
     }
 
     /// A fresh scratch directory for the acquire tests.

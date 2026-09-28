@@ -13,7 +13,7 @@ Work in progress. Config structure will probably change in the future, but I wil
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
-The current version is **v0.14.1**.
+The current version is **v0.15.0**.
 
 ## Usage
 
@@ -29,6 +29,8 @@ Options:
   -c, --config <CONFIG>   Path to the config file; when omitted, `config.json` is
                           searched for in ~/.config/dak/, then the current
                           directory, then the directory containing the binary
+                          (skipping one there that is not yours or that others
+                          can write to)
   -d, --debug <DEBUG>...  Debug subsystems to enable, comma-separated: device, scene, action, fonts
       --log-level <LEVEL> Log level: error, warning, info or debug
       --log-file <PATH>   Also append log lines (timestamped) to PATH
@@ -234,7 +236,7 @@ Button text is drawn with fonts embedded in the binary: DejaVu Sans Mono in regu
 - `emoji` — the fallback for characters none of the text fonts have (emoji, symbols).
 - `extra` — a last-resort font tried after the emoji fonts, meant for a script the others lack, typically Chinese/Japanese/Korean.
 
-Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
+Paths expand a leading `~` and `$` references (with the variables' initial values). A path ending in `#N` picks face `N` (counting from 0) of a `.ttc` font collection, e.g. `"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#2"`. Fonts are loaded once at startup and cannot be changed at runtime; a missing, unreadable, larger than 256 MiB or invalid font file (including one with nonsensical metrics: no line height, an `M` without width, a units-per-em outside 16-16384) is a config error, so the program refuses to start rather than silently drawing in a font you did not ask for.
 
 Each character is drawn from the first of these fonts that has it:
 
@@ -311,7 +313,8 @@ exactly as it was set, so a name stays a name.
 References are substituted in every action string, in `setup` `params` and in the
 `timer` seconds key, resolved when the value is actually used, so they always see the
 current value. An int renders as its decimal digits; a str is inserted verbatim (no
-quotes added).
+quotes added). In a command a value is always data, never command syntax - see
+[Values in commands](#values-in-commands).
 
 A name is greedy (`$name_kun` reads `name_kun`). Escape the next character with a
 backslash to end it: `$name\-kun` is the value of `name` followed by `-kun`, and
@@ -359,10 +362,34 @@ Assignments write runtime state only: `config.json` is never modified.
 #### Commands and the shell
 
 A command - an action command, an `image_exec`/`text_exec`/`launch` `params`, or a
-`$(command)` - runs directly when it contains no unquoted shell operator, and through
-`sh -c` when it contains one of `` | & ; < > ` ( ) `` or a newline. Pipelines and
-redirection therefore work when you write them, while a plain command never grows a
-shell.
+`$(command)` - runs directly when its config text contains no unquoted shell operator,
+and through `sh -c` when it contains one of `` | & ; < > ` ( ) `` or a newline.
+Pipelines and redirection therefore work when you write them, while a plain command
+never grows a shell - not even when a variable's value contains shell syntax.
+
+#### Values in commands
+
+A variable may hold any text, including `|`, `;`, `$(`, quotes or newlines, and this
+text often comes from other programs (a `$(command)` assignment storing a track title,
+a window title, a web page). So inside a command, a `$name` value is always **data**:
+
+- In a plain command it is exactly one argument (or part of one), as written: it is not
+  split at spaces, quotes and backslashes in it are kept, and a leading `~` in it is not
+  expanded. `notify-send $title` passes the whole title as one argument, even when it is
+  `x; rm -rf ~` or empty.
+- In a command that runs through `sh -c`, dak hands each value to the shell as a
+  separate argument and the script only expands it (as `"${1}"`, `"${2}"`, ...), quoted
+  for where the reference appears; the shell never parses the value, so
+  `echo $title | wc -c` counts the characters of any title. The script therefore sees
+  those values as its positional parameters.
+- A value never changes what kind of action runs: `@$name` switches to the scene the
+  value names, and a command stays a command whatever its values contain.
+
+`$!name` (and `$!scope.name`) pastes the value in as if you had typed it into the config
+instead: it is split into words, may add shell syntax (so the command may start using a
+shell) and, as a whole action, may be `@scene` or an assignment. This is how `$name`
+behaved before v0.15.0. **Use `$!` only for values you control** - never for text that
+came from another program.
 
 #### Actions run in parallel
 
@@ -375,6 +402,20 @@ assignment runs on its own task. So
 
 assigns the **old** value of `$b` to `$a`, because both commands read `$b` before either
 finishes. Do not rely on the order of independent assignments in one action list.
+
+#### Limits
+
+Keypad input and program output come from outside dak, so its work is bounded:
+
+- at most 50 input events (presses or encoder notches) per control per second are acted
+  on; the rest are dropped with a warning (a dropped press together with its release);
+- at most 32 action commands and `$(command)` assignments run at the same time, across
+  all keypads; an action that would start another is skipped with a warning;
+- `image_exec`/`text_exec`/`$(command)` programs run in their own process group, killed
+  as a whole when the program times out, fails or is no longer needed, so what it started
+  does not outlive it (a program that succeeded may leave background jobs running);
+- a keypad that disconnects more than 5 times within a minute is reconnected only after
+  a pause, from 1 s doubling up to 1 minute.
 
 See `examples/EXAMPLES.md` for complete worked examples, including an encoder that
 changes screen brightness using `bc`.
@@ -406,9 +447,9 @@ Rules for the program:
 Each scene is a dictionary with two reserved keys: `setup` (button content) and `actions` (per-key bindings). A missing `setup` or `actions` simply means "empty". Button content from the previous scene is kept for any button not listed in `setup`:
 
 - `setup` — a dictionary of control references. Each key (`1b01`, `1b02`, ...) maps a physical button to a dictionary with `type`, `params` and optional `refresh`, `background`, `text_color` and `markup`:
-  - `{"type":"image","params":"path"}` — load an image from `path` onto the button
+  - `{"type":"image","params":"path"}` — load an image from `path` onto the button. PNG, JPEG, GIF, BMP, ICO, WebP and PNM are read; an image may be at most 4096 pixels wide and high (larger ones are refused, big ones scaled down first). The same applies to `image_exec` output.
   - `{"type":"image_exec","params":"program args..."}` — run `program args...` asynchronously and use its stdout as the button image; the program must print a valid image file to stdout. If it does not finish within 5 seconds, or the button is changed in the meantime, the process is killed, an error is logged, and the button shows the text "Error" in red.
-  - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied
+  - `{"type":"text","params":"path"}` — display the first 6 columns of the first 3 lines of the file `path`, with [markup](#text-markup) applied. As for `image`, `path` must be a regular file (a device or FIFO is refused) and is read within 5 seconds.
   - `{"type":"text_value","params":"text"}` — display `text` directly (after `$` references are expanded), without reading a file or running a program. This is the simplest way to show a variable's value, e.g. `{"type":"text_value","params":"$defaults.button_brightness%"}`
   - `{"type":"text_exec","params":"program args..."}` — run `program args...` asynchronously and show its stdout the same way (first 6 columns of its first 3 lines, with markup); the program must exit on its own, and a timeout or reassignment kills it and draws "Error" in red, just like `image_exec`
   - `{"type":"launch","params":"program args..."}` — run `program args...` fully detached from this program: its own process group, no stdio, and it keeps running (re-parented to init) after this program exits, so it is never killed or waited on. The button is only a config slot; nothing is drawn on it and nothing is restored on termination
@@ -417,7 +458,7 @@ Each scene is a dictionary with two reserved keys: `setup` (button content) and 
   - `text_color` (optional, colour, default: `defaults.text_color`) — override the glyph colour for this button. Allowed on `text`, `text_value` and `text_exec` only.
   - `markup` (optional, `tmux` or `none`, default: `defaults.markup`) — how this button's text is parsed (see [Text markup](#text-markup)). Allowed on `text`, `text_value` and `text_exec` only; written literally, not `$`-expanded.
   - `refresh` (optional, seconds, default `0`) — on `image`, `text`, `text_value`, `image_exec` and `text_exec` only, re-applies this entry on its own every `refresh` seconds, without touching any other button or re-applying the rest of the scene. `0` (or omitting it) means "apply once on scene entry, never again" — today's behavior. A button's refresh, like its content, is tied to whichever scene last explicitly defined it: switching to a scene that does not mention the button leaves both its display and its refresh schedule running; a later scene that does redefine the button replaces both, whether or not the new definition itself refreshes. Not allowed (a config error) on `clear` or `launch`, which have nothing left to redraw. A refresh restarts `image_exec`/`text_exec` the same way reassigning the button does — it kills any still-running process for that key — so pick an interval comfortably longer than the command's typical runtime, or it will be killed before it ever finishes.
-- `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene.
+- `actions` — a dictionary of per-control behavior. Keys are control references (e.g. `1b01`) and map to the actions for `short_press`, `long_press`, `double_click`, `pressed` and `released`. The complex events fire on release as described in [Defaults](#defaults), while `pressed` fires on the press edge and `released` on the release edge. An encoder reference (e.g. `1e01`) additionally maps the `turn_cw` and `turn_ccw` keys, which bind one rotation notch in each direction; pushing an encoder knob addresses the same five press events on the encoder reference. The special key `timer` maps to a single-element dictionary `{ "<seconds>": "<action>" }` — the action runs once that many seconds have passed after entering the scene. The seconds must be at least `1` (a variable holding less counts as `1`).
 
 Use `short_press`, `long_press` or `double_click` for ordinary button actions: they fire on release and cover a full click, so a single action is all you usually need. `pressed` and `released` are low-level edge events — they fire instantly on the down/up edge and, unlike complex presses, are not held back so a double click can be recognized. Reach for them only when you truly need to react to the exact press or release instant (for example to start something on `pressed` and stop it on `released`).
 
@@ -515,7 +556,7 @@ dak --map
 Each `buttons` entry maps a button `number` to the raw codes it sends when pressed and released, and whether the button has a screen (`screen` `true`/`false` with its `draw_id`). Each `encoders` entry maps an encoder `number` to its `cw`/`ccw` codes — one `turn_cw`/`turn_ccw` action per rotation notch — and, after the wizard replays a knob push, its `press`/`release` codes; an encoder without push codes still turns, but its knob push is ignored at runtime.
 
 `protocol_version` is optional (omit it, or set it to JSON `null`, to fall back to the
-default): it picks which of `mirajazz`'s connection protocol variants `dak` speaks to
+default; otherwise `1`, `2` or `3`): it picks which of `mirajazz`'s connection protocol variants `dak` speaks to
 this device with (see [Help me support more devices](#help-me-support-more-devices)
 for the wider device family this matters for). `dak --map` fills it in with the
 recognized device kind's own default and prints the same value to the console while
@@ -548,6 +589,7 @@ At startup each definition is matched against the discovered hardware:
 
 - A definition whose serial is anything but `"unknown"` matches only the device reporting that exact serial, which tells identical devices apart.
 - A definition whose serial is `"unknown"` falls back to comparing the VID:PID string (`device_id` vs. the device's vendor/product ids), so devices without serials still work as long as only one of their kind is connected.
+- When more than one attached device matches a definition, none of them is used and a warning says so: USB serial numbers are neither secret nor authenticated, so a second device with the same serial may be impersonating your keypad (it would see everything drawn on the buttons, and its "presses" would run your actions). A lost keypad is only reconnected to a device with the serial it had.
 
 Every matched device is connected using the key and encoder counts from its own definition and driven with the shared scenes: the `on_start` scene is applied on it, and its buttons/timers run the `setup` and `actions` entries, addressed by the device's own id. A device defined in config but not found is reported with a warning, a discovered device with no config definition is ignored with a warning, and when no configured device is found the program exits with status 4 (see "Exit status" in `dak(1)`).
 
@@ -623,7 +665,7 @@ never need it:
 | Key | Meaning | Default |
 |---|---|---|
 | `output` | one or more of `console`, `journal` (stderr with `<N>` priority prefixes), `syslog`, `file`; or `auto` alone | `"auto"` |
-| `file` | log file for the `file` output; `~` is expanded, the directory is created | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
+| `file` | log file for the `file` output; `~` is expanded, the directory is created; a symlink, hard link, other user's file or non-regular file is refused | `$XDG_STATE_HOME/dak/dak.log`, else `~/.local/state/dak/dak.log` |
 | `syslog_facility` | syslog facility | `user` |
 | `level` | most detailed level written; errors are always written, `warning` also hides the banner and connect lines | `info` |
 | `debug` | debug subsystems (`device`, `scene`, `actions`, `fonts`); written only at level `debug` | none |
@@ -684,10 +726,18 @@ releases the lock whenever that dak ends, even after a crash. When another dak h
 - with `--wait` dak waits until it is released and then takes it - handy when switching
   users: the next user's dak picks the keypad up as soon as the previous one stops;
 - with `--replace` dak sends the holder `SIGTERM`, waits up to 10 s for it to clean up,
-  and takes over. Only for your own instances, or anyone's as root.
+  and takes over. Only for your own instances, or anyone's as root. Because every user
+  can write to lock files, dak first checks that the recorded process really is a dak
+  running as the recorded user, and refuses to signal it otherwise.
 
 The lock is kept while a lost keypad is being waited for, so nobody takes it over in
 the meantime. `dak --map` locks the keypad too, and refuses one in use.
+
+The lock directory is shared by all users, so any local user can hold (or block) a
+keypad's lock; dak then only refuses or waits, it never trusts what the file says. A lock
+file that is a symlink, a hard link or not a regular file is refused. Where this matters
+(a multi-user machine with untrusted users), point `DAK_LOCK_DIR` at a directory only
+the keypad's users can write to.
 
 ## Device install
 

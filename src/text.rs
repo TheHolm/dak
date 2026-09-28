@@ -48,6 +48,10 @@ pub const MAX_LINE_CHARS: usize = 6;
 /// Matches the config documentation for the `text` and `text_exec` commands.
 pub const MAX_LINES: usize = 3;
 
+/// Most characters drawn for one grapheme cluster (a base character and its combining
+/// marks). Real text needs a handful; the rest of a longer cluster is dropped.
+pub const MAX_CLUSTER_CHARS: usize = 8;
+
 /// The keys `defaults.fonts` may contain, in documentation order: the four text styles,
 /// the emoji fallback and the last-resort extra font (e.g. CJK). Also the vocabulary
 /// `tests/man_pages.rs` requires `dak-config.5` to document.
@@ -570,14 +574,17 @@ fn drawable_glyph(font: &FontArc, ch: char) -> Option<(GlyphId, bool)> {
 fn decode_bitmap(font: &FontArc, id: GlyphId) -> Option<RgbaImage> {
     let image = font.glyph_raster_image2(id, u16::MAX)?;
     match image.format {
-        GlyphImageFormat::Png => {
-            image::load_from_memory_with_format(image.data, image::ImageFormat::Png)
-                .ok()
-                .map(|decoded| decoded.to_rgba8())
-        }
+        GlyphImageFormat::Png => crate::imaging::decode_as(image.data, image::ImageFormat::Png)
+            .ok()
+            .map(|decoded| decoded.to_rgba8()),
         GlyphImageFormat::BitmapPremulBgra32 => {
             let (width, height) = (u32::from(image.width), u32::from(image.height));
-            if image.data.len() < (width * height * 4) as usize {
+            // u64: 65535 x 65535 x 4 overflows u32. Bounded like any other picture.
+            let needed = u64::from(width) * u64::from(height) * 4;
+            if width > crate::imaging::MAX_DIMENSION
+                || height > crate::imaging::MAX_DIMENSION
+                || (image.data.len() as u64) < needed
+            {
                 return None;
             }
             let mut rgba = RgbaImage::new(width, height);
@@ -858,7 +865,49 @@ pub fn load_font_file(spec: &str) -> Result<(FontArc, FontScan), String> {
         });
     }
     let font = FontVec::try_from_vec_and_index(bytes, index).map_err(|_| not_a_font())?;
-    Ok((FontArc::new(font), scan))
+    let font = FontArc::new(font);
+    check_font_metrics(&font).map_err(|problem| format!("\"{path}\" {problem}"))?;
+    Ok((font, scan))
+}
+
+/// Refuses a font whose basic metrics make no sense, since text is scaled by them: a
+/// units-per-em outside what the OpenType spec allows (16 to 16384), a line height
+/// (ascent - descent) that is not a positive finite number, or an `M` whose advance is
+/// not (the width of the text block is measured in `M`s). A broken or hostile font
+/// could otherwise make the scale infinite, or zero.
+fn check_font_metrics(font: &FontArc) -> Result<(), String> {
+    if let Some(upem) = font.units_per_em() {
+        if !(16.0..=16384.0).contains(&upem) {
+            return Err(format!("has an invalid units-per-em of {upem}"));
+        }
+    }
+    let line = font.ascent_unscaled() - font.descent_unscaled();
+    if !line.is_finite() || line <= 0.0 {
+        return Err(format!("has an invalid line height of {line}"));
+    }
+    let m = font.glyph_id('M');
+    if m.0 != 0 {
+        let advance = font.h_advance_unscaled(m);
+        if !advance.is_finite() || advance <= 0.0 {
+            return Err(format!("has an invalid advance of {advance} for \"M\""));
+        }
+    }
+    Ok(())
+}
+
+/// Most a glyph may be enlarged relative to its natural size when it is fitted into its
+/// cells (see `lay_out`): far more than any real font needs.
+const MAX_FIT_SCALE: f32 = 8.0;
+
+/// `value` when it is a positive finite number no larger than `max`, `max` when it is
+/// larger (or infinite), and `fallback` otherwise (zero, negative, NaN): the guard every
+/// font-derived scale goes through before glyphs are rasterised with it.
+fn sane_scale(value: f32, max: f32, fallback: f32) -> f32 {
+    if value.is_nan() || value <= 0.0 {
+        fallback
+    } else {
+        value.min(max)
+    }
 }
 
 /// Splits a font spec into its path and collection face index: `"a.ttc#2"` is face 2 of
@@ -1060,7 +1109,11 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                 let target = cells as f32 * cell;
                 let natural = font.as_scaled(1.0).h_advance(id).max(f32::EPSILON);
                 let em = fonts.em_box(font);
-                let scale = (FITTED_EM_FILL / em.size.max(f32::EPSILON)).min(target / natural);
+                let scale = sane_scale(
+                    (FITTED_EM_FILL / em.size.max(f32::EPSILON)).min(target / natural),
+                    MAX_FIT_SCALE,
+                    1.0,
+                );
                 laid.glyphs.push(PlacedGlyph {
                     font: font.clone(),
                     id,
@@ -1072,7 +1125,14 @@ fn lay_out(line: &Line, fonts: &FontSet) -> LaidOutLine {
                 });
                 laid.width += target;
             } else {
-                for (index, ch) in std::iter::once(first).chain(chars).enumerate() {
+                // A cluster is one cell however many combining marks it has; draw at
+                // most MAX_CLUSTER_CHARS of them, so a cluster of millions of marks
+                // (program output can be megabytes) cannot keep the renderer busy.
+                for (index, ch) in std::iter::once(first)
+                    .chain(chars)
+                    .take(MAX_CLUSTER_CHARS)
+                    .enumerate()
+                {
                     let (font, id) = if index == 0 {
                         (font, id)
                     } else {
@@ -1151,7 +1211,10 @@ pub fn render_lines(
     // Largest uniform scale that keeps every column and all lines inside the button.
     let scale_x = width as f32 / widest;
     let scale_y = height as f32 / (line_count * line_height + (line_count - 1.0) * line_gap);
-    let scale = scale_x.min(scale_y);
+    // A font with broken metrics (zero line height or `M` width) could make this
+    // infinite or NaN; no text needs more than the button's height per font unit.
+    let max_scale = 4.0 * height.max(width) as f32;
+    let scale = sane_scale(scale_x.min(scale_y), max_scale, 1.0);
 
     let scaled = primary.as_scaled(scale);
     let ascent = scaled.ascent();
@@ -1195,9 +1258,12 @@ pub fn render_lines(
                     picture.height().max(1) as f32,
                 );
                 let fit = (box_width / picture_width).min(box_height / picture_height);
+                // Never larger than the button (a broken fit would otherwise ask for a
+                // picture of up to u32::MAX pixels a side).
+                let fit = sane_scale(fit, f32::MAX, 1.0);
                 let (draw_width, draw_height) = (
-                    (picture_width * fit).round().max(1.0) as u32,
-                    (picture_height * fit).round().max(1.0) as u32,
+                    ((picture_width * fit).round().max(1.0) as u32).min(width),
+                    ((picture_height * fit).round().max(1.0) as u32).min(height),
                 );
                 let x0 = left + glyph.x * scale + (box_width - draw_width as f32) / 2.0;
                 let y0 = baseline - ascent + (box_height - draw_height as f32) / 2.0;
@@ -1215,7 +1281,7 @@ pub fn render_lines(
                 );
                 continue;
             }
-            let glyph_scale = scale * glyph.scale;
+            let glyph_scale = sane_scale(scale * glyph.scale, max_scale, scale);
             let glyph_baseline = match glyph.centred {
                 // Put the glyph's em box centre on the primary font's line centre.
                 Some(em_centre) => {
@@ -1268,7 +1334,7 @@ pub fn render_lines(
 /// whatever falls outside the image.
 fn blend_picture(image: &mut RgbImage, picture: &RgbaImage, x: i32, y: i32) {
     for (px, py, pixel) in picture.enumerate_pixels() {
-        let (tx, ty) = (x + px as i32, y + py as i32);
+        let (tx, ty) = (x.saturating_add(px as i32), y.saturating_add(py as i32));
         if tx < 0 || ty < 0 || tx as u32 >= image.width() || ty as u32 >= image.height() {
             continue;
         }
@@ -1300,6 +1366,54 @@ mod tests {
             rotation: mirajazz::types::ImageRotation::Rot0,
             mirror: mirajazz::types::ImageMirroring::None,
         }
+    }
+
+    /// Scales from font metrics are kept positive, finite and bounded.
+    #[test]
+    fn sane_scale_bounds_font_derived_scales() {
+        assert_eq!(sane_scale(2.5, 10.0, 1.0), 2.5);
+        assert_eq!(sane_scale(f32::INFINITY, 10.0, 1.0), 10.0);
+        assert_eq!(sane_scale(1e30, 10.0, 1.0), 10.0);
+        assert_eq!(sane_scale(f32::NAN, 10.0, 1.0), 1.0);
+        assert_eq!(sane_scale(0.0, 10.0, 1.0), 1.0);
+        assert_eq!(sane_scale(-3.0, 10.0, 1.0), 1.0);
+    }
+
+    /// A picture placed at the far edge of the coordinate range is clipped, not an
+    /// overflow.
+    #[test]
+    fn blend_picture_clips_extreme_positions() {
+        let mut image = RgbImage::new(4, 4);
+        let picture = RgbaImage::from_pixel(3, 3, image::Rgba([255, 0, 0, 255]));
+        for (x, y) in [
+            (i32::MAX, 0),
+            (0, i32::MAX),
+            (i32::MIN, i32::MIN),
+            (i32::MAX - 1, i32::MAX - 1),
+        ] {
+            blend_picture(&mut image, &picture, x, y);
+        }
+        assert!(image.pixels().all(|pixel| pixel.0 == [0, 0, 0]));
+        blend_picture(&mut image, &picture, 2, 2);
+        assert_eq!(image.get_pixel(3, 3).0, [255, 0, 0]);
+    }
+
+    /// A grapheme cluster with a huge number of combining marks is one cell, and only
+    /// [`MAX_CLUSTER_CHARS`] of its characters are laid out and drawn.
+    #[test]
+    fn huge_clusters_are_capped() {
+        let text = format!("a{}b", "\u{301}".repeat(100_000));
+        let parsed = parse(&text, Markup::None);
+        let laid = lay_out(&parsed.lines[0], &FontSet::embedded());
+        assert_eq!(laid.glyphs.len(), MAX_CLUSTER_CHARS + 1);
+        render_lines(
+            &parsed.lines,
+            &default_background(),
+            &default_text_color(),
+            &FontSet::embedded(),
+            format(),
+        )
+        .unwrap();
     }
 
     /// Renders tmux-markup `text` white on black with the embedded fonts.

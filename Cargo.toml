@@ -1,6 +1,6 @@
 [package]
 name = "dak"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2021"
 authors = ["TheHolm <theholm@github.com>"]
 description = "Controls an Ajazz AKP03E/AKP03R USB macro keypad: paints button images, sets brightness, and reacts to key/encoder input"
@@ -39,7 +39,9 @@ assets = [
 
 [dependencies]
 chrono = { version = "0.4" }
-image = { version = "0.25" }
+# Only the formats dak documents (src/imaging.rs FORMATS): every enabled decoder is
+# attack surface for image files and image_exec output. No rayon: images are tiny.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp", "pnm"] }
 tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal", "fs"] }
 
 serde_json = { version = "1.0.150"}
