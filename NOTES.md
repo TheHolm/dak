@@ -1076,3 +1076,21 @@ rejects protocol versions outside 1..=3 (`actions::PROTOCOL_VERSIONS`) and count
 reached: every image is shrunk to 240 px (`imaging::shrink`) and then resized to the
 button (60x60) and JPEG-encoded, a few KiB.
 
+## 14. Verifying CI downloads without pinned hashes
+
+`release.yaml` pins no checksums (they would need updating for every OS/toolchain
+release). Instead:
+
+- `base.txz`: `scripts/verify-freebsd-dist.sh` checks it against the release `MANIFEST`
+  (tab separated: set, sha256, ...), and requires that MANIFEST to be byte-identical on
+  download.freebsd.org and on every reachable mirror of `FREEBSD_MIRRORS` (default
+  ftp.de.freebsd.org and mirror.aarnet.edu.au, both HTTPS with valid certificates as
+  of 2026-09; ftp.uk.freebsd.org's certificate did not match). At least one mirror must
+  answer. Checked live against 15.1-RELEASE.
+- rustup (Ubuntu job): `scripts/fetch-verified.sh` against
+  `static.rust-lang.org/.../rustup-init.sha256`, replacing `curl sh.rustup.rs | sh`.
+- `cargo-deb` and `cargo-audit` are installed with fixed `--version`s (update them
+  deliberately). `cargo audit` exits 0 on "unmaintained" warnings; in 2026-09 it
+  reported only RUSTSEC-2026-0192 (`ttf-parser`, via `ab_glyph`).
+- Docker images stay referenced by tag, not digest.
+

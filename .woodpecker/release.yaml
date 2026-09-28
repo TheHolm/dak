@@ -27,6 +27,17 @@
 # concurrency setting allowing more than one step container at a time - the
 # DAG here just describes what's *allowed* to run concurrently.
 #
+# Downloads are verified without checksums written into this repository (they would
+# have to be updated for every toolchain/OS release and prove little on their own):
+# FreeBSD's base.txz against the release MANIFEST, cross-checked between
+# download.freebsd.org and independent mirrors (scripts/verify-freebsd-dist.sh), and
+# rustup-init against the .sha256 static.rust-lang.org publishes next to it
+# (scripts/fetch-verified.sh). Every step first refuses a tag that is not a plain
+# vX.Y.Z (scripts/check-release-tag.sh), since later commands expand it. The base
+# images are referenced by tag, not digest, for the same no-hard-coded-hash reason.
+# `cargo audit` fails the release on a known-vulnerable dependency, and the release
+# gets a SHA256SUMS file for its artifacts.
+#
 # There's no separate source-tarball step: GitHub already auto-generates a
 # "Source code (zip/tar.gz)" download for every release from the underlying
 # git tag, so building and uploading a redundant one ourselves would just
@@ -54,6 +65,7 @@ steps:
       CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER: clang
       RUSTFLAGS: "-C link-arg=--target=x86_64-unknown-freebsd15 -C link-arg=--sysroot=/opt/freebsd-sysroot -C link-arg=-fuse-ld=lld -C link-arg=-B/opt/freebsd-sysroot/usr/lib"
     commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - rustup target add x86_64-unknown-freebsd
       - apt-get update && apt-get install -y --no-install-recommends clang lld zstd python3
       - mkdir -p /opt/freebsd-sysroot
@@ -70,7 +82,7 @@ steps:
       # base.txz to find the new name, then update this list, this comment,
       # and NOTES.md section 1.4a. scripts/check-target-freshness.sh flags
       # in CI when a newer FreeBSD release than the one pinned below exists.
-      - curl -fsSL -o /tmp/base.txz https://download.freebsd.org/releases/amd64/amd64/15.1-RELEASE/base.txz
+      - sh scripts/verify-freebsd-dist.sh releases/amd64/amd64/15.1-RELEASE base.txz /tmp/base.txz
       - >-
         tar -xJf /tmp/base.txz -C /opt/freebsd-sysroot
         ./lib/libc.so.7 ./usr/lib/libc.so ./usr/lib/libc_nonshared.a
@@ -144,10 +156,14 @@ steps:
     environment:
       CARGO_TARGET_DIR: target/deb-ubuntu2604
     commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends curl ca-certificates build-essential libudev-dev pkg-config lintian
-      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+      # rustup-init checked against the SHA-256 published next to it, instead of
+      # piping https://sh.rustup.rs into a shell.
+      - sh scripts/fetch-verified.sh https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init /tmp/rustup-init
+      - chmod +x /tmp/rustup-init && /tmp/rustup-init -y --profile minimal --default-toolchain 1.92.0
       - . "$HOME/.cargo/env"
-      - cargo install cargo-deb --locked
+      - cargo install cargo-deb --locked --version 3.8.0
       - mkdir -p dist
       # --deb-revision disambiguates the two .deb outputs: cargo-deb's
       # default naming (dak_<version>-1_amd64.deb) doesn't encode which
@@ -187,8 +203,12 @@ steps:
     environment:
       CARGO_TARGET_DIR: target/deb-trixie
     commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends libudev-dev lintian
-      - cargo install cargo-deb --locked
+      - cargo install cargo-deb --locked --version 3.8.0
+      # Fails the release when a dependency in Cargo.lock has a published advisory.
+      - cargo install cargo-audit --locked --version 0.22.2
+      - cargo audit
       - mkdir -p dist
       - cargo deb --deb-revision "1~trixie"
       - cp target/deb-trixie/debian/*.deb dist/
@@ -215,6 +235,7 @@ steps:
       GH_TOKEN:
         from_secret: github_token
     commands:
+      - sh scripts/check-release-tag.sh "$CI_COMMIT_TAG"
       - apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg
       - mkdir -p -m 755 /etc/apt/keyrings
       - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
@@ -222,6 +243,8 @@ steps:
       - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
       - apt-get update && apt-get install -y --no-install-recommends gh
       - ./scripts/extract-release-notes.sh "$CI_COMMIT_TAG" RELEASE_NOTES.md > /tmp/release-notes.md
+      # Checksums of everything released, so downloads can be checked.
+      - cd dist && sha256sum -- * > SHA256SUMS && cd ..
       - >-
         gh release create "$CI_COMMIT_TAG" dist/*
         --repo theholm/dak
