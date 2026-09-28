@@ -742,8 +742,11 @@ bare metal; **treat FreeBSD reconnect as flaky** until it has been.
 
 - `hw.usb.usbhid.enable=1` was already on in the template; `hidraw` needed
   `kldload hidraw` (plus `hidraw_load="YES"` in `/boot/loader.conf`).
-- devfs rule as in `INSTALL.md` (`hidraw*` mode 0660 group operator) plus the
-  user in `operator`. The keypad appears as three `hidraw` nodes (two for its
+- devfs rule `hidraw*` mode 0660 group operator plus the user in `operator` (what
+  `INSTALL.md` said until v0.15.0; it now recommends a devd attach rule matching the
+  keypad's vendor/product and a dedicated `dak` group, since `hidraw*` covers every HID
+  device including keyboards and `operator` can read raw disks. The devd rule relies
+  on hidbus children's pnpinfo carrying `vendor`/`product`; not yet run on hardware). The keypad appears as three `hidraw` nodes (two for its
   own two `usbhid` interfaces, one for the QEMU tablet); dak uses `hidraw0`.
 - `usbconfig power_off`/`power_on`/`reset` need root even with those devfs
   rules (the `ugen`/`usb` nodes are not covered by them).

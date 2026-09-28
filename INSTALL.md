@@ -57,20 +57,35 @@ install. A source checkout has the same pages under `man/`; read them with
 # lsusb
 Bus 003 Device 020: ID 0300:3002 Ajazz HOTSPOTEKUSB HID DEMO
 ```
-2. Create UDEV rule to give regular user access to the device
-change GROUP= to some group appropriate to your system which your user is member of.
-The file must be named with a `.rules` suffix - `udevd` silently ignores any
-other extension (e.g. `.conf`) in `/etc/udev/rules.d/`.
+2. Create a udev rule giving the user at the seat access to the keypad's `hidraw`
+nodes - and nothing else. The file must be named with a `.rules` suffix - `udevd`
+silently ignores any other extension (e.g. `.conf`) in `/etc/udev/rules.d/`.
 
 ```
-#cat /etc/udev/rules.d/ajazz_akp03e.rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTR{idVendor}=="0300", ATTR{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", TAG+="uaccess", GROUP="plugdev"
+#cat /etc/udev/rules.d/70-ajazz-akp03e.rules
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0600", TAG+="uaccess"
 ```
 ```
-sudo chown root:root /etc/udev/rules.d/ajazz_akp03e.rules
+sudo chown root:root /etc/udev/rules.d/70-ajazz-akp03e.rules
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+```
+
+`TAG+="uaccess"` lets systemd-logind give the logged-in user at the seat (and only
+them) access, and takes it away again at logout; the file name must sort before
+`73-seat-late.rules` for that to work. dak only needs the `hidraw` nodes, so the rule
+deliberately does not open up the raw USB device node (`SUBSYSTEM=="usb"`), which
+would let a user talk to the keypad's firmware directly.
+
+Without systemd-logind, use a dedicated group instead of `uaccess`, containing only
+the users who should drive the keypad (not a catch-all group such as `plugdev`):
+
+```
+sudo groupadd --system dak
+sudo usermod -aG dak yourusername
+```
+```
+#cat /etc/udev/rules.d/70-ajazz-akp03e.rules
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0300", ATTRS{idProduct}=="3002", MODE="0660", GROUP="dak"
 ```
 
 ### FreeBSD
@@ -89,30 +104,38 @@ sudo sysctl hw.usb.usbhid.enable=1
 echo 'hw.usb.usbhid.enable=1' | sudo tee -a /etc/sysctl.conf
 ```
 
-`/dev/hidrawN` nodes default to `0600 root:operator` (root-only, even for group
-members) - add a `devfs.rules(5)` entry granting your user's group read/write
-access, analogous to the udev rule above, e.g.:
+`/dev/hidrawN` nodes default to `0600 root:operator`. Give a dedicated group access
+to the keypad's nodes only, with a `devd(8)` rule that runs when a `hidraw` node of
+vendor 0x0300, product 0x3002 attaches:
 
 ```
-# /etc/devfs.rules
-[dakrules=10]
-add path 'hidraw*' mode 0660 group operator
+sudo pw groupadd dak
+sudo pw groupmod dak -m yourusername
+```
+```
+# /usr/local/etc/devd/dak-permissions.conf
+attach 100 {
+	device-name "hidraw[0-9]+";
+	match "vendor" "0x0300";
+	match "product" "0x3002";
+	action "chgrp dak /dev/$device-name && chmod 0660 /dev/$device-name";
+};
+```
+```
+sudo service devd restart
 ```
 
-Activate it and add your user to that group:
+Do **not** use a `devfs.rules(5)` entry such as `add path 'hidraw*' ... group operator`
+for this: with `hw.usb.usbhid.enable=1` *every* HID device (keyboards included) gets a
+`hidraw` node, so that rule would let the group read every keystroke typed on the
+machine - and `operator` can also read raw disks, so it must never be handed out just
+to use a keypad.
+
+Then replug the device, or reset it, so it re-attaches under `/dev/hidrawN` instead of
+`/dev/uhidN` (and the rule runs):
 
 ```
-sudo sysrc devfs_system_ruleset=dakrules
-sudo pw groupmod operator -m yourusername
-```
-
-Then either reboot, or apply immediately without one:
-
-```
-sudo service devfs restart
-sudo usbconfig -d ugenX.Y reset   # replug the device, or reset it like this,
-                                   # so it re-attaches under /dev/hidrawN
-                                   # instead of /dev/uhidN
+sudo usbconfig -d ugenX.Y reset
 ```
 (log out and back in too, so your shell picks up the new group membership).
 
