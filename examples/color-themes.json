@@ -1,0 +1,93 @@
+{
+  // Button and text colours (v0.11.0). `defaults.background`/`text_color` set the
+  // whole keypad's theme - the canvas colour under transparent image pixels and text,
+  // and the colour text is drawn in. 1b01 toggles between a light and dark theme at
+  // runtime with `$defaults.background := ...` / `$defaults.text_color := ...`; both
+  // are readable too, so 1b01's own label shows the current pair live.
+  //
+  // 1b02 is a literal per-button override: its `background`/`text_color` keys stay
+  // red-on-almost-black no matter what the theme does, because a `setup` entry's
+  // colour override belongs to the button, not the scene (same rule as content and
+  // actions - see scene-carry-over.json).
+  //
+  // 1b03's `text_color` is a `$` reference instead of a literal, so it can be changed
+  // on its own with a plain assignment, independent of the theme toggle.
+  //
+  // 1b04 shows a `background` override on an `image` entry: the colour composited
+  // under any transparent pixels of the icon (without it, transparent icon pixels
+  // default to `defaults.background`, black).
+  //
+  // A colour change only affects the *next* draw (a scene switch, a refresh tick or a
+  // new image) - buttons already on screen are not repainted, which is why 1b01 and
+  // 1b03 carry a `refresh` here.
+  "version": "1.0",
+  "variables": {
+    "warn_colour": { "type": "str", "max_length": 16, "value": "yellow" }
+  },
+  "defaults": {
+    "background": "#000000",
+    "text_color": "#ffffff"
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "$defaults.text_color\non\n$defaults.background", "refresh": 1 },
+        "1b02": {
+          "type": "text_value",
+          "params": "ALERT",
+          "background": "#330000",
+          "text_color": "red"
+        },
+        "1b03": { "type": "text_value", "params": "WARN", "text_color": "$warn_colour", "refresh": 1 },
+        "1b04": {
+          "type": "image",
+          "params": "/usr/share/icons/hicolor/48x48/apps/utilities-terminal.png",
+          "background": "#001133"
+        }
+      },
+      "actions": {
+        "1b01": {
+          "short_press": [
+            "$defaults.background := \"#ffffff\"",
+            "$defaults.text_color := \"#000000\""
+          ],
+          "long_press": [
+            "$defaults.background := \"#000000\"",
+            "$defaults.text_color := \"#ffffff\""
+          ]
+        },
+        "1b03": {
+          "short_press": "$warn_colour := \"orange\"",
+          "long_press": "$warn_colour := \"yellow\""
+        }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

@@ -25,10 +25,10 @@
         // 1b01 is the only button whose action Alt overrides (to go back).
         "1b01": { "short_press": "@Alt" },
         // These three keep firing while Alt is active, because Alt never rebinds them.
-        "1b02": { "short_press": "/usr/bin/notify-send dak '1b02: on_start binding'" },
-        "1b03": { "short_press": "/usr/bin/notify-send dak '1b03: on_start binding'" },
-        "1b04": { "short_press": "/usr/bin/notify-send dak '1b04: on_start binding'" },
-        "1b05": { "short_press": "/usr/bin/notify-send dak '1b05: on_start binding'" }
+        "1b02": { "short_press": "notify-send dak '1b02: on_start binding'" },
+        "1b03": { "short_press": "notify-send dak '1b03: on_start binding'" },
+        "1b04": { "short_press": "notify-send dak '1b04: on_start binding'" },
+        "1b05": { "short_press": "notify-send dak '1b05: on_start binding'" }
       }
     },
     "Alt": {
@@ -43,7 +43,7 @@
         // 1b04 and 1b05 out inherits the on_start bindings for them.
         "1b01": { "short_press": "@on_start" },
         "1b02": {
-          "short_press": "/usr/bin/notify-send dak '1b02: Alt binding (overwrote on_start)'"
+          "short_press": "notify-send dak '1b02: Alt binding (overwrote on_start)'"
         }
       }
     }

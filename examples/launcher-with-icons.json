@@ -25,7 +25,7 @@
         },
         "1b04": {
           "type": "image_exec",
-          "params": "/usr/bin/convert -size 60x60 xc:'#222222' -fill white -pointsize 14 -gravity center -annotate 0 'DAK' png:-"
+          "params": "convert -size 60x60 xc:'#222222' -fill white -pointsize 14 -gravity center -annotate 0 'DAK' png:-"
         }
       },
       "actions": {
@@ -37,7 +37,7 @@
     "Firefox": {
       "setup": {
         "1b01": { "type": "text_value", "params": "HOME" },
-        "1b07": { "type": "launch", "params": "/usr/bin/firefox" }
+        "1b07": { "type": "launch", "params": "firefox" }
       },
       "actions": {
         "1b01": { "short_press": "@on_start" },
@@ -47,7 +47,7 @@
     "Terminal": {
       "setup": {
         "1b01": { "type": "text_value", "params": "HOME" },
-        "1b07": { "type": "launch", "params": "/usr/bin/x-terminal-emulator" }
+        "1b07": { "type": "launch", "params": "x-terminal-emulator" }
       },
       "actions": {
         "1b01": { "short_press": "@on_start" },
@@ -57,7 +57,7 @@
     "Editor": {
       "setup": {
         "1b01": { "type": "text_value", "params": "HOME" },
-        "1b07": { "type": "launch", "params": "/usr/bin/code" }
+        "1b07": { "type": "launch", "params": "code" }
       },
       "actions": {
         "1b01": { "short_press": "@on_start" },

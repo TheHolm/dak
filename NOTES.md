@@ -41,6 +41,9 @@ FreeBSD/cross-compiling) and states its own environment inline.
 10. [Device lock files shared between users](#10-device-lock-files-shared-between-users)
 11. [Running as a service (systemd, autostart, hooks)](#11-running-as-a-service-systemd-autostart-hooks)
 12. [Measuring test coverage](#12-measuring-test-coverage)
+13. [Device library limits dak keeps away from](#13-device-library-limits-dak-keeps-away-from)
+14. [Verifying CI downloads without pinned hashes](#14-verifying-ci-downloads-without-pinned-hashes)
+15. [Writing and checking example configs](#15-writing-and-checking-example-configs)
 
 ---
 
@@ -1094,3 +1097,35 @@ release). Instead:
   reported only RUSTSEC-2026-0192 (`ttf-parser`, via `ab_glyph`).
 - Docker images stay referenced by tag, not digest.
 
+## 15. Writing and checking example configs
+
+Learned while updating `examples/` and `config.json.example` for v1.0.0 (2026-09, Debian
+13 sandbox, no keypad attached).
+
+- **Load check without hardware:** `cargo test --test validation example_configs_load
+  shipped_example_config_loads` loads every `examples/*.json` and `config.json.example`.
+  `./target/debug/dak -c FILE` also prints the load warnings before failing with
+  `HidError(NotConnected)`; that error just means no keypad, not a config problem.
+- **Shell `$(...)` must be escaped.** A bare `$` in config text starts a dak variable
+  reference, so `$(date +%s)` fails to load. Write `\$(...)` in dak text, which is
+  `\\$(...)` inside a JSON string. Same for `$((...))` arithmetic.
+- **A command containing `|`, `;`, `(` etc. runs through `sh -c`** automatically
+  (`command_needs_shell`), and the load check then skips the "program not found in
+  PATH" warning for it, since it cannot tell which word is the program.
+- **Checking what a `text_exec` really prints:** the load check does not run commands.
+  A throwaway crate under `/tmp` depending on `dak = { path = ... }` can run the
+  actual command:
+  `dak::variables::expand_pieces_with(params, |_| Err("no vars".into()))`, then
+  `dak::actions::build_command_pieces(&pieces)` for the program and arguments, then
+  `std::process::Command`. `dak::markup::parse(output, Markup::Tmux)` returns the
+  parsed lines and any markup warnings.
+- **A button shows 6 columns x 3 lines.** `HH:MM:SS` (8 columns) gets cut off; use
+  `date +%H:%M%n%S` (two lines), as `scene-navigation.json` and `hello-dak.json` do.
+- **Scene changes keep what the new scene does not redefine,** content and actions
+  separately. Redrawing a button in another scene does not remove the action it had,
+  so bind `""` to unbind it, and `clear` buttons that should not keep the other
+  scene's content (see `hello-dak.json`).
+- **Encoder references are never checked against the device.** An action on `1e04` for
+  a 3-encoder device loads without a warning and simply never fires (`route` logs it
+  only under `-d device`). A demo meant for every keypad should not rely on encoders.
+  See `TODO.md` item 11.

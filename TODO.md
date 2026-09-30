@@ -35,8 +35,9 @@
    to *configure* one from `config.json`: `image_exec` with `refresh` already re-runs a
    command and redraws, but only every N whole seconds, and `image` only ever pushes a
    single static frame. There is no way to say "cycle through these frames" or "redraw
-   every N ms". Needs a new setup type (or an extension of the existing ones) plus a
-   way to control the frame rate.
+   every N ms" (`examples/hello-dak.json`'s Party scene shows the one-second
+   workaround: `text_exec` picking a frame from the current second). Needs a new setup
+   type (or an extension of the existing ones) plus a way to control the frame rate.
 6. (Maybe - lower priority, and only relevant once #5 above exists) A sleep/low-power
    mode for animations specifically: redrawing a button continuously costs real,
    measurable CPU and HID bandwidth (see `NOTES.md` section 6) even though today's
@@ -84,3 +85,12 @@
     uses are already reachable by composing commands with the existing events - e.g.
     `playerctl`/`dbus-send` in a `text_exec` or action. Noted as "probably not";
     revisit only if a wanted use case genuinely cannot be covered by shelling out.
+11. Warn at config load about control references the device definitions cannot
+    have. `Reference::parse` only checks the syntax, so an action on `1e04` for a
+    device with `encoder_count: 3` (or on `2b01` with no device "2") loads without a
+    word and never fires; `route` only logs the unmatched code under `-d device`.
+    A `setup` entry for an out-of-range button is at least warned about each time the
+    scene is drawn. Checking every `setup`/`actions` key against the matching
+    definition's `key_count`/`encoder_count` in `validate` would catch typos early.
+    Only warnings, not errors: a config may be shared between keypads of different
+    sizes. Found while writing `examples/hello-dak.json` (see `NOTES.md` section 15).

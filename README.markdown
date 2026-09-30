@@ -4,6 +4,16 @@
 
 # DAK — Dynamic Ajazz Keyboard
 
+## TL;DR
+
+1. Install `dak` (a `.deb`/`.pkg` from [Releases](https://github.com/theholm/dak/releases), or build from source - see [INSTALL.md](INSTALL.md)).
+2. Run `dak --map` to detect your keypad and print its `devices` definition (see [Devices](#devices) below and `dak(1)` for the full walkthrough).
+3. Write a `config.json`: paste the `devices` block from step 2 under a `scenes` section - or start from [`examples/hello-dak.json`](examples/hello-dak.json) and swap in your own `devices` block.
+4. Run `dak` (or `dak -c path/to/config.json`).
+
+See [Config structure](#config-structure) below for everything a config can do, and
+[`examples/`](examples/EXAMPLES.md) for more complete, runnable configs.
+
 **DAK** (**D**ynamic **A**jazz **K**eyboard)(pronounced as ~/ˈɡʊmiˌʔɛntə/~ /dʌk/) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`). Several other Ajazz/Mirabox-branded devices are wired up the same way and have a good chance of working out of the box even though nobody has confirmed them yet - see [Help me support more devices](#help-me-support-more-devices) for the full list and how verified each one is. Project is loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
 
 # THIS IS VIBE CODED(mostly) GARBAGE(100%, as non vibe-coded parts are garbage too), USE ON YOUR OWN RISK
@@ -111,7 +121,11 @@ Prebuilt packages for tagged releases are published to [GitHub Releases](https:/
 
 `config.json` drives all runtime behavior. The **dak-config(5)** man page is
 the compact reference for this file format; the rest of this section is the
-same material with more explanation and full examples. The top level of the
+same material with more explanation and full examples. [`config.json.example`](config.json.example),
+shipped alongside the binary, is a single file exercising (almost) every key
+described below - a quick way to find a working example of whatever you're
+looking for; [`examples/`](examples/EXAMPLES.md) has focused, one-concern-per-file
+configs instead. The top level of the
 config is a dictionary with up to six keys:
 
 - `"scenes"` — the scenes dictionary (see [Scenes](#scenes))
@@ -521,9 +535,9 @@ of needing two separate buttons:
 {
   "on_start": {
     "setup": {
-      "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
+      "1b01": { "type": "image", "params": "/path/to/icon.png" },
+      "1b02": { "type": "image_exec", "params": "text2gif -t Start" },
+      "1b03": { "type": "text_exec", "params": "date +%H:%M" },
       "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {
@@ -534,18 +548,18 @@ of needing two separate buttons:
   },
   "Main": {
     "setup": {
-      "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 },
+      "1b03": { "type": "text_exec", "params": "date +%H:%M", "refresh": 1 },
       "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
     },
     "actions": {}
   },
   "Test": {
     "setup": {
-      "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+      "1b02": { "type": "image_exec", "params": "text2gif -t Test" },
       "1b03": { "type": "clear" }
     },
     "actions": {
-      "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
+      "1b01": { "short_press": ["aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
       "timer": { "1": "@" }
     }
   }

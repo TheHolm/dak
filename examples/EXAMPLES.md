@@ -5,6 +5,19 @@ adjust. Paths, device serials and commands are placeholders - change them to mat
 system. Every example is a full config, runnable as-is once you have the hardware and any
 helper tools it mentions.
 
+- [`hello-dak.json`](hello-dak.json) - a quick tour in one file, buttons only (no
+  encoder needed). The home screen has a colourful greeting with an emoji, a live clock
+  (`text_exec` + `refresh`, seconds on a second line to fit the 6-column button), the 1/5/15-minute load averages from `/proc/loadavg`
+  (one per line, each in its own colour), a `notify-send` button and a "PARTY" button.
+  `Party` is a differently-themed scene (its own `background`/`text_color`) with a
+  "chase light" animation across `1b04`-`1b06` - three emoji frames picked from the
+  current second, each button one frame ahead of the previous - and it returns home
+  after 5 seconds via the scene `timer`. Both scenes set, clear or unbind every button
+  the other one uses differently, since a scene change keeps whatever it does not
+  redefine. Needs `date`, `cut` and Linux's `/proc/loadavg`; `notify-send` (present on
+  most Debian/Ubuntu desktops) only warns if missing. Start here if you just want to
+  see what a config can do.
+
 - [`scene-carry-over.json`](scene-carry-over.json) - shows how a scene change only
   replaces what the new scene explicitly defines. A home scene fills buttons `1b01`-`1b06`
   and binds actions on `1b01`-`1b05`; the `Alt` scene redefines only `1b01` (a new label
@@ -46,6 +59,15 @@ helper tools it mentions.
   Needs `expr` and `hostname` (both in the base system on Linux and FreeBSD; bare
   program names are looked up in `PATH`, so the example works on both).
 
+- [`variable-scene-select.json`](variable-scene-select.json) - `$name` vs `$!name`
+  (added in v0.15.0). Menu buttons assign a literal, fully config-authored scene
+  reference (`$target := "@Video"`) to a variable; a single "GO" button, bound once
+  to `$!target`, pastes that value in as a whole new action - here `@Video` or
+  `@Music` - and, never redefined by `Video`/`Music`, carries the same binding into
+  both (see `scene-carry-over.json`). By default a `$` value is always data, never an
+  action or shell syntax; `$!` is the (documented, narrow) exception, safe only
+  because `$target` is never set from a command's output. Needs nothing external.
+
 - [`press-scene-preview.json`](press-scene-preview.json) - a "flash" trick: `pressed` on
   `1b01` switches to a scene that repaints the keypad, and the inherited `released`
   binding switches back when the button is let go. Relies on the scene/action
@@ -62,6 +84,17 @@ helper tools it mentions.
   every tick so it tracks the encoder's changes (the `%` is literal text, ending the
   reference name).
 
+- [`color-themes.json`](color-themes.json) - button/text colours (added in v0.11.0).
+  `defaults.background`/`text_color` set the whole keypad's theme, toggled at runtime
+  by `1b01` with `$defaults.background := ...` / `$defaults.text_color := ...`
+  (readable too, so `1b01`'s own label tracks the current pair live via `refresh`).
+  `1b02` is a literal per-button `background`/`text_color` override that ignores the
+  theme entirely - an override belongs to the button, not the scene, the same rule as
+  content and actions (see `scene-carry-over.json`). `1b03`'s `text_color` is a
+  `$variable` instead of a literal, changed on its own with a plain assignment. `1b04`
+  shows a `background` override on an `image` entry, composited under any transparent
+  icon pixels. Needs nothing external.
+
 - [`styled-text.json`](styled-text.json) - button text markup: a bold left-aligned
   heading over a right-aligned value whose colour comes from a variable (`1b01` switches
   it on press), a single emoji inserted by code point (`#[u=1F600]`), mixed
@@ -70,6 +103,18 @@ helper tools it mentions.
   wide emoji. A commented-out `defaults.fonts` block shows how to use your own fonts,
   including a colour emoji font and a CJK font (`extra`).
   Needs only `date`.
+
+- [`multi-device.json`](multi-device.json) - one config driving two keypads. A single
+  `on_start` scene addresses both through the leading digit of each control reference
+  (`1b01` is device 1's first button, `2b01` is device 2's), sharing content and
+  actions the same way one device's buttons do. Implemented and covered by tests with
+  mocked devices, but never exercised against two real keypads at once - treat it as
+  unverified in practice. Also shows the serial-matching rule that makes this safe with
+  identical hardware: device "1" matches by VID:PID alone (`serial: "unknown"`, fine
+  with only one such device attached), while device "2" carries a placeholder real
+  serial to tell a second, identical unit apart - replace it with what `dak --map`
+  reports for that unit. Needs nothing external (`notify-send` on `1b02`/`2b02` is
+  optional; missing it only warns).
 
 - [`service.json`](service.json) - a config for running dak as a service (systemd user
   unit, XDG autostart or `--detach`): a `logging` section writing to the journal
@@ -80,5 +125,6 @@ helper tools it mentions.
   (`dak-rescan.conf`) - and an XDG autostart entry (`dak.desktop`) for starting dak
   with a desktop that has no systemd, such as on FreeBSD. Needs only `date`.
 
-See the README's [Variables](../README.markdown#variables) and
-[Text markup](../README.markdown#text-markup) sections for the syntax these examples use.
+See the README's [Variables](../README.markdown#variables),
+[Text markup](../README.markdown#text-markup) and
+[Devices](../README.markdown#devices) sections for the syntax these examples use.

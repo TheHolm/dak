@@ -1,10 +1,22 @@
 {
   "version": "1.0",
-  // Global values actions and setup params can read and assign. See the README's
-  // "Variables" section and the complete examples/ folder.
+
+  // A reference template exercising every top-level key and (almost) every setup/
+  // action feature dak supports, so grepping this one file usually finds an example
+  // of whatever key you're looking for. For a focused, single-feature config, see
+  // the examples/ folder instead: examples/hello-dak.json is a short, flashy tour;
+  // examples/EXAMPLES.md indexes the rest, one concern per file.
+
+  // Global values actions and setup params can read and assign. `type` is "int" or
+  // "str": an "int" takes "min"/"max" (inclusive), a "str" takes "max_length". See
+  // the README's "Variables" section.
   "variables": {
-    "step": { "type": "int", "min": 1, "max": 100, "value": 10 }
+    "counter": { "type": "int", "min": 0, "max": 100, "value": 0 },
+    // Only ever assigned a literal "@scene" string in this file - see the "$!goto"
+    // comment under "Test" below for why that matters.
+    "goto": { "type": "str", "max_length": 16, "value": "@Main" }
   },
+
   "defaults": {
     "short_press_duration": 300,
     "double_click_gap": 300,
@@ -12,49 +24,134 @@
     "encoder_brightness": 50,
     "background": "#000000",
     "text_color": "#ffffff",
+    // Reconnect timing used when a device disappears (sleep, unplug, USB reset);
+    // overridable per device - see the commented-out fields on device "1" below.
+    "device_reconnect_interval": 15,
+    "device_reconnect_max_attempts": 0,
     // Button text understands tmux-style tags like "#[bold,fg=red]"; "none" turns
-    // that off. Add "fonts": { "regular": "/path/to/font.ttf", ... } to use your own
-    // fonts - see the README's "Text markup" and "Fonts" sections.
+    // that off (a per-entry "markup" key overrides this - see 1b04 below).
     "markup": "tmux"
+    // Replace any of these with a TrueType/OpenType file of your own; a missing or
+    // broken file stops dak from starting, so this stays commented out by default -
+    // see the README's "Fonts" section.
+    // "fonts": {
+    //   "regular": "~/.local/share/fonts/Regular.ttf",
+    //   "bold": "~/.local/share/fonts/Bold.ttf",
+    //   "italic": "~/.local/share/fonts/Italic.ttf",
+    //   "bold_italic": "~/.local/share/fonts/BoldItalic.ttf",
+    //   "emoji": "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    //   "extra": "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc#0"
+    // }
   },
+
   // Where log lines go; without this section dak picks the console in a terminal,
-  // the journal under systemd and syslog when detached. See the README's "Logging".
-  // "logging": { "output": ["console", "file"], "level": "info" },
+  // the journal under systemd and syslog when detached. Commented out so copying
+  // this file does not start writing a log file until you actually want one - see
+  // the README's "Logging" section.
+  // "logging": {
+  //   "output": ["console", "file"],
+  //   "file": "~/.local/state/dak/dak.log",
+  //   "syslog_facility": "user",
+  //   "level": "info",
+  //   "debug": ["device", "scene"],
+  //   "timestamps": "auto"
+  // },
+
   "scenes": {
     "on_start": {
       "setup": {
-        "1b01": { "type": "image", "params": "/usr/lib/python3/dist-packages/smartcard/wx/resources/reader.ico" },
-        "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Start" },
-        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M" },
-        "1b04": { "type": "text", "params": "/tmp/aaa.txt" },
-        "1b05": { "type": "text_value", "params": "#[bold]Hi#[nobold,fg=yellow,u=1F600]\n#[align=left,italics]dak" }
+        "1b01": { "type": "image", "params": "/path/to/icon.png" },
+        "1b02": { "type": "image_exec", "params": "text2gif -t Start" },
+        "1b03": { "type": "text_exec", "params": "date +%H:%M" },
+        // "markup": "none" shows the file's content literally, tags and all.
+        "1b04": { "type": "text", "params": "/tmp/aaa.txt", "markup": "none" },
+        // A per-entry background/text_color override: kept until a later scene
+        // redefines this button, regardless of what defaults.background/text_color
+        // do meanwhile (see 1b05's own actions below).
+        "1b05": {
+          "type": "text_value",
+          "params": "#[bold]Hi#[nobold,fg=yellow,u=1F600]\n#[align=left,italics]dak",
+          "background": "#001133",
+          "text_color": "#ffffff"
+        },
+        // A config slot only: nothing is drawn here, and the command keeps running
+        // (detached) after dak exits.
+        "1b06": { "type": "launch", "params": "some-background-tool" }
       },
       "actions": {
+        // Every event name a button can bind, spelled out even where empty ("" means
+        // "bound, no action" - see the README's "Scenes" section).
         "1b01": { "short_press": "@", "long_press": "", "double_click": "", "pressed": "", "released": "" },
         "1b02": { "short_press": "@Test", "long_press": "", "double_click": "", "pressed": "", "released": "" },
-        "1b04": { "long_press": "$defaults.button_brightness := 100" },
+        // Low-level edge events: fire instantly on press/release, unlike the complex
+        // events below, which are held back so a double click can be recognized.
+        "1b03": {
+          "pressed": "notify-send dak pressed",
+          "released": "notify-send dak released"
+        },
+        // The three assignment operators: ":=" clamps and warns, "~=" clamps
+        // silently, "=" rejects an out-of-range result outright. "$(expr ...)" is a
+        // command substitution - there is no inline arithmetic in the config
+        // language.
+        "1b04": {
+          "short_press": "$counter := 0",
+          "long_press": "$counter ~= $(expr $counter + 10)",
+          "double_click": "$counter = 50"
+        },
+        // Both writable colour defaults, round-tripped as an array action (each
+        // entry runs without waiting on the others).
+        "1b05": {
+          "short_press": ["$defaults.background := \"#ffffff\"", "$defaults.text_color := \"#000000\""],
+          "long_press": ["$defaults.background := \"#000000\"", "$defaults.text_color := \"#ffffff\""]
+        },
+        // An encoder in "setup" is a config error - only "actions" may address one.
+        "1e01": {
+          "turn_cw": "$defaults.button_brightness := 100",
+          "turn_ccw": "$defaults.button_brightness := 20"
+        },
         "timer": { "1": "@Main" }
       }
     },
     "Main": {
       "setup": {
-        "1b03": { "type": "text_exec", "params": "/usr/bin/date +%H:%M", "refresh": 1 },
-        "1b04": { "type": "text", "params": "/tmp/aaa.txt" }
+        "1b03": { "type": "text_exec", "params": "date +%H:%M", "refresh": 1 },
+        // Two variables (one declared above, one a writable default) read back
+        // together in one text_value, re-expanded every tick by "refresh".
+        "1b04": { "type": "text_value", "params": "cnt=$counter\nbrt=$defaults.button_brightness%", "refresh": 1 }
       },
       "actions": {}
     },
     "Test": {
       "setup": {
-        "1b02": { "type": "image_exec", "params": "/usr/bin/text2gif -t Test" },
+        "1b02": { "type": "image_exec", "params": "text2gif -t Test" },
         "1b03": { "type": "clear" }
       },
       "actions": {
-        "1b01": { "short_press": ["/usr/bin/aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"], "long_press": "", "double_click": "", "pressed": "", "released": "" },
-        "1e01": { "turn_cw": "@", "turn_ccw": "@Test", "pressed": "", "released": "", "short_press": "", "long_press": "", "double_click": "" },
+        "1b01": {
+          "short_press": ["aplay /usr/share/sounds/sound-icons/prompt.wav", "@on_start"],
+          "long_press": "", "double_click": "", "pressed": "", "released": ""
+        },
+        "1e01": {
+          "turn_cw": "@",
+          "turn_ccw": "@Test",
+          "pressed": "",
+          "released": "",
+          // By default a "$" value is always data (one argument, never an action or
+          // shell syntax) - "$!name" is the documented exception: it pastes the
+          // value in as config text instead, so an action that is *exactly*
+          // "$!goto" is re-read as a whole new action, here "@Main" (goto's default
+          // value; assign it a different literal "@scene" string elsewhere to
+          // redirect it). Only safe because "goto" is never set from a command's
+          // output - never do this with a variable that can hold outside text.
+          "short_press": "$!goto",
+          "long_press": "",
+          "double_click": ""
+        },
         "timer": { "1": "@" }
       }
     }
   },
+
   "devices": {
     "1": {
       "device_id": "0300:3002",
@@ -64,6 +161,10 @@
       "encoder_count": 3,
       "screens": 6,
       "protocol_version": 2,
+      // Overrides defaults.device_reconnect_interval/device_reconnect_max_attempts
+      // for this device only.
+      // "device_reconnect_interval": 5,
+      // "device_reconnect_max_attempts": 60,
       "buttons": [
         { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
         { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },

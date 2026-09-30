@@ -1,0 +1,83 @@
+{
+  // `$name` vs `$!name` (v0.15.0). By default a `$` reference is always **data**: in a
+  // plain command it is exactly one argument, and as a whole action it can only be a
+  // command - never `@scene` or an assignment, no matter what the value looks like.
+  // `$!name` is the opposite: it pastes the value in as if it had been typed into the
+  // config, so an action that is *exactly* `$!name` is re-read as a whole new action,
+  // which may be `@scene` (used here) or another assignment.
+  //
+  // This menu sets `$target` to a literal, fully config-authored scene reference
+  // (`"@Video"`, `"@Music"`, `"@on_start"` - never a `$(command)` substitution or
+  // anything else that could come from outside dak) and a single "GO" button, bound
+  // once in `on_start` to `"$!target"`, jumps to whichever scene was last selected.
+  // `Video`/`Music` never redefine 1b04, so the same binding carries over into them
+  // unchanged (see scene-carry-over.json) - one physical button that goes wherever
+  // `$target` currently points, however many scenes it is reused in.
+  //
+  // Do not follow this pattern with a variable whose value can come from a command's
+  // output, a window title, or anything else outside this file: `$!` would then let
+  // that outside text add shell syntax or fire an arbitrary action instead of just
+  // being shown or passed as one argument. Use `$!` only for values you write yourself.
+  "version": "1.0",
+  "variables": {
+    "target": { "type": "str", "max_length": 16, "value": "@on_start" }
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "MENU" },
+        "1b02": { "type": "text_value", "params": "VIDEO" },
+        "1b03": { "type": "text_value", "params": "MUSIC" },
+        "1b04": { "type": "text_value", "params": "GO" }
+      },
+      "actions": {
+        "1b02": { "short_press": "$target := \"@Video\"" },
+        "1b03": { "short_press": "$target := \"@Music\"" },
+        "1b04": { "short_press": "$!target" }
+      }
+    },
+    "Video": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "PLAYING\nVIDEO" }
+      },
+      "actions": {
+        "1b01": { "short_press": "$target := \"@on_start\"" }
+      }
+    },
+    "Music": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "PLAYING\nMUSIC" }
+      },
+      "actions": {
+        "1b01": { "short_press": "$target := \"@on_start\"" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

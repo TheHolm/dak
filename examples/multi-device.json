@@ -1,0 +1,85 @@
+{
+  // Driving two keypads from one config. `devices` may declare more than one entry,
+  // each matched to its own physical unit and driven by the same shared `scenes`; a
+  // control reference's leading digit picks the device (`1b01` is device 1's first
+  // button, `2b01` is device 2's), so one scene's `setup`/`actions` can address both
+  // at once, as below.
+  //
+  // Implemented and covered by tests with mocked devices, but never exercised against
+  // two or more real keypads attached at the same time - treat it as unverified in
+  // practice (see README's "Devices" section and AGENTS.md's "Status / known gaps").
+  //
+  // Matching: device "1" here has `serial: "unknown"`, so it matches by `device_id`
+  // (VID:PID) alone - fine as long as only one such device is attached. Device "2" is
+  // given a real serial instead: with two identical keypads plugged in, a second
+  // `"unknown"` definition could not tell them apart (neither would be used, with a
+  // warning - see README) - `dak --map` against the *second* unit fills in its actual
+  // serial for you; replace the placeholder below with that value.
+  "version": "1.0",
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "DEV 1" },
+        "1b02": { "type": "text_exec", "params": "date +%H:%M", "refresh": 30 },
+        "2b01": { "type": "text_value", "params": "DEV 2" },
+        "2b02": { "type": "text_exec", "params": "date +%H:%M", "refresh": 30 }
+      },
+      "actions": {
+        "1b02": { "short_press": "notify-send dak 'device 1 pressed'" },
+        "2b02": { "short_press": "notify-send dak 'device 2 pressed'" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    },
+    "2": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "REPLACE-WITH-SECOND-UNITS-SERIAL",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

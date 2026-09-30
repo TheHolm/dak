@@ -22,24 +22,24 @@
         "1b04": { "type": "text_value", "params": "MUTE" },
         "1b05": {
           "type": "text_exec",
-          "params": "/usr/bin/playerctl metadata --format '{{ artist }} - {{ title }}'",
+          "params": "playerctl metadata --format '{{ artist }} - {{ title }}'",
           "refresh": 3
         }
       },
       "actions": {
-        "1b01": { "short_press": "/usr/bin/playerctl play-pause" },
-        "1b02": { "short_press": "/usr/bin/playerctl previous" },
-        "1b03": { "short_press": "/usr/bin/playerctl next" },
+        "1b01": { "short_press": "playerctl play-pause" },
+        "1b02": { "short_press": "playerctl previous" },
+        "1b03": { "short_press": "playerctl next" },
         "1b04": {
           "short_press": [
-            "/usr/bin/pactl set-sink-mute @DEFAULT_SINK@ toggle",
-            "/usr/bin/notify-send dak 'Output mute toggled'"
+            "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+            "notify-send dak 'Output mute toggled'"
           ]
         },
         "1e01": {
-          "turn_cw": "/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ +5%",
-          "turn_ccw": "/usr/bin/pactl set-sink-volume @DEFAULT_SINK@ -5%",
-          "short_press": "/usr/bin/playerctl play-pause"
+          "turn_cw": "pactl set-sink-volume @DEFAULT_SINK@ +5%",
+          "turn_ccw": "pactl set-sink-volume @DEFAULT_SINK@ -5%",
+          "short_press": "playerctl play-pause"
         }
       }
     }

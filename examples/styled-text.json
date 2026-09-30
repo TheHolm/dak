@@ -1,6 +1,7 @@
 {
   // Styled button text: tmux-style markup, emoji and (optionally) your own fonts.
   // See the README's "Text markup" and "Fonts" sections.
+  "version": "1.0",
   "variables": {
     "alert": { "type": "str", "value": "red" }
   },

@@ -1,0 +1,110 @@
+{
+  // A quick tour in one file: colourful text markup, emoji, a live clock, the system
+  // load average, a themed scene switch with an auto-return timer, a "chase light"
+  // animation and a notification. Uses buttons only - no encoder needed.
+  //
+  // Needs `date`, `cut` and a Linux `/proc/loadavg`; `notify-send` (present on most
+  // Debian/Ubuntu desktops) is used by the NOTIFY button but only warns if missing.
+  //
+  // Scene changes only replace what the new scene defines (see
+  // scene-carry-over.json), so each scene here sets every button it cares about and
+  // explicitly clears or unbinds the ones the other scene uses differently.
+  //
+  // The `$` of a shell `$(...)` is written `\\$` below: in dak config text a bare `$`
+  // starts a dak variable reference.
+  "version": "1.0",
+  "defaults": {
+    "background": "#000000",
+    "text_color": "#ffffff"
+  },
+  "scenes": {
+    "on_start": {
+      "setup": {
+        "1b01": { "type": "text_value", "params": "#[bold,fg=lime]DAK#[nobold]\n#[fg=yellow]ready#[u=1F44B]" },
+        // HH:MM:SS would be 8 columns, more than a button's 6, so the seconds go on
+        // a second line.
+        "1b02": { "type": "text_exec", "params": "date +%H:%M%n%S", "refresh": 1 },
+        "1b03": { "type": "text_value", "params": "#[align=center,fg=magenta]PARTY#[u=1F389]" },
+        "1b04": { "type": "text_value", "params": "#[fg=cyan]NOTIFY" },
+        // Blank: Party animates this button, so coming back must clear it.
+        "1b05": { "type": "clear" },
+        // 1, 5 and 15 minute load averages, one per line, each in its own colour.
+        "1b06": {
+          "type": "text_exec",
+          "params": "printf '#[fg=red]%s\\n#[fg=yellow]%s\\n#[fg=cyan]%s' \\$(cut -d' ' -f1-3 /proc/loadavg)",
+          "refresh": 5
+        }
+      },
+      "actions": {
+        // Unbinds the NOTIFY action Party puts on 1b02.
+        "1b02": { "short_press": "" },
+        "1b03": { "short_press": "@Party" },
+        "1b04": { "short_press": "notify-send dak 'Hello from your keypad'" }
+      }
+    },
+    "Party": {
+      "setup": {
+        "1b01": {
+          "type": "text_value",
+          "params": "#[bold]PARTY#[nobold]\n#[u=1F389,1F389]",
+          "background": "#220033",
+          "text_color": "magenta"
+        },
+        "1b02": { "type": "text_value", "params": "#[fg=cyan]NOTIFY" },
+        "1b03": { "type": "text_value", "params": "#[fg=lime]BACK" },
+        // Chase lights: the same three frames on each button, redrawn every second
+        // and picked from the current second, with 1b05/1b06 one and two frames ahead.
+        "1b04": {
+          "type": "text_exec",
+          "params": "case \\$(( \\$(date +%s) % 3 )) in 0) printf '#[fg=magenta,align=center,u=1F389,1F389]' ;; 1) printf '#[fg=yellow,align=center,u=1F38A,1F38A]' ;; *) printf '#[fg=cyan,align=center,u=2728,2728]' ;; esac",
+          "refresh": 1
+        },
+        "1b05": {
+          "type": "text_exec",
+          "params": "case \\$(( (\\$(date +%s) + 1) % 3 )) in 0) printf '#[fg=magenta,align=center,u=1F389,1F389]' ;; 1) printf '#[fg=yellow,align=center,u=1F38A,1F38A]' ;; *) printf '#[fg=cyan,align=center,u=2728,2728]' ;; esac",
+          "refresh": 1
+        },
+        "1b06": {
+          "type": "text_exec",
+          "params": "case \\$(( (\\$(date +%s) + 2) % 3 )) in 0) printf '#[fg=magenta,align=center,u=1F389,1F389]' ;; 1) printf '#[fg=yellow,align=center,u=1F38A,1F38A]' ;; *) printf '#[fg=cyan,align=center,u=2728,2728]' ;; esac",
+          "refresh": 1
+        }
+      },
+      "actions": {
+        "1b02": { "short_press": "notify-send dak 'Hello from your keypad'" },
+        "1b03": { "short_press": "@on_start" },
+        // 1b04 is decoration here: drop the NOTIFY action it had on on_start.
+        "1b04": { "short_press": "" },
+        // Back to on_start after 5 seconds, in case nobody presses BACK.
+        "timer": { "5": "@on_start" }
+      }
+    }
+  },
+  "devices": {
+    "1": {
+      "device_id": "0300:3002",
+      "device_name": "Ajazz HOTSPOTEKUSB HID DEMO",
+      "serial": "unknown",
+      "key_count": 9,
+      "encoder_count": 3,
+      "screens": 6,
+      "protocol_version": 2,
+      "buttons": [
+        { "number": 1, "press": 1, "release": 1, "screen": true, "draw_id": 1 },
+        { "number": 2, "press": 2, "release": 2, "screen": true, "draw_id": 2 },
+        { "number": 3, "press": 3, "release": 3, "screen": true, "draw_id": 3 },
+        { "number": 4, "press": 4, "release": 4, "screen": true, "draw_id": 4 },
+        { "number": 5, "press": 5, "release": 5, "screen": true, "draw_id": 5 },
+        { "number": 6, "press": 6, "release": 6, "screen": true, "draw_id": 6 },
+        { "number": 7, "press": 37, "release": 37, "screen": false, "draw_id": -1 },
+        { "number": 8, "press": 48, "release": 48, "screen": false, "draw_id": -1 },
+        { "number": 9, "press": 49, "release": 49, "screen": false, "draw_id": -1 }
+      ],
+      "encoders": [
+        { "number": 1, "cw": 81, "ccw": 80, "press": 53, "release": 53 },
+        { "number": 2, "cw": 145, "ccw": 144, "press": 51, "release": 51 },
+        { "number": 3, "cw": 97, "ccw": 96, "press": 52, "release": 52 }
+      ]
+    }
+  }
+}

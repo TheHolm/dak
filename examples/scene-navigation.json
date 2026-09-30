@@ -20,9 +20,9 @@
         "1b02": { "short_press": "@System" },
         // One button, three outcomes: tap, hold, and tap twice fire separately.
         "1b03": {
-          "short_press": "/usr/bin/notify-send dak 'short press'",
-          "long_press": "/usr/bin/notify-send dak 'long press'",
-          "double_click": "/usr/bin/notify-send dak 'double click'"
+          "short_press": "notify-send dak 'short press'",
+          "long_press": "notify-send dak 'long press'",
+          "double_click": "notify-send dak 'double click'"
         }
       }
     },

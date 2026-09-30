@@ -211,8 +211,15 @@ under other platforms.
   checks their key settings and that both packaging paths ship them
 - `config.json` — the user's own runtime config (gitignored, not checked in):
   scenes, per-key actions (pressed/released/short/long press/double click), timers
-- `config.json.example` — checked-in template new users copy to `config.json`
-- `examples/` — complete, copyable example configs, indexed by `examples/EXAMPLES.md`
+- `config.json.example` — checked-in template new users copy to `config.json`; also
+  the one-file reference that uses (almost) every config key, so keep it in step when
+  a key is added (the fonts and logging blocks stay commented out: a bad font path
+  stops dak, and a live logging block would start writing a file)
+- `examples/` — complete, copyable example configs, one feature each, indexed by
+  `examples/EXAMPLES.md`; `hello-dak.json` is the short tour the README's TL;DR points
+  to (Debian/Ubuntu desktop, buttons only). Commands use bare program names; a shell
+  `$(...)` in config text must be written `\$(...)` (`\\$` inside JSON).
+  `tests/validation.rs`'s `example_configs_load` loads every file there
 - `man/` — roff man pages: `dak.1` (CLI reference) and `dak-config.5` (config
   file format). `dak.1` is **generated** from `src/cli.rs` plus the roff
   appendix in `tests/man_pages.rs`; regenerate it after touching either with
@@ -236,6 +243,8 @@ under other platforms.
   convention below
 - `vendor/` — FreeBSD-only forks of `mirajazz`/`async-hid` (the real `async-hid` has no FreeBSD HID backend); only referenced from `Cargo.toml`'s `[target.'cfg(target_os = "freebsd")'.dependencies]`, so Linux and every other platform still resolve the real crates.io releases untouched. See `vendor/README.md`.
 - `NOTES.md` — agent-to-agent knowledge base for cross-compiling/packaging/testing `dak` for FreeBSD from Linux (sysroot setup, building a `.pkg`, jail-based dependency testing). Read it before touching CI or cross-compilation; keep it updated as you learn more, don't let it go stale.
+- `TODO.md` — numbered list of planned features and known gaps not yet worked on;
+  update an item when work changes its state, and add one for a gap found along the way
 - `.woodpecker/release.yaml` — tag-triggered CI pipeline (`event: tag`, `ref: refs/tags/v*`) that builds a Debian trixie `.deb`, an Ubuntu 26.04 LTS `.deb`, and a FreeBSD `.pkg`, then publishes them to a GitHub Release; `.woodpecker/check-target-freshness.yaml` — monthly cron job flagging when the OS versions pinned in `release.yaml` go stale (see `scripts/check-target-freshness.sh`)
 - `scripts/` — helpers used only by `.woodpecker/*.yaml`: `verify-freebsd-dist.sh`
   (base.txz against MANIFEST, cross-checked between download.freebsd.org and mirrors),

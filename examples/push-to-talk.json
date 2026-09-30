@@ -14,17 +14,17 @@
       "setup": {
         "1b01": { "type": "text_value", "params": "TALK" },
         "1b02": { "type": "text_value", "params": "MIC" },
-        "1b03": { "type": "launch", "params": "/usr/bin/nerd-dictation begin" }
+        "1b03": { "type": "launch", "params": "nerd-dictation begin" }
       },
       "actions": {
         "1b01": {
-          "pressed": "/usr/bin/pactl set-source-mute @DEFAULT_SOURCE@ 0",
-          "released": "/usr/bin/pactl set-source-mute @DEFAULT_SOURCE@ 1"
+          "pressed": "pactl set-source-mute @DEFAULT_SOURCE@ 0",
+          "released": "pactl set-source-mute @DEFAULT_SOURCE@ 1"
         },
         "1b02": {
           "short_press": [
-            "/usr/bin/pactl set-source-mute @DEFAULT_SOURCE@ toggle",
-            "/usr/bin/notify-send dak 'Microphone mute toggled'"
+            "pactl set-source-mute @DEFAULT_SOURCE@ toggle",
+            "notify-send dak 'Microphone mute toggled'"
           ]
         }
       }
