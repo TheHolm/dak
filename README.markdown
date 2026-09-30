@@ -6,14 +6,21 @@
 
 **DAK** (**D**ynamic **A**jazz **K**eyboard)(pronounced as ~/ˈɡʊmiˌʔɛntə/~ /dʌk/) is a Rust tool for controlling Ajazz- and Mirabox-branded "stream controller" USB macro keypads (the two brands sell the same OEM hardware under different names/USB IDs) via [`mirajazz`](https://crates.io/crates/mirajazz). Running the binary connects to the device, paints the configured images and text labels onto the button LCDs, controls brightness, and reacts to key and encoder input. Built and actually tested against a real **Ajazz AKP03E** (HID device, vendor `0x0300`, product `0x3002`). Several other Ajazz/Mirabox-branded devices are wired up the same way and have a good chance of working out of the box even though nobody has confirmed them yet - see [Help me support more devices](#help-me-support-more-devices) for the full list and how verified each one is. Project is loosely based on [OpenDesk pkugin](https://github.com/4ndv/opendeck-akp03/)
 
-Work in progress. Config structure will probably change in the future, but I will try to make it easy to update to new version.
-
-
 # THIS IS VIBE CODED(mostly) GARBAGE(100%, as non vibe-coded parts are garbage too), USE ON YOUR OWN RISK
 
 I did not check what is in the code at all, so who knows what it is really doing.
 
 The current version is **v1.0.0**.
+
+## Companion projects
+
+- [dak-nuggets](https://github.com/TheHolm/dak-nuggets) — small helper programs
+  meant to be called from a DAK config (`text_exec`/`image_exec`/`launch`/`$(...)`),
+  e.g. `gnome-next-meeting` (calendar countdowns on a button) and
+  `opencode-podman-status`.
+- [teams-control](https://github.com/TheHolm/teams-control) — drives the Microsoft
+  Teams web client (mute, video, accept/decline, join, leave) from Unix signals, so
+  a keypad button can control a call with a plain `kill -SIGRTMIN+n` action.
 
 ## Usage
 

@@ -32,10 +32,11 @@
    once, with no config support needed for that at all - confirmed against real
    hardware, including a 3-hour zero-error run (see `NOTES.md` section 6 for the full
    findings, including where the real throughput ceiling is). What's missing is a way
-   to *configure* one from `config.json`: today `setup` only ever pushes a single
-   static frame (`"image"`/`"image_exec"`), with no way to say "cycle through these
-   frames" or "call this command every N ms and redraw". Needs a new setup type (or an
-   extension of the existing ones) plus a way to control the frame rate.
+   to *configure* one from `config.json`: `image_exec` with `refresh` already re-runs a
+   command and redraws, but only every N whole seconds, and `image` only ever pushes a
+   single static frame. There is no way to say "cycle through these frames" or "redraw
+   every N ms". Needs a new setup type (or an extension of the existing ones) plus a
+   way to control the frame rate.
 6. (Maybe - lower priority, and only relevant once #5 above exists) A sleep/low-power
    mode for animations specifically: redrawing a button continuously costs real,
    measurable CPU and HID bandwidth (see `NOTES.md` section 6) even though today's
@@ -58,10 +59,13 @@
     hammered with this command. Needs a real unit with working encoder LEDs to
     properly map and add this safely.
 8. Named pipes (FIFOs) as a button image/text source. Today `image`/`text` read a
-   regular file once on scene entry/refresh (`read_text_file_bounded`, `image::open`)
-   and `image_exec`/`text_exec` spawn a short-lived command and capture its stdout,
-   so an external producer must either rewrite a file and rely on `refresh`, or be
-   re-run each update. A long-lived FIFO would let one producer push updates on its
+   regular file once on scene entry/refresh (`read_text_file_bounded`,
+   `crate::imaging::open`) and `image_exec`/`text_exec` spawn a short-lived command
+   and capture its stdout, so an external producer must either rewrite a file and rely
+   on `refresh`, or be re-run each update. Since v0.15.0 `image`/`text` deliberately
+   refuse anything but a regular file (a FIFO used to freeze the keypad and now shows
+   the error label), so this needs its own setup type rather than relaxing that rule.
+   A long-lived FIFO would let one producer push updates on its
    own schedule: `dak` opens it and redraws whenever a writer connects/writes. Open
    questions to design: avoid blocking startup and spurious EOF between writers
    (`O_RDWR`/`O_NONBLOCK`), per-write chunk bounding and decoding for images,

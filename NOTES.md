@@ -591,7 +591,7 @@ this into an actual CI pipeline.
       sysroot) could be a slower, separate/optional job.
 - [ ] No automated check exists yet for "did `vendor/mirajazz-freebsd` or
       `vendor/async-hid-freebsd` fall behind a newer upstream crates.io
-      release" (this is also called out as a TODO in `README.markdown`) -
+      release" (this is also item 1 in `TODO.md`) -
       would be good to fold into the same CI effort.
 - [ ] The `.pkg`-building script currently only exists as a throwaway; if
       packages become a real release artifact, promote the recipe in
